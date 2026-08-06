@@ -1,0 +1,80 @@
+---
+title: アイテム上限と自動アーカイブ
+description: 1,000 行 / 5,000 行の天井、over_row_maximum エラー、そしてミラーがその十分手前で自己制限すべき理由
+sidebar_position: 22
+---
+
+Slack List にはリストごとの厳格な容量上限があり、その天井を「そのうち埋めていけばよいもの」として扱うことが、外部の成長し続けるデータソースから供給されるリストで最もよくある設計ミスだ。
+
+## 数字: アイテムとサブタスクで 1,000、Enterprise Grid では 5,000
+
+Slack のヘルプ記事「Use lists in Slack」はこの上限をそのまま明記している。Pro と Business+ では**アイテム + サブタスクで 1,000**、**Enterprise Grid では 5,000**。上位の有料プランへ移行して変わるのは*容量*であってアクセス可否ではない — Lists 自体はどの有料プランでもすでに利用できる（本セクション前半の概要ページを参照）。Enterprise Grid は天井を引き上げるだけだ。
+
+**サブタスク（`parent_item_id` を付けて作った行）は、トップレベルの行と同じ予算を消費する。** トップレベル 900 行 + サブタスク 150 行のリストは、標準プランの上限をすでに超えている — サブタスク用の別枠は存在しない。ソースデータが親子構造を持つなら、「本物のレコード」と考えている行だけでなく、合計行数で予算を組むこと。
+
+## `over_row_maximum` — 上限を示す唯一の文書化されたシグナル
+
+`slackLists.items.create` には `over_row_maximum` エラーが文書化されている。これがリストが満杯であることを示す唯一の権威ある Slack 公式シグナルであり、リトライ・バックオフやアラートのロジックはこれで分岐させるべきだ — 自前の追跡から推測した行数ではなく。
+
+:::warning[未検証]
+この上限に関連する 2 つの問いは実証検証の対象としてフラグが立てられていたが、このプロジェクトの検証スパイクはスキップされた（テストトークンが用意できなかった）ため、どちらも元調査時点の未検証ステータスのままで、確定した事実には格上げされていない。
+
+- **上限に達したときに最も古い行が自動アーカイブされるのか、そもそも。** これは*報告されている*内容であって、Slack が文書化したものでも、実地で観測されたものでもない。もしこれが誤りなら、上限到達時には何も黙ってアーカイブされず、単に `over_row_maximum` で create が失敗するだけかもしれない — 本セクションが関心を寄せる設計にとって、意味のある違い（うるさい失敗か静かな失敗か）になる。
+- **アーカイブ済みの行が依然として上限を消費するのか**、つまりアーカイブが空き容量を解放するのか、それともデフォルトの `items.list` ビューから隠すだけなのか。これは、長期運用するミラーにとって明示的な `items.deleteMultiple` 呼び出しが必須なのか、それとも行を自動アーカイブに任せるだけで足りるのかを左右する。
+
+実ワークスペースで確認できるまでは、`over_row_maximum` をエラーハンドリングの土台にできる唯一の事実として扱い、自動アーカイブが信頼できる容量の逃し弁だとは仮定しないこと。
+:::
+
+もし*報告されている*「古い行から自動アーカイブ」の挙動が実在するなら、それはここで起こり得る最も厄介な失敗モードだ。自分のデータベースがまだ指している行が、イベントもエラーもないまま黙ってリストから消える — 後になってその `row_id` に対する `items.update` が失敗するまで気づけない。この失敗は、些細な問題では済まなくなるまで一切うるさく知らせてくれない。
+
+## 緩和策: 上限の十分手前で自己制限し、明示的に退避する
+
+元調査の結論であり、本セクション全体が寄りかかっている設計はこうだ。**成長し続けるテーブルの system of record をリストにしてはならない。** 具体的には次のとおり。
+
+- **有界なアクティブ作業セットだけをミラーする** — 例えば未アーカイブの行や現在関連のあるソース行だけで、全履歴は載せない。
+- **自分のミラーに 1,000 の十分手前でハード上限を設ける**（元調査の推奨レンジは 300〜500）。こうしておけば、実際の天井付近でプラットフォームがどう振る舞うかに依存せずに成長の余地を確保できる。
+- **自分の上限を超えたら、`items.deleteMultiple`（Tier 2、20+/min）で最も古い行を自分で取り除く** — Slack 自身の自動アーカイブが何をするかに頼らない。明示的に削除すれば、削除対象を自分で選べるうえ、`row_id` のマッピングを正確に保てる — データベースがまだリストにあると思っている状態と黙って食い違うことがなくなる。
+- **行の予算が厳しいならサブタスク（`parent_item_id`）は一切使わない** — 別枠なしで同じ上限を共有するため、親子構造にすると、自分で設けた上限に対して使える予算が実質的に半減する。
+
+```typescript
+// Self-imposed ceiling, well under Slack's 1,000-row cap. Evict the
+// oldest rows explicitly rather than depending on Slack's own
+// (reported, unverified) auto-archive behavior.
+const MIRROR_ROW_CEILING = 400;
+
+async function evictOldestIfOverCeiling(
+  botToken: string,
+  listId: string,
+  currentRowIds: readonly string[], // ordered oldest-first by your own db
+): Promise<void> {
+  if (currentRowIds.length <= MIRROR_ROW_CEILING) return;
+  const toEvict = currentRowIds.slice(0, currentRowIds.length - MIRROR_ROW_CEILING);
+  const res = await fetch("https://slack.com/api/slackLists.items.deleteMultiple", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${botToken}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify({ list_id: listId, row_ids: toEvict }),
+  });
+  // Slack's Web API returns HTTP 200 even on failure — {"ok": false, "error": "..."}.
+  // Only remove rows from your own mapping table AFTER confirming ok: true; removing
+  // them unconditionally would desync your mapping from Slack on a rejected call.
+  const body = (await res.json()) as { ok: boolean; error?: string };
+  if (!body.ok) {
+    throw new Error(`slackLists.items.deleteMultiple rejected: ${body.error}`);
+  }
+  // Remove the same row_ids from your own mapping table in the same
+  // operation — do not let the two stores drift apart.
+}
+```
+
+## リストの充填状況を読む
+
+`items.list` は行数を一切返さない。容量に関する数字が表に出てくる唯一の場所は、`items.info` レスポンスの `list_limits`（`row_count`、`row_count_limit`、`archived_row_count`）だ — ミラー用の行を 1 つ潰さずにこれを読む方法は、[リストの読み取り](./reading-lists.mdx)のセンチネル行パターンを参照。事後的に `over_row_maximum` へ反応するだけでなく、定期的に確認すること — 自分の上限に対して先回りして退避していれば、通常運用でこのエラーが発火しない程度には実際の上限から距離を保てる。
+
+## 関連ページ
+
+- [リストの読み取り](./reading-lists.mdx) — 作業セットの行を消費せずに `list_limits` を読むためのセンチネル行パターン。
+- [イベントなし、冪等性なし](./no-events-no-idempotency.mdx) — 自動アーカイブが（実在するなら）取り除いたものを見る唯一の方法である `archived: true` の照合パス。
+- [ワンウェイミラーパターン](./one-way-mirror.mdx) — 自己制限と明示的な退避が、完全な同期設計のどこに収まるか。

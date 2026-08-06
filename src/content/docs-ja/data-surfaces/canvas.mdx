@@ -1,0 +1,74 @@
+---
+title: キャンバス
+description: canvases.create / canvases.edit の書き込み経路、チャンネルキャンバス、access.set による読み取り付与の流れ、そして各種上限。
+sidebar_position: 3
+---
+
+キャンバスは Slack に組み込まれた Markdown 文書のサーフェスで、「シンプルながら強力な文書」としてチャンネルに紐づくか、単体で存在する（[surfaces/canvases](https://docs.slack.dev/surfaces/canvases/)）。このページでは bot 側から見た書き込み経路 — 作成、同期の維持、読み取り専用アクセスの付与、そして上限がどこにあるか — を扱う。読み取り専用ダッシュボードとして、キャンバスが他の 4 つのデータサーフェスに対してどう位置づけられるかは[ダッシュボードサーフェスの選び方](./choosing-a-dashboard-surface.mdx)を参照。
+
+## キャンバスの作成
+
+`canvases.create` はオプションの `title`、オプションの `document_content`（Markdown）、オプションの `channel_id` を取る（[reference/methods/canvases.create](https://docs.slack.dev/reference/methods/canvases.create)）。`channel_id` を渡すことがそれを**チャンネルキャンバス**にする。キャンバスはそのチャンネルのヘッダーにある「チャンネルタブへ自動的に追加され得る」（[surfaces/canvases](https://docs.slack.dev/surfaces/canvases/)）ものになり、bot がリンクで共有して回る単体の文書ではなくなる。`canvases.create` と `canvases.edit` はどちらも `canvases:write` スコープを必要とする（[reference/scopes/canvases.write](https://docs.slack.dev/reference/scopes/canvases.write/)）。
+
+```json
+{
+  "channel_id": "C0123456789",
+  "title": "Sync Status",
+  "document_content": {
+    "type": "markdown",
+    "markdown": "# Sync Status\n\nLast run: ..."
+  }
+}
+```
+
+## キャンバスの編集 — 呼び出しあたり 1 操作
+
+`canvases.edit` のドキュメントはこう明言している。「現在、API 呼び出しあたり 1 操作のみ対応している」（[reference/methods/canvases.edit](https://docs.slack.dev/reference/methods/canvases.edit)）。リクエストの形は `changes` 配列で、この配列は複数の変更オブジェクトを載せられる — が、その 1 つ 1 つは依然として単一のアトミックな操作だ。
+
+- `insert_after` / `insert_before` — 既存セクションを基準にコンテンツを追加する
+- `insert_at_start` / `insert_at_end` — 文書のいずれかの端にコンテンツを追加する
+- `replace` — セクションを上書きする
+- `delete` — セクションを削除する
+- `rename` — キャンバスのタイトルを変更する
+
+「このセル 1 つだけをパッチする」という安価な操作がないため、ソースデータから再生成される bot 所有のキャンバスにとって現実的に回る更新パターンは、**文書全体の `replace`** になる。毎ティックで完全な Markdown 文字列を組み立て、それを 1 つの `replace` 操作として送るほうが、前回の文書との差分を取って増分変更を送ろうとするより現実的だ。
+
+```json
+{
+  "canvas_id": "F0123456789",
+  "changes": [
+    {
+      "operation": "replace",
+      "section_id": "<root-section-id>",
+      "document_content": {
+        "type": "markdown",
+        "markdown": "# Sync Status\n\nLast run: ..."
+      }
+    }
+  ]
+}
+```
+
+## 読み取り専用アクセスの付与
+
+`canvases.access.set` は `canvas_id`、`read` / `write` / `owner` のいずれかの `access_level`、そして `channel_ids` か `user_ids` のどちらか一方（両方は不可）を取る（[reference/methods/canvases.access.set](https://docs.slack.dev/reference/methods/canvases.access.set)）。順序が重要だ。Slack のドキュメントは「アクセスレベルを設定したい対象に応じて、キャンバスのリンクをチャンネルまたはユーザーへ共有しておくこと」と述べており、特に `user_ids` の形式では「先にそのユーザーへキャンバスを直接送っていなければならない」— さもないと `access.set` の呼び出しが失敗する。アクセスを設定する前にキャンバスを共有すること。後ではない。
+
+読み取りアクセスは UI 上のヒントではなく、本物の天井だ。キャンバスに閲覧専用アクセスを持つ人は「変更もコメントもできない」（[Manage access permissions for canvases and lists](https://slack.com/help/articles/15678967614611-Manage-access-permissions-for-canvases-and-lists)）— キャンバスには、閲覧者がアイテムにコメントできるという Lists の例外規定がない。
+
+## チャンネルタブとしての永続性
+
+`channel_id` を指定して作成された（あるいは後から紐づけられた）キャンバスは、チャンネルヘッダーにメッセージと並ぶ独自のタブとして常駐する — ピン留めメッセージには得られない、耐久性のある UI の一等地だ。チャンネルが使われても視界から流れ去らないし、チャンネルメンバーがうっかりピン留めを外してしまうことに相当する事故も起きない。
+
+## 上限
+
+| 上限 | 値 | 出典 |
+|---|---|---|
+| `canvases.edit` 呼び出しあたりの操作数 | 1 | [canvases.edit](https://docs.slack.dev/reference/methods/canvases.edit) |
+| `document_content` の Markdown サイズ | 1 MiB / 1,048,576 文字 — `changes` 配列のエントリが複数ある場合は変更ごとに適用される | [canvases.edit](https://docs.slack.dev/reference/methods/canvases.edit)、[surfaces/canvases](https://docs.slack.dev/surfaces/canvases/) |
+| 表 1 つあたりのセル数 | 300 — 行 × 列の組み合わせは任意 | [surfaces/canvases](https://docs.slack.dev/surfaces/canvases/) |
+| `canvases.edit` のレート制限 | Tier 3（50+ requests/min） | [canvases.edit](https://docs.slack.dev/reference/methods/canvases.edit) |
+| 必要なスコープ | `canvases:write` — 作成、編集、access.set のすべてに必要 | [scopes/canvases.write](https://docs.slack.dev/reference/scopes/canvases.write/) |
+
+:::note[キャンバスにできないこと]
+ボードレイアウトなし、列なし、セル単位の書き込みなし。そのコンテンツが実際には文書ではなくステータスボードなら、残り 4 つの選択肢は[ダッシュボードサーフェスの選び方](./choosing-a-dashboard-surface.mdx)を参照。
+:::
