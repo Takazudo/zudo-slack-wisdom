@@ -1,0 +1,72 @@
+---
+title: Updating in Place
+description: "chat.update's absolute read-only guarantee, the pinned-dashboard pattern, and Table block limits"
+sidebar_position: 3
+---
+
+## Only the Authoring App Can Update
+
+`chat.update` edits an existing message's text and blocks. Per Slack's own docs, "only messages
+posted by the authenticated user can be updated"
+([`chat.update`](https://docs.slack.dev/reference/methods/chat.update/)) — "the authenticated
+user" is the token's identity, not necessarily the app. For a **bot token**, that's the bot itself:
+only the bot that originally posted a message can edit it, and there is no ACL to configure, no
+share dialog to get wrong, and no admin override that grants a different app or a human editing
+rights on the message body. A **user token**, though, authenticates as a human — `chat.update`
+called with one can edit any message that human authored, including one posted on their behalf by
+a different app (e.g. a Slack Connect or workflow integration acting as them). The absolute,
+zero-configuration read-only guarantee below holds for the bot-token dashboard pattern this page
+describes; a user-token integration doesn't get it for free.
+
+## No Notification, No "Edited" Flag — When Blocks Are Used
+
+Editing a message in place produces no channel notification, which is the correct behavior for a
+status board that shouldn't spam the channel on every refresh. When the message content is Block
+Kit `blocks` (rather than plain `text`), Slack also shows no "(edited)" flag — visually, a
+`chat.update`-refreshed Block Kit message reads exactly like it did on its first post, every time
+it's refreshed.
+
+## The Pinned-Dashboard Pattern
+
+The combination above — bot-exclusive write access, silent refresh, no visual "this changed"
+marker — makes `chat.update` the default building block for an in-Slack status board:
+
+1. `chat.postMessage` once, with the initial Block Kit body.
+2. `pins.add` the resulting message so it's discoverable from the channel's pinned-items panel.
+3. On a cron (or any trigger), `chat.update` the same `channel` + `ts` with a freshly rendered
+   `blocks` payload.
+
+This costs exactly one API call per refresh, needs no state beyond the `channel`/`ts` pair, and
+inherits the read-only guarantee above with zero additional configuration. Pinning does **not**
+keep a message fixed at the top of the channel timeline — it only adds the message to the pinned
+items list, so the dashboard still scrolls out of the visible history as new messages arrive; the
+pin is what lets a reader jump back to it regardless of scroll position. Any channel member can
+unpin it — unpinning does not delete the message, so the dashboard survives, it just drops out of
+that pinned-items list.
+
+:::tip[Default choice among Slack's bot-writable display surfaces]
+Against the other surfaces a bot can write a dashboard to — a Slack List, a Canvas, an App Home
+tab, a channel bookmark to an external page — a pinned `chat.update` message is the lowest-cost
+option with the strongest read-only guarantee. It trades away real layout modes (no Kanban board,
+no per-row threads); reach for a heavier surface only after the team has actually asked for those.
+:::
+
+## Table Block Limits
+
+Block Kit's Table block is the highest-fidelity structured layout available inside a
+`chat.update`-refreshed message. As of 2026-08-06, per the primary reference
+([Table block](https://docs.slack.dev/reference/block-kit/blocks/table-block/)):
+
+| Limit | Value |
+|---|---|
+| Tables per message | 1 — a second Table block in the same message fails with `only_one_table_allowed` |
+| Rows | Maximum 100 |
+| Columns per row | Maximum 20 table cells per row array |
+| Characters per table | 10,000, across all cells in that table |
+| Characters per message | 10,000, aggregated across all table cells in the message |
+| Cell types | `rich_text`, `raw_text`, `raw_number` |
+| `block_id` | Maximum 255 characters |
+
+A dashboard that needs more than 100 rows or 10,000 characters of table content has outgrown this
+surface — page the data, summarize it, or move to a surface built for larger structured data (a
+Slack List; see the [Lists](../lists/index.mdx) section).

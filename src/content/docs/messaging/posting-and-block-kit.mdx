@@ -1,0 +1,65 @@
+---
+title: Posting and Block Kit
+description: chat.postMessage essentials — channel resolution, threading, blocks + text fallback, common block types, unfurl flags
+sidebar_position: 2
+---
+
+## Channel Resolution
+
+`chat.postMessage` takes `channel` as "an encoded ID or channel name that represents a channel,
+private group, or IM channel to send the message to"
+([`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postMessage/)). In practice,
+prefer the encoded ID (`C0123456789`) over a name: IDs are stable across channel renames, and some
+name-based lookups depend on the app already being a member of the channel.
+
+Membership requirements differ by channel type. A bot with the
+[`chat:write.public`](https://docs.slack.dev/reference/scopes/chat.write.public/) scope can post
+to any **public** channel without joining it first — that scope exists specifically to skip the
+join step. Without it, a bot must join public channels via `conversations.join` before posting.
+**Private** channels have no such shortcut: there is no scope that lets an app post into a private
+channel it hasn't been explicitly invited to.
+
+## Threading with `thread_ts`
+
+Passing `thread_ts` (the parent message's `ts`, not the reply's own) makes a new message a
+threaded reply instead of a top-level post. Two things worth getting right:
+
+- **Always thread off the parent's `ts`.** Threading off a reply's `ts` does not nest further —
+  Slack flattens threads to one level, so the reply lands in the same thread as the parent
+  regardless, but code that assumes arbitrary nesting will misread the result.
+- **`reply_broadcast: true`** also posts the reply as a visible line in the channel (in addition
+  to the thread), for the cases where a thread reply is also channel-relevant news. It defaults to
+  `false` — a plain threaded reply is not visible in the channel body unless the reader opens the
+  thread.
+
+## `blocks` + `text`: Fallback, Not Optional in Practice
+
+`text` is not a hard requirement when `blocks` is present, but it is "highly recommended" — when
+`blocks` is set, `text` is used as the fallback string shown in push notifications, email digests,
+and anywhere else Block Kit can't render (`chat.postMessage`, above). Skipping it means a bot's
+messages show up as a blank or generic notification. Always set `text` to a short plain-language
+summary of the message even when the visible body is entirely blocks.
+
+## Common Block Types
+
+| Block | Purpose | Notable limit |
+|---|---|---|
+| `section` | Main content — text plus an optional `accessory` (button, image, select, …) or up to 10 `fields` for a compact key/value grid | `text` max 3,000 characters; `fields` array max 10 items ([reference](https://docs.slack.dev/reference/block-kit/blocks/section-block/)) |
+| `context` | Small, muted secondary line — a mix of short text and image elements, typically metadata like "Updated 2 minutes ago" | Up to 10 elements |
+| `actions` | Interactive elements — buttons, select menus, date pickers | Max 25 elements ([reference](https://docs.slack.dev/reference/block-kit/blocks/actions-block/)) |
+| `divider` | Visual separator, no content | — |
+| `header` | Large bold text at the top of a message, `plain_text` only (no `mrkdwn`, no emoji shorthand rendering beyond the base set) | 150 characters max ([reference](https://docs.slack.dev/reference/block-kit/blocks/header-block/)) |
+
+A message can carry up to **50 blocks**; modals and Home tab views raise that to 100
+([Block Kit overview](https://docs.slack.dev/block-kit/)).
+
+## Unfurl Flags
+
+`unfurl_links` and `unfurl_media` both default to enabled — a bare URL in the message text
+expands into a preview card unless explicitly suppressed. Set either to `false` to keep a message
+compact, which matters most for messages that already carry their own Block Kit layout and don't
+need Slack's auto-generated link preview competing for space underneath.
+
+See [Formatting](./formatting.mdx) for the `mrkdwn` syntax used inside `text` objects, and
+[Updating in Place](./updating-in-place.mdx) for turning a posted message into a
+`chat.update`-refreshed dashboard.
