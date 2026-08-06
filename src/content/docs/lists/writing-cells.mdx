@@ -1,0 +1,180 @@
+---
+title: Writing List Items
+description: The request and response contract for slackLists.items.update
+sidebar_position: 6
+---
+
+## Overview
+
+[`slackLists.items.update`](https://docs.slack.dev/reference/methods/slackLists.items.update/)
+is the single write path for changing cell values on existing List rows — flipping a status
+column, reassigning an owner, ticking a checkbox. It takes exactly three arguments: `token`
+(header), `list_id`, and `cells`. All three are required; there is no optional fourth
+argument and no top-level `row_id` — each entry inside `cells[]` carries its own `row_id`
+alongside `column_id` and one typed value key.
+
+Slack's own docs ship a sample titled "Update select option":
+
+```json
+{
+  "list_id": "F01ABCDE2FG",
+  "cells": [
+    { "column_id": "Col018AL7649G", "select": ["in_progress"], "row_id": "Rec018B8RR603" }
+  ]
+}
+```
+
+Cross-referencing [`slackLists.items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/)
+confirms `Col018AL7649G` in that sample is a `type: "select"` / `format: "single_select"`
+"Status" column — the docs demonstrate an actual single-select flip, not a stretched analogue.
+
+The only scope required is `lists:write` on the bot token —
+[`lists:write`](https://docs.slack.dev/reference/scopes/lists.write/) is sufficient on its
+own; `lists:read` is not needed for the write.
+
+## Batching Multiple Rows in One Call
+
+Because `row_id` lives inside each cell rather than at the top level, a single call can
+structurally carry cells that target many different rows and columns:
+
+```json
+{
+  "list_id": "F01ABCDE2FG",
+  "cells": [
+    { "row_id": "Rec0AAA111", "column_id": "Col0STATUS01", "select": ["done"] },
+    { "row_id": "Rec0BBB222", "column_id": "Col0STATUS01", "select": ["doing"] },
+    { "row_id": "Rec0BBB222", "column_id": "Col0OWNER99", "user": ["U01284PCR98"] }
+  ]
+}
+```
+
+:::warning[Unverified]
+Every sample in Slack's docs shows exactly one cell for one row, and no page states that a
+single call may span multiple `row_id`s. The shape structurally allows it, but this is
+inference, not contract. It is the single highest-leverage unknown for a bulk sync — whether
+a 200-row update is a handful of batched calls or one call per row at Tier 3 — so confirm it
+empirically (write two known rows in one call, then read both back) before designing a sync
+loop around it.
+:::
+
+## Typed Value Keys Are (Almost) Always Arrays
+
+Each cell carries exactly one typed value key matching the target column's type. Nearly all of
+them are an array even when they hold a single value:
+
+| Column type | Cell key and shape |
+|---|---|
+| select (single or multi) | `select: ["opt_value"]` — always a string array |
+| user | `user: ["U01..."]` |
+| checkbox | `checkbox: [true]` |
+| rating | `rating: [3]` |
+| number | `number: [42]` |
+| date | `date: ["2026-08-06"]` |
+| timestamp | `timestamp: [1699999999]` |
+| text / notes | Block Kit `rich_text` structures — never a plain string |
+
+Sending a bare scalar (`select: "done"`) fails with `invalid_input_type`. Only the read-side
+`text` convenience field on responses is a bare string; the write side never accepts one for
+a text column, and a plain string there fails with `invalid_blocks` / `invalid_text_block`.
+
+**Single- and multi-select columns are written identically.** There is no `multi_select` cell
+key in the docs or in any official SDK's type union — both column formats go through
+`select: [...]`; the column's `options.format` decides how many entries are accepted.
+
+:::warning[Unverified]
+Sending two values (`select: ["a", "b"]`) to a column whose `options.format` is
+`single_select` is undefined behavior — the docs never say whether it errors, keeps the first
+value, or stores both. Treat it as untested and avoid relying on either outcome.
+:::
+
+## The `key` / Generic `value` Shape Is Deprecated
+
+Slack's docs state plainly that the older `key` field property "will be deprecated in favor
+of `column_id`," and the generic `value` field "will also be deprecated eventually in favor
+of typed values." Address every cell by `column_id` plus one of the typed keys above from day
+one — do not build against the `key`/`value` shape even if you see it in older samples or
+third-party code, since Slack has already announced its removal.
+
+## The Response Is a Bare `{"ok": true}`
+
+A successful call returns exactly `{"ok": true}` — no echo of the updated row, no revision
+token, no `list_metadata`. Confirming a write landed requires a follow-up read via
+[`items.info`](./errors-reference.mdx) or `items.list`.
+
+Use `application/json` as the content type. Form-encoding is nominally accepted, but `cells`
+is an array of objects that themselves contain arrays; a form-encoded body for that shape
+returns `invalid_array_arg`.
+
+## Cap on `cells[]` Per Call
+
+No formal `cells[]` sub-schema exists on the method's docs page — every cell property
+(`row_id`, `column_id`, the typed value keys) appears only in samples or error strings. The
+raw docs JSON, mirrored by [slack-ruby/slack-api-ref](https://github.com/slack-ruby/slack-api-ref),
+constrains `cells` to `minItems: 1, maxItems: 100`; the `over_cell_fields_limit` error is the
+runtime signal that a call exceeded the cap.
+
+:::warning[Unverified]
+The `maxItems: 100` figure comes from a third-party mirror of Slack's internal docs JSON, not
+a live probe against the API — the practical ceiling has not been confirmed against the
+running service. Find your own working ceiling empirically before batching aggressively (send
+101 cells, expect `over_cell_fields_limit`, then bisect if the observed limit differs).
+:::
+
+## Copy-Pasteable Worker-Side Example
+
+```ts
+const SLACK_API_BASE_URL = "https://slack.com/api";
+
+// Opaque Slack IDs, persisted by us: list_id + column_id come from
+// slackLists.create (or items.info); row_id comes from slackLists.items.create
+// when the bot first inserts the row.
+const LIST_ID = "F09ABCDE1FG";
+const STATUS_COLUMN_ID = "Col07XSTATUS01";
+
+// The bot writes the slug (options.choices[].value); Slack renders the label
+// chip. Choose slugs at slackLists.create time -- no API path edits an
+// existing column's option set afterwards (UI edits and todo_mode column
+// additions are the only post-creation schema changes; see schema-mutability.mdx).
+const STATUS_OPTION = {
+  todo: "todo",
+  doing: "doing",
+  done: "done",
+} as const;
+
+export async function setListItemStatus(
+  botToken: string,
+  rowId: string,
+  option: (typeof STATUS_OPTION)[keyof typeof STATUS_OPTION],
+): Promise<void> {
+  const res = await fetch(`${SLACK_API_BASE_URL}/slackLists.items.update`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${botToken}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify({
+      list_id: LIST_ID,
+      cells: [
+        {
+          row_id: rowId, // <- INSIDE the cell, not top-level
+          column_id: STATUS_COLUMN_ID,
+          select: [option], // <- ALWAYS an array, even single-select
+        },
+      ],
+    }),
+  });
+
+  const body = (await res.json()) as { ok?: boolean; error?: string };
+  if (body.ok !== true) {
+    throw new Error(`slackLists.items.update rejected: ${body.error}`);
+  }
+  // Success body is literally {"ok": true} -- no updated row is returned.
+}
+```
+
+Do not route this through a GET/form-encoded path: form-encoding an array of objects produces
+`invalid_array_arg`, as noted above.
+
+For why the `select` value must be a slug rather than a label, see
+[Select Columns](./select-columns.mdx). For the full branchable error table, see
+[Errors Reference](./errors-reference.mdx).

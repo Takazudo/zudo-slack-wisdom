@@ -1,0 +1,119 @@
+---
+title: Select Columns — Values, Not Labels
+description: Why slackLists.items.update rejects labels, and how to design select-column slugs
+sidebar_position: 7
+---
+
+## Overview
+
+Select columns (single- and multi-select) are the most common write target for a status
+board — a Kanban-style "todo / doing / done" column, for example. Getting a write accepted
+depends entirely on sending the right string, and that string is not what a human sees on the
+chip.
+
+## The `select` Array Carries Values, Never Labels
+
+The `select` array carries the column schema's `options.choices[].value` — the machine
+slug — never `choices[].label`, the chip text a human reads. Writing a label returns
+`invalid_option_id`.
+
+Slack's docs describe select values in prose as "an array of List encoded option IDs" and use
+`OptHIGH123`-style placeholders in examples, which reads as if `choices[]` had a separate
+`id` key. It does not: **no choice object anywhere in the API has an `id` key.** Choices are
+exactly `{value, label, color}` in every surface checked —
+[`slackLists.create`](https://docs.slack.dev/reference/methods/slackLists.create/)'s request
+and response, the `items.info` schema, the
+[node SDK's `SlackListsSchemaColumnChoice`](https://github.com/slackapi/node-slack-sdk/blob/main/packages/web-api/src/types/request/slackLists.ts),
+and the Java SDK's `ListColumnOptions.Choice`. **The `value` field is the option ID.** The
+docs' own worked example proves it: column `Col018AL7649G` has
+`{"value": "in_progress", "label": "In Progress"}`, and the update sample for that column
+writes `select: ["in_progress"]`.
+
+## The ASCII-Slug-Under-Localized-Label Pattern
+
+Because `value` and `label` are independent fields, a select option can carry a stable ASCII
+slug as its `value` while its `label` is any human-facing text, including non-English text —
+the write path never touches the label at all.
+
+Production evidence this is the working pattern:
+
+- [navikt/saape-slackapp](https://github.com/navikt/saape-slackapp) declares Norwegian chips
+  as `{value: 'pending', label: 'Avventer'}, {value: 'in_progress', label: 'Pågår'}, ...` and
+  flips them with `select: [listStatus]` — the value stays ASCII, only the label is localized.
+- The [n8n community node's README](https://github.com/hoyo/n8n-nodes-slack-lists) states
+  "Select columns accept and return the option *value* (e.g. `day_1`, `OptXXXXXX`)."
+- [SirMaiquis/deno-mr-poc](https://github.com/SirMaiquis/deno-mr-poc) ships a label→value
+  resolver (`choices.find(c => c.label === ...)` → send `option.value`) — code that would not
+  exist if labels worked directly.
+
+:::note[Degenerate edge]
+If a column was defined with `value === label`, sending the label text happens to work —
+because it is, in that case, also the value. Don't rely on this by accident; choose `value`
+and `label` independently so a later label rename (translation, wording tweak) can never break
+a write.
+:::
+
+## The Bot-Creates-the-List Pattern
+
+Have the bot create the list itself via `slackLists.create`, choosing every option's `value`
+up front. This resolves two problems at once:
+
+1. **Slug control.** You pick neutral ASCII values (`todo` / `doing` / `done`) under any
+   display label, so the label↔ID mapping problem disappears entirely — the slugs are
+   compile-time constants in your Worker code.
+2. **Access.** How a bot gets write access to a list it did **not** create is genuinely
+   undocumented: [`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/)
+   accepts only `channel_ids` and `user_ids` — there is no `app_ids`/bot argument anywhere.
+   Yet `items.update` clearly enforces access (`access_denied`, `no_permission`,
+   `permission_denied`). The creator implicitly has access, making bot-creates-the-list the
+   only documented-clean path. There is a real community report
+   ([slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)) of
+   `list_not_found` from `items.update` despite the list being shared into the bot's channel
+   (pre-GA, workflow-token context). Do not plan around a human creating the list and sharing
+   it with the bot until that path is proven with a throwaway call.
+
+If a human already made the list, there is no `slackLists.info` and no `slackLists.list` to
+discover it by. Discovery is `slackLists.items.info` (needs `lists:read`), which returns the
+whole list object including `list.list_metadata.schema[]` — every select column with its `id`
+and `options.choices[]`. Call it once by hand, then hardcode the values.
+
+## Single- and Multi-Select Are Written Identically
+
+There is no separate `multi_select` cell key. Both single-select and multi-select columns are
+written through the same `select: [...]` array — the column's `options.format` (`single_select`
+vs `multi_select`) is what decides how many values are accepted, not the write shape.
+
+:::warning[Unverified]
+Sending two values (`select: ["a", "b"]`) to a `single_select`-format column is undefined
+behavior in the docs — untested whether it errors, keeps one value, or is silently accepted.
+:::
+
+## Replace vs. Append on an Existing Cell
+
+:::warning[Unverified]
+No page in Slack's docs states that writing `select: ["B"]` to a cell already holding `"A"`
+**replaces** the value rather than appending to it. For a `single_select`-format column,
+replace is the only coherent semantics, and production apps depend on it — but it is
+inference, not a documented contract. It matters doubly for `multi_select`-format columns,
+where append-vs-replace genuinely diverge in effect. Confirm with two consecutive
+`items.update` calls on one row (write `["A"]`, then `["B"]`), then read back with
+`items.info` and assert exactly `["B"]` before depending on it — repeat against a
+`multi_select`-format column separately, since the two formats could behave differently.
+:::
+
+## Clearing a Selection with `select: []`
+
+:::warning[Unverified]
+Whether `select: []` clears a populated select cell is undocumented. At least one production
+codebase, [Kero46/slack-review-reminder](https://github.com/Kero46/slack-review-reminder/blob/main/lib/list_io.ts),
+deliberately omits empty cells from its update payload rather than rely on this. If your
+design needs an explicit "no status" state, model it as a real option value (e.g. `"none"`)
+instead of depending on an empty-array clear until this is confirmed against the live API.
+:::
+
+## Related
+
+For the full write contract (`list_id` + `cells[]`, typed value keys, batching), see
+[Writing List Items](./writing-cells.mdx). For why the option set itself is effectively
+closed once the list is created, see [Schema Mutability](./schema-mutability.mdx). For the
+error a bad slug produces, see [Errors Reference](./errors-reference.mdx).
