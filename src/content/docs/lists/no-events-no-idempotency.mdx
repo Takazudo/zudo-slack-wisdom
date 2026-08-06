@@ -46,9 +46,13 @@ no caller-supplied external key, nothing that lets you ask "does a row for sourc
 already exist." You are the only party tracking that mapping, and you must:
 
 1. **Persist the returned `row_id` to your database in the same step as the create — before any
-   other work.** A failure between "row created in Slack" and "id saved to my database" orphans
-   a Slack row you can never address again, and guarantees the next run creates a duplicate for
-   the same source record.
+   other work.** This narrows the failure window, it does not close it: there is no transaction
+   spanning a Slack API call and your own database write, so a crash or an ambiguous timeout
+   between "row created in Slack" and "id saved to my database" can still orphan a Slack row.
+   Do not treat immediate persistence as a full fix — pair it with the reconcile pass below,
+   which is what actually catches an orphan: mirror your own primary key into a text column on
+   every Slack row, so a reconcile sweep can match an unexpected row back to its source record
+   instead of your next run blindly creating a duplicate for it.
 2. **Branch create-vs-update on whether your source record already carries a stored `row_id`.**
    An additive, nullable column on the source table (plus an index) is enough: `NULL` means
    "never synced, call `items.create`"; a populated value means "call `items.update`."
@@ -95,6 +99,11 @@ required, not optional — it is the only way you find out what changed outside 
 3. `items.list` returns `updated_by` on every row — use it to flag rows last touched by someone
    other than the bot, a signal that a human edited a row the sync otherwise assumes it owns
    exclusively.
+4. **Match any row with no corresponding `row_id` in your database against your mirrored
+   primary-key text column, not just against source records already marked "never synced."**
+   This is what actually closes the create-then-crash gap above — an orphaned row from a failed
+   run looks exactly like this, and matching it here re-attaches it to its source record instead
+   of leaving the next sync tick free to create a second row for the same data.
 
 At roughly 10 paginated calls per 1,000 rows (Tier 2, 20+/min), a reconcile pass is cheap enough
 to run on every cron tick if the list stays within a bounded working set — see

@@ -81,7 +81,7 @@ async function evictOldestIfOverCeiling(
 ): Promise<void> {
   if (currentRowIds.length <= MIRROR_ROW_CEILING) return;
   const toEvict = currentRowIds.slice(0, currentRowIds.length - MIRROR_ROW_CEILING);
-  await fetch("https://slack.com/api/slackLists.items.deleteMultiple", {
+  const res = await fetch("https://slack.com/api/slackLists.items.deleteMultiple", {
     method: "POST",
     headers: {
       authorization: `Bearer ${botToken}`,
@@ -89,6 +89,13 @@ async function evictOldestIfOverCeiling(
     },
     body: JSON.stringify({ list_id: listId, row_ids: toEvict }),
   });
+  // Slack's Web API returns HTTP 200 even on failure — {"ok": false, "error": "..."}.
+  // Only remove rows from your own mapping table AFTER confirming ok: true; removing
+  // them unconditionally would desync your mapping from Slack on a rejected call.
+  const body = (await res.json()) as { ok: boolean; error?: string };
+  if (!body.ok) {
+    throw new Error(`slackLists.items.deleteMultiple rejected: ${body.error}`);
+  }
   // Remove the same row_ids from your own mapping table in the same
   // operation — do not let the two stores drift apart.
 }

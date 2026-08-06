@@ -74,10 +74,18 @@ and how it shapes who needs to be the list's owner.
 ## Recreation loses all views
 
 Schema is effectively frozen after `slackLists.create` — no documented API adds, removes, or
-retypes a column, and the sanctioned way to get a different schema (say, one more status option
-than you provisioned) is to create a **new** list via `copy_from_list_id` +
-`include_copied_list_records` (you cannot pass both `copy_from_list_id` and `schema` in the same
-call). That mints a new `list_id` and new `column_id`s you must re-persist everywhere.
+retypes a column, and the sanctioned API-level workaround is to create a **new** list via
+`copy_from_list_id` + `include_copied_list_records` (you cannot pass both `copy_from_list_id`
+and `schema` in the same call). That mints a new `list_id` and new `column_id`s you must
+re-persist everywhere.
+
+`copy_from_list_id` alone does not add the option you were missing — it reproduces the
+**exact** schema of the source list, options and all. Getting an actual schema change out of
+this two-step: copy to get a fresh, non-frozen `list_id`, then have a human edit that new list's
+column options **by hand in the Slack UI** (adding, renaming, or recoloring select options is a
+UI-only operation, never an API one). The copy step solves "the old `list_id` is frozen"; the
+manual edit step solves "I need a different option set." Skipping the second step just leaves
+you with a second list carrying the same missing option.
 
 **Analysis, not a directly documented Slack fact:** views — including Board layout and its
 group-by setting — are configured per list entirely through the UI, and nothing in the copy/

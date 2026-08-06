@@ -93,7 +93,7 @@ export async function stampFreshness(
   rowCount: number,
 ): Promise<void> {
   const timestamp = new Date().toISOString();
-  await fetch("https://slack.com/api/slackLists.update", {
+  const res = await fetch("https://slack.com/api/slackLists.update", {
     method: "POST",
     headers: {
       authorization: `Bearer ${botToken}`,
@@ -116,6 +116,13 @@ export async function stampFreshness(
       ],
     }),
   });
+  // Slack's Web API returns HTTP 200 even on failure — {"ok": false, "error": "..."}.
+  // This call is meant to run after every successful sync tick, so a swallowed
+  // rejection here would leave a stale stamp while the tick still reports success.
+  const body = (await res.json()) as { ok: boolean; error?: string };
+  if (!body.ok) {
+    throw new Error(`slackLists.update rejected: ${body.error}`);
+  }
 }
 ```
 
