@@ -309,6 +309,12 @@ jobs:
     needs: [build-site, build-history]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Fork PRs don't get CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID (GitHub
+    # withholds repo secrets from workflows triggered by fork PRs), so the
+    # wrangler deploy step would fail on every external contribution. Skip
+    # the whole job for fork PRs; every other pr-checks job is independent
+    # and still runs.
+    if: github.event.pull_request.head.repo.full_name == github.repository
 
     steps:
       - name: Checkout repository

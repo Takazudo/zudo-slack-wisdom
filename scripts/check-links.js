@@ -8,7 +8,7 @@
  */
 
 import { readFile, readdir, access } from "node:fs/promises";
-import { join, extname, resolve, relative, dirname } from "node:path";
+import { join, extname, resolve, relative, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -149,6 +149,17 @@ export async function resolveLinkDetail(href, distDir, basePath = "/", fileDir =
 
   const relPath = stripped.startsWith("/") ? stripped.slice(1) : stripped;
   if (!relPath) return "root";
+
+  // Clamp to distDir: a relative link with more `..` segments than its
+  // containing directory is deep can otherwise escape dist/ (e.g.
+  // `join("docs", "../../package.json")` normalizes to `../package.json`),
+  // letting a file that exists elsewhere in the repo satisfy the existence
+  // check below for a link that actually 404s in the browser.
+  const resolvedDistDir = resolve(distDir);
+  const resolvedTarget = resolve(distDir, relPath);
+  if (resolvedTarget !== resolvedDistDir && !resolvedTarget.startsWith(resolvedDistDir + sep)) {
+    return "missing";
+  }
 
   // Has file extension → check exact path
   if (extname(relPath)) {
@@ -380,9 +391,13 @@ export function formatReport(brokenLinks, mdxWarnings, trailingSlashWarnings = [
 // --- Allowlist ---
 
 /**
- * Read the allowlist file (one entry per line; `#` comments stripped).
- * Each non-blank line is a literal `<file>:<line>:<href>` exact match.
- * Returns a Set for O(1) lookup against `entryKey()` output below.
+ * Read the allowlist file (one entry per line; a line is a comment only
+ * when `#` is its first non-whitespace character — an entry's href can
+ * itself contain `#` (a fragment, e.g. `../page#section`), so `#` is never
+ * stripped mid-line).
+ * Each non-blank, non-comment line is a literal `<file>:<line>:<href>`
+ * exact match. Returns a Set for O(1) lookup against `entryKey()` output
+ * below.
  */
 export async function readAllowlist(allowlistPath) {
   if (!allowlistPath) return new Set();
@@ -390,8 +405,8 @@ export async function readAllowlist(allowlistPath) {
   const text = await readFile(allowlistPath, "utf-8");
   const lines = text
     .split("\n")
-    .map((l) => l.replace(/#.*$/, "").trim())
-    .filter((l) => l.length > 0);
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith("#"));
   return new Set(lines);
 }
 
