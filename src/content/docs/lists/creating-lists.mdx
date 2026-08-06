@@ -70,14 +70,17 @@ list's schema after creation — `slackLists.update` with `todo_mode: true` adds
 to a list that didn't have them. Set `todo_mode: false` at creation if you don't need them; it is
 safe to rely on.
 
-## Persist `list_id` and Every `column_id` — There Is No Recovery Without a Row
+## Persist `list_id` and Every `column_id`
 
 `slackLists.create`'s response carries `list_id` and `list_metadata` (which includes every
 column's `column_id`). **Capture and persist both in the same step as the create call.** There is
 no runtime re-discovery path: no `slackLists.list` to enumerate lists, no `slackLists.info` to
-read a schema by ID. The only fallback if the mapping is ever lost is `slackLists.items.info`
-against a *known row id* — which itself requires a row you already have. If no such row exists,
-recovery means manually reconstructing the mapping from the UI.
+read a schema by ID. The only read path is `slackLists.items.info`, which needs an existing row
+id — but that row does not have to be one of your own. `initial_fields` on `items.create` is
+optional, so with write access you can create a single throwaway row against the `list_id` and
+immediately call `items.info` on the returned row id to recover the full `list_metadata.schema[]`
+— no pre-existing row required. Without write access, recovery falls back to reconstructing the
+mapping by hand from the UI.
 
 ## Schema Is Effectively Immutable
 

@@ -7,7 +7,9 @@ sidebar_position: 1
 ## What a Slack List Is
 
 A Slack List is a structured collection of rows and typed columns — a lightweight spreadsheet
-embedded in a channel. Each column has a type (`select`, `user`, `date`, `number`, `checkbox`,
+that is a Slack-native surface in its own right, not something that lives inside a channel; it is
+created standalone and then explicitly shared into channels or with people via
+`slackLists.access.set` (see [Access and Scopes](./access-and-scopes.mdx)). Each column has a type (`select`, `user`, `date`, `number`, `checkbox`,
 `rating`, `text`, …), and a list renders in either a **table** layout or a **board** layout —
 items grouped by one column's value (for example a `select` "Status" column with generic options
 `todo` / `doing` / `done`), with cards movable between the groups. Board layout is the one
