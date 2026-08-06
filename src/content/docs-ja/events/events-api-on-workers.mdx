@@ -1,0 +1,96 @@
+---
+title: Workers での Events API
+description: Worker 上で動く Events API エンドポイントの url_verification ハンドシェイク、素早い ack、リトライ、イベントの重複排除
+sidebar_position: 2
+---
+
+## Request URL の登録
+
+Event Subscriptions は api.slack.com のアプリ設定の中にある。有効化したら、Slack に単一の
+**Request URL** -- Worker 上のルート -- を指定する。すると Slack は後述のハンドシェイクを
+送り、イベント種別を購読すればそこに実際のトラフィックも流し始める。
+[Request URL は大文字小文字を区別する](https://docs.slack.dev/apis/events-api/using-http-request-urls/)。
+
+## `url_verification` のハンドシェイク
+
+Slack は Request URL を有効化する前に、そのエンドポイントを本当に管理しているかを確認する
+ため、一度だけチャレンジを POST してくる。
+
+```json
+{
+  "token": "Jhj5dZrVaK7ZwHHjRyZWjbDl",
+  "challenge": "3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P",
+  "type": "url_verification"
+}
+```
+
+Worker は HTTP 200 で応答し、`challenge` の値をそのまま返さなければならない。プレーン
+テキスト、フォームエンコード（`challenge=...`）、JSON（`{"challenge": "..."}`）のいずれの
+応答も受け付けられる
+([リファレンス](https://docs.slack.dev/reference/events/url_verification/))。最小限の
+ハンドラーは、他の何よりも先に `type` で分岐する。
+
+```typescript
+const body = await request.json<{ type: string; challenge?: string }>();
+
+if (body.type === "url_verification") {
+  return Response.json({ challenge: body.challenge });
+}
+```
+
+:::warning[先に署名を検証する]
+このハンドシェイクのリクエストも、他のすべてのイベントと同じ方式で署名されている。この分岐が
+走る前に署名検証を通すこと -- ここを飛ばすと、Request URL を推測できた者は誰でもエンドポイント
+を叩いて探れてしまう。`X-Slack-Signature` / `X-Slack-Request-Timestamp` の検証については
+[リクエストの検証](../worker-backend/verifying-requests.mdx)を参照
+([出典](https://docs.slack.dev/authentication/verifying-requests-from-slack))。
+:::
+
+## 素早く ack し、処理は `waitUntil` で
+
+購読を始めると、条件に合うイベントはそれぞれ個別の POST として届き、Slack は **3 秒以内**の
+2xx 応答を期待する
+([出典](https://docs.slack.dev/apis/events-api/))。Worker でこれを守るとは、Slack Web API の
+呼び出しや D1 への書き込み、AI による要約が終わるより先にレスポンスを返すということだ --
+そうした処理はレスポンス前にインラインで await せず、`ctx.waitUntil()` に渡す。パターンは
+[3 秒以内の ack](../worker-backend/three-second-ack.mdx)を参照。
+
+## リトライとイベントの重複排除
+
+3 秒の枠を逃してもイベントが失われるわけではない。Slack は最大 3 回リトライする。1 回目は
+ほぼ即座に、2 回目は約 1 分後、3 回目（最後）は約 5 分後だ
+([出典](https://docs.slack.dev/apis/events-api/))。つまり応答が 1 度遅かったり不安定だった
+りするだけで、同じイベントが最大 4 回エンドポイントに届きうる（最初の配信 + 3 回のリトライ）。
+
+リトライには 2 つのヘッダーが付く
+([出典](https://docs.slack.dev/apis/events-api/))。
+
+- **`X-Slack-Retry-Num`** -- 試行回数。`1`、`2`、`3` のいずれか。
+- **`X-Slack-Retry-Reason`** -- リトライの理由。`http_timeout`（3 秒以内に 2xx が返らなかった）、
+  `connection_failed`、`ssl_error`、`http_error`、`too_many_redirects`、`unknown_error`。
+
+ただし重複排除にこのリトライヘッダーを使ってはいけない。これらが示すのはこの配信がリトライ
+*である*ことだけで、その裏にあるイベントをすでに処理したかどうかは分からないからだ。すべての
+イベントエンベロープには安定した `event_id` が入っているので、重複排除の判定はそちらを
+キーにする（短い TTL の KV か D1 の行で十分だ）。すでに処理済みの `event_id` にはエラーを
+返さず 2xx を返す。エラーを返してもリトライを 1 回消費するだけで、結果は変わらない。
+
+:::tip[自分の bot のメッセージもスキップする]
+自分の bot ユーザーが発火させたメッセージイベントも、同じ購読を通って返ってくる。処理の前に
+`event.bot_id` を確認する（あるいは自分の bot のユーザー ID と比較する）こと。さもないと、
+メッセージに反応して投稿する bot が自分自身をループで起動しかねない。
+:::
+
+## 購読スコープとイベント種別
+
+イベントへのアクセスも、他のすべてと同じ OAuth スコープの仕組みに乗っている
+([出典](https://docs.slack.dev/apis/events-api/))。
+[イベントリファレンス](https://docs.slack.dev/reference/events/)の各イベント種別には、それを
+許可する[スコープ](https://docs.slack.dev/reference/scopes)が記載されている -- `file_created`
+なら `files:read`、`reaction_added` なら `reactions:read`、といった具合だ。配信を実際に
+認可するのはスコープなので、[トークン、スコープ、OAuth](../getting-started/tokens-scopes-oauth.mdx)
+の最小スコープ原則に従い、イベントハンドラーが実際に使うスコープだけを要求すること。
+
+チーム単位のイベントには、ワークスペースあたり・アプリあたりで直近 60 分間に 30,000 配信という
+上限もある。これを超えると、購読したトラフィックの代わりに `app_rate_limited` イベントが届く
+([出典](https://docs.slack.dev/apis/events-api/))。
