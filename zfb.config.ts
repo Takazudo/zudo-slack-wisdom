@@ -3,7 +3,7 @@ import { zudoDoc } from "@takazudo/zudo-doc/config";
 
 export default defineConfig(
   zudoDoc({
-    siteName: "Zudo Slack Wisdom",
+    siteName: "zudo-slack-wisdom",
     siteDescription: "Slack developer knowledge base with a Cloudflare Worker backend editorial stance, for me and AI agents",
     // siteUrl host MUST match the wrangler.toml custom-domain route (added in
     // the deploy-config sub-issue).
