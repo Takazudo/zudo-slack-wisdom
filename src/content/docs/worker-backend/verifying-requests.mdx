@@ -1,0 +1,147 @@
+---
+title: Verifying Requests
+description: "Slack's v0 request signing scheme on Workers — crypto.subtle HMAC-SHA256, the raw-body pitfall, and timing-safe comparison."
+sidebar_position: 3
+---
+
+## Overview
+
+Any endpoint your Worker exposes to Slack — Events API, interactivity,
+slash commands — is a public URL. Before acting on a request, the Worker
+must prove it actually came from Slack and not from anyone who found the
+URL. Slack signs every outbound request with your app's signing secret;
+[Slack's request-verification docs](https://docs.slack.dev/authentication/verifying-requests-from-slack/)
+define the exact scheme to reproduce and compare.
+
+## The v0 signing scheme
+
+Two headers arrive with every Slack request:
+
+- `X-Slack-Request-Timestamp` — Unix seconds when Slack sent the request
+- `X-Slack-Signature` — `v0=<hex HMAC-SHA256 digest>`
+
+The signature covers a **base string** built from the timestamp and the
+literal request body:
+
+```
+v0:{timestamp}:{raw_body}
+```
+
+The Worker computes `HMAC-SHA256(signing_secret, base_string)`, hex-encodes
+it, prefixes it with `v0=`, and compares that to the incoming
+`X-Slack-Signature` header. This runs entirely on `crypto.subtle` — no
+external crypto library needed on Workers.
+
+```typescript
+async function verifySlackSignature(
+  request: Request,
+  rawBody: string,
+  env: Env,
+): Promise<boolean> {
+  const timestamp = request.headers.get("x-slack-request-timestamp");
+  const signature = request.headers.get("x-slack-signature");
+  if (!timestamp || !signature) return false;
+
+  // Reject requests older than 5 minutes -- replay protection.
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSeconds - Number(timestamp)) > 300) return false;
+
+  const baseString = `v0:${timestamp}:${rawBody}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(env.SLACK_SIGNING_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(baseString));
+  const computedSignature =
+    "v0=" +
+    Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+  return timingSafeEqual(computedSignature, signature);
+}
+```
+
+The 5-minute window is Slack's own guidance: a timestamp further than five
+minutes from local time is treated as a possible replay attack, so the
+request should be rejected before the HMAC is even computed.
+
+## The raw-body pitfall
+
+The HMAC is computed over the **exact bytes** of the request body Slack
+sent — not a re-serialized version of it. `Request.json()` consumes and
+parses the body; by the time you have a parsed object, the original byte
+sequence is gone, and `JSON.stringify(parsed)` will not reliably reproduce
+it (key order, whitespace, and number formatting can all differ).
+
+:::danger[Read the raw body before parsing JSON]
+Call `await request.clone().text()` (or `request.text()` if you don't also
+need the parsed body from the same `Request` object) to get the raw string,
+compute the signature over that, and only then `JSON.parse` it if the
+signature checks out. Verifying against a re-stringified body is the most
+common way this check silently always fails, or worse, always passes
+because both sides normalize the same way and the check stops meaning
+anything.
+:::
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const rawBody = await request.text();
+
+    const isValid = await verifySlackSignature(request, rawBody, env);
+    if (!isValid) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    const payload = JSON.parse(rawBody);
+    // ... handle payload (see Three-Second Ack)
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+## Timing-safe comparison
+
+A plain `===` on two strings short-circuits on the first mismatched
+character, which leaks how many leading characters were correct through
+response timing. Slack's docs themselves recommend an HMAC-aware compare
+function over direct equality. On Workers, a simple constant-time loop is
+enough since both strings are fixed-length hex:
+
+```typescript
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+```
+
+:::tip[Length check first is fine]
+Returning early on a length mismatch does not leak useful information here —
+both values are always a fixed-length hex digest under normal operation, so
+a length mismatch only ever means "malformed input," not "N characters
+matched."
+:::
+
+## Gotchas
+
+- **`request.json()` before signature checking** silently breaks
+  verification — see the raw-body pitfall above. Always get the raw string
+  first.
+- **Missing headers should fail closed.** No `X-Slack-Signature` or
+  `X-Slack-Request-Timestamp` means "not a valid Slack request," not
+  "skip verification."
+- **The signing secret is per-app, not per-workspace.** Rotating it in
+  Slack's app management console invalidates every signature computed with
+  the old value — deploy the new secret ([Secrets and
+  Config](./secrets-and-config.mdx)) in the same change as any app-side
+  rotation.
+- **Clock skew is real at the edge.** The 5-minute window is generous enough
+  to absorb normal clock drift between Slack's servers and a Workers
+  isolate; don't tighten it further.
