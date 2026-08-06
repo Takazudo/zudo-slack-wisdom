@@ -1,0 +1,109 @@
+---
+title: リクエストの検証
+description: Workers 上での Slack v0 リクエスト署名方式 -- crypto.subtle による HMAC-SHA256、生ボディの落とし穴、タイミングセーフな比較。
+sidebar_position: 3
+---
+
+## 概要
+
+Events API、インタラクティビティ、スラッシュコマンドなど、Worker が Slack へ公開するエンドポイントはすべて公開 URL である。リクエストに反応する前に、Worker はそれが URL を見つけた誰かではなく本当に Slack から来たものだと証明しなければならない。Slack は送信するすべてのリクエストにアプリの signing secret で署名しており、[Slack のリクエスト検証ドキュメント](https://docs.slack.dev/authentication/verifying-requests-from-slack/)が、再現して照合すべき方式を厳密に定義している。
+
+## v0 署名方式
+
+Slack からのリクエストには、必ず 2 つのヘッダーが付いてくる。
+
+- `X-Slack-Request-Timestamp` -- Slack がリクエストを送った時刻（Unix 秒）
+- `X-Slack-Signature` -- `v0=<hex HMAC-SHA256 digest>`
+
+署名の対象は、タイムスタンプとリクエストボディそのものから組み立てた**ベース文字列**である。
+
+```
+v0:{timestamp}:{raw_body}
+```
+
+Worker は `HMAC-SHA256(signing_secret, base_string)` を計算し、16 進エンコードして `v0=` を前置し、受信した `X-Slack-Signature` ヘッダーと突き合わせる。この処理は完全に `crypto.subtle` だけで完結し、Workers 上で外部の暗号ライブラリを持ち込む必要はない。
+
+```typescript
+async function verifySlackSignature(
+  request: Request,
+  rawBody: string,
+  env: Env,
+): Promise<boolean> {
+  const timestamp = request.headers.get("x-slack-request-timestamp");
+  const signature = request.headers.get("x-slack-signature");
+  if (!timestamp || !signature) return false;
+
+  // Reject requests older than 5 minutes -- replay protection.
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSeconds - Number(timestamp)) > 300) return false;
+
+  const baseString = `v0:${timestamp}:${rawBody}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(env.SLACK_SIGNING_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(baseString));
+  const computedSignature =
+    "v0=" +
+    Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+  return timingSafeEqual(computedSignature, signature);
+}
+```
+
+5 分というウィンドウは Slack 自身のガイダンスに基づく。ローカル時刻から 5 分以上離れたタイムスタンプはリプレイ攻撃の可能性ありとみなされるため、HMAC を計算するより前に弾いてしまってよい。
+
+## 生ボディの落とし穴
+
+HMAC は Slack が送ってきたリクエストボディの**バイト列そのもの**に対して計算する。シリアライズし直したものではない。`Request.json()` はボディを消費してパースしてしまうので、パース済みオブジェクトを手にした時点で元のバイト列は失われており、`JSON.stringify(parsed)` でそれを確実に復元することはできない（キーの順序、空白、数値の表現がいずれもずれうる）。
+
+:::danger[JSON をパースする前に生ボディを読む]
+`await request.clone().text()`（同じ `Request` オブジェクトからパース済みボディを取る必要がないなら `request.text()` でよい）で生の文字列を取得し、それに対して署名を計算する。JSON へのパースは、署名が一致してからで構わない。シリアライズし直したボディに対して検証してしまうのが、このチェックが黙って常に失敗する最もありがちな原因だ。さらに悪いのは、両側が同じ正規化を経て常に成功してしまい、チェックが何の意味も持たなくなるケースである。
+:::
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const rawBody = await request.text();
+
+    const isValid = await verifySlackSignature(request, rawBody, env);
+    if (!isValid) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    const payload = JSON.parse(rawBody);
+    // ... handle payload (see Three-Second Ack)
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+## タイミングセーフな比較
+
+素の `===` による文字列比較は最初に食い違った文字で打ち切られるため、先頭何文字が一致していたかが応答時間から漏れる。Slack のドキュメント自身も、単純な等値比較ではなく HMAC を意識した比較関数を推奨している。Workers 上では、両者とも固定長の 16 進文字列なので、単純な定数時間ループで十分だ。
+
+```typescript
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+```
+
+:::tip[長さのチェックを先に置いても問題ない]
+長さが違う時点で早期リターンしても、ここでは有用な情報は漏れない。正常な運用ではどちらの値も常に固定長の 16 進ダイジェストなので、長さの不一致は「N 文字まで一致した」ではなく「不正な形式の入力」しか意味しないからだ。
+:::
+
+## つまずきどころ
+
+- **署名チェックの前に `request.json()` を呼ぶ**と、検証が黙って壊れる。上の「生ボディの落とし穴」のとおり、必ず先に生の文字列を取ること。
+- **ヘッダーが欠けているときはフェイルクローズする。** `X-Slack-Signature` や `X-Slack-Request-Timestamp` がないということは「有効な Slack リクエストではない」であって、「検証をスキップする」ではない。
+- **signing secret はワークスペース単位ではなくアプリ単位。** Slack のアプリ管理コンソールでローテーションすると、古い値で計算された署名はすべて無効になる。アプリ側のローテーションと同じ変更のなかで、新しいシークレットもデプロイすること（[シークレットと設定](./secrets-and-config.mdx)）。
+- **エッジではクロックスキューが現実に起きる。** 5 分のウィンドウは、Slack のサーバーと Workers のアイソレート間で生じる通常の時刻のずれを吸収できる程度には広く取ってある。これ以上狭めないこと。

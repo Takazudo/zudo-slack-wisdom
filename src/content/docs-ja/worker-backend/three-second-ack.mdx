@@ -1,0 +1,86 @@
+---
+title: 3 秒 ack
+description: Slack の 3 秒 ack ルール、実処理を担う ctx.waitUntil()、そして X-Slack-Retry-Num によるリトライの扱い。
+sidebar_position: 4
+---
+
+## 概要
+
+Slack は Events API のリクエストに対して、**3 秒以内**の HTTP `2xx` 応答を期待している。[Slack の Events API ドキュメント](https://docs.slack.dev/apis/events-api/)によれば、この時間内に返せなかった場合は Slack のリトライ機構が動き出す。同じイベントが、場合によっては何度も再送されてくる一方で、最初のハンドラーはまだ走り続けているかもしれない。スラッシュコマンドやインタラクティビティのペイロードも形は同じで、まず素早く ack し、実際の処理はそのあとに回す。
+
+Cloudflare Worker の `fetch` ハンドラーはこの形に自然に馴染む。ただし、LLM の呼び出し、データベースへの書き込み、フォローアップメッセージの投稿といった「実処理」を、レスポンスを返す*前*ではなく*後*に走らせることが条件になる。
+
+## まず ack し、処理は `ctx.waitUntil()` へ
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const rawBody = await request.text();
+    if (!(await verifySlackSignature(request, rawBody, env))) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    const payload = JSON.parse(rawBody);
+
+    // Slack's URL verification handshake -- must be answered synchronously.
+    if (payload.type === "url_verification") {
+      return Response.json({ challenge: payload.challenge });
+    }
+
+    // Hand the real work to ctx.waitUntil() and return immediately.
+    // payload.event_id is the envelope's dedup key (see Deduplication below).
+    ctx.waitUntil(handleEvent(payload.event, env, payload.event_id));
+    return new Response(null, { status: 200 });
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+`ctx.waitUntil()` は、レスポンスを送り終えたあとも指定した Promise のためにアイソレートを生かしておくよう Workers ランタイムへ伝えるものだ。これがないと、ランタイムは `fetch()` が返った時点で Worker を破棄してよいことになり、実行中の `handleEvent()` が途中で打ち切られうる。Cloudflare は、この方法で登録された処理におよそ 30 秒の予算を割り当てるとしている（同一リクエスト内のすべての `waitUntil()` 呼び出しで共有される）。Slack のイベントハンドラーには十分すぎる長さだが、処理が日常的にそれを超えるようなら、本物のキューの代わりにはならない。Promise がいつまでも解決しない場合の挙動を含む完全な仕様は、[Cloudflare の `ctx.waitUntil()` ドキュメント](https://developers.cloudflare.com/workers/runtime-apis/context/)を参照。
+
+:::danger[レスポンスを返す前に実処理を `await` してはいけない]
+`return` の前に `await handleEvent(...)` を置くと、ハンドラーが少しでも重いこと（LLM 呼び出し、Slack Web API の往復、データベースへの書き込み）をした途端に 3 秒の予算を使い切る。ここでの `ctx.waitUntil()` は最適化ではない。これがなければ ack と処理が結合したままになり、Slack はほとんど即座にリトライを始める。
+:::
+
+## リトライのセマンティクス
+
+Slack は ack の失敗に対して最大**3 回**リトライする。ほぼ即座に 1 回、約 1 分後に 1 回、約 5 分後に 1 回だ。各リトライには 2 つのヘッダーが付く。
+
+- `X-Slack-Retry-Num` -- 試行回数。`1`、`2`、`3` のいずれか
+- `X-Slack-Retry-Reason` -- リトライの理由（`http_timeout`、`connection_failed`、`http_error` など）
+
+```typescript
+const retryNum = request.headers.get("x-slack-retry-num");
+if (retryNum) {
+  // This is a Slack-initiated retry, not a first delivery.
+  console.log(`Slack retry #${retryNum}: ${request.headers.get("x-slack-retry-reason")}`);
+}
+```
+
+リトライが来たということは、Slack が*最初の*試行は失敗したと判断したという意味でしかない。そこには、Worker が実際にはイベントを処理し終えていたが 200 のレスポンスが間に合わなかった、というケースも含まれる。これが重複排除の問題そのものだ。リトライは新しい HTTP リクエストでありながら、すでに済ませた仕事を指しているかもしれない。
+
+## `event_id` による重複排除
+
+すべてのイベントペイロードには、グローバルに一意な `event_id` が含まれている。Slack のドキュメントは特定の重複排除方式を規定していないが、`event_id` はまさにこのために用意されたフィールドだ。これを記録し（リトライのウィンドウは長くても 5 分程度なので、短い TTL を付けた KV で足りる）、すでに見たものならば処理をスキップする。
+
+```typescript
+async function handleEvent(event: SlackEvent, env: Env, eventId: string): Promise<void> {
+  const dedupeKey = `slack-event:${eventId}`;
+  if (await env.KV.get(dedupeKey)) {
+    return; // Already processed -- this is a retry.
+  }
+  await env.KV.put(dedupeKey, "1", { expirationTtl: 600 });
+
+  // ... do the real work
+}
+```
+
+:::tip[重複だと分かってスキップする場合でも、ack は速く返す]
+重複だったかどうかにかかわらず、`200` は即座に返すこと。ack と重複チェックは別々の関心事であり、レスポンスを返す前の KV 読み取りに 3 秒の予算を食わせてはいけない。
+:::
+
+## つまずきどころ
+
+- **`ctx.waitUntil()` のなかで起きた失敗は、呼び出し元からは見えない。** Slack はすでに `200` を受け取っている。バックグラウンドの Promise が throw した場合は、HTTP エラーとして表面化させるのではなく、その Promise の内側で捕捉してログに残すしかない。
+- **リトライは必ずしもユーザーの意図の重複を意味しない。** 元のイベントを本当にもう一度実行する必要がある場合（たとえば重複排除用のストア自体が壊れていたとき）もあるので、リトライは全部捨てて安全だと決めつけないこと。判断の基準は `event_id` であって、「これは 2 回目 / 3 回目だから」ではない。
+- **3 秒の予算には、自前の署名検証や JSON のパースも含まれる。**「実処理」だけではない。`return` より手前は何もかも軽く、体感として同期的に済むよう保つこと。
+- **スラッシュコマンドとインタラクティビティは ack のパターンこそ共有するが、ペイロードの形は違う。** 3 秒ルールと `ctx.waitUntil()` のやり方はそのまま通用する一方、ペイロードの構造と `X-Slack-Retry-*` ヘッダーは Events API 固有である。扱うサーフェスに対応する Slack のドキュメントを確認すること。
