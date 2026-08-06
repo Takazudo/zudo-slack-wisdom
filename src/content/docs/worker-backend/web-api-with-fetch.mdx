@@ -133,6 +133,18 @@ apply — back off the specific method that returned `429`, and let every
 other call proceed normally.
 :::
 
+:::warning[A long Retry-After can outlive ctx.waitUntil()'s budget]
+Sleeping in-isolate is fine for the short delays Slack typically sends, but
+`Retry-After` has no documented upper bound, and background work registered
+with `ctx.waitUntil()` only gets roughly 30 seconds after the response is
+sent (see [Three-Second Ack](./three-second-ack.mdx)). If this retry runs
+inside that background work and `Retry-After` is long enough to blow the
+budget, the runtime cancels the pending promise mid-wait. For a call where
+that matters, don't loop-and-sleep past a couple of retries in-Worker —
+persist "retry this later" state (KV, D1, a queue) and let the next cron
+tick or a dedicated retry path pick it up instead.
+:::
+
 ## Gotchas
 
 - **Form-encoding an array-shaped argument is the most common cause of a
@@ -140,9 +152,11 @@ other call proceed normally.
   objects (Block Kit `blocks`, Lists `cells`, and similar), send
   `application/json` — there's no reason to use form encoding for any Web
   API call from a Worker.
-- **A `200` response does not mean success.** The Web API always answers
-  `200` and puts the real result in the JSON body's `ok` field. Check
-  `json.ok`, not `res.ok`.
+- **A `200` response does not mean success, and not every response is
+  `200`.** Most Web API responses are `200` with the real result in the
+  JSON body's `ok` field — check `json.ok`, not just `res.ok` — but `429`
+  and transient HTTP-level errors (timeouts, `5xx`) do happen and need
+  their own handling, as the retry helper above does for `429`.
 - **`Retry-After` is authoritative — don't guess your own backoff.** Slack
   tells you exactly how long to wait; a shorter self-chosen delay just
   produces another `429`.

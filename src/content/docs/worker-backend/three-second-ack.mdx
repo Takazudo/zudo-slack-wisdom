@@ -36,7 +36,8 @@ export default {
     }
 
     // Hand the real work to ctx.waitUntil() and return immediately.
-    ctx.waitUntil(handleEvent(payload.event, env));
+    // payload.event_id is the envelope's dedup key (see Deduplication below).
+    ctx.waitUntil(handleEvent(payload.event, env, payload.event_id));
     return new Response(null, { status: 200 });
   },
 } satisfies ExportedHandler<Env>;
