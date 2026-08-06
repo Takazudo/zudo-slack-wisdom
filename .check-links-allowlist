@@ -14,3 +14,9 @@
 # When ANY of these stops being a known exception (e.g. someone
 # writes the missing JA mirror page), DELETE the entry — the
 # strict gate then surfaces real regressions in the same category.
+
+# The JA lists index mirrors the EN one, which links to the
+# data-surfaces section. The JA data-surfaces mirror is written by
+# sub-issue #18 (JA translations 3) — DELETE this entry once that
+# lands, since the link resolves from then on.
+dist/ja/docs/lists/index.html:893:../data-surfaces/index/

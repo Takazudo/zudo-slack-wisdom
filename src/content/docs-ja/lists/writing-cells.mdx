@@ -1,0 +1,140 @@
+---
+title: リストアイテムへの書き込み
+description: slackLists.items.update のリクエストとレスポンスの契約
+sidebar_position: 6
+---
+
+## 概要
+
+[`slackLists.items.update`](https://docs.slack.dev/reference/methods/slackLists.items.update/) は、既存のリスト行のセル値を変更する唯一の書き込み経路だ — ステータスカラムの切り替え、担当者の付け替え、チェックボックスのオンなど。引数はちょうど 3 つ：`token`（ヘッダー）、`list_id`、`cells` を取る。3 つとも必須で、任意の 4 つ目の引数もトップレベルの `row_id` も存在しない — `cells[]` の各エントリが `column_id` と 1 つの型付き値キーとともに、それぞれ自分の `row_id` を持つ。
+
+Slack 自身のドキュメントには "Update select option" と題されたサンプルがある：
+
+```json
+{
+  "list_id": "F01ABCDE2FG",
+  "cells": [
+    { "column_id": "Col018AL7649G", "select": ["in_progress"], "row_id": "Rec018B8RR603" }
+  ]
+}
+```
+
+[`slackLists.items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/) と突き合わせると、このサンプルの `Col018AL7649G` は `type: "select"` / `format: "single_select"` の "Status" カラムであることが確認できる — つまりドキュメントは、こじつけの類例ではなく実際の単一選択の切り替えを示している。
+
+必要なスコープは bot トークン上の `lists:write` だけだ — [`lists:write`](https://docs.slack.dev/reference/scopes/lists.write/) 単体で十分であり、書き込みに `lists:read` は要らない。
+
+## 1 回の呼び出しで複数行をまとめる
+
+`row_id` がトップレベルではなく各セルの内側にあるため、1 回の呼び出しが構造上は多数の異なる行とカラムを対象とするセルを運べる：
+
+```json
+{
+  "list_id": "F01ABCDE2FG",
+  "cells": [
+    { "row_id": "Rec0AAA111", "column_id": "Col0STATUS01", "select": ["done"] },
+    { "row_id": "Rec0BBB222", "column_id": "Col0STATUS01", "select": ["doing"] },
+    { "row_id": "Rec0BBB222", "column_id": "Col0OWNER99", "user": ["U01284PCR98"] }
+  ]
+}
+```
+
+:::warning[未検証]
+Slack のドキュメントのサンプルはすべて 1 行に対する 1 セルだけを示しており、1 回の呼び出しが複数の `row_id` にまたがってよいと述べたページは存在しない。形の上では可能だが、これは推論であって契約ではない。一括同期にとって最もレバレッジの大きい未知 — 200 行の更新がひとまとめの数回の呼び出しで済むのか、それとも Tier 3 のもとで 1 行 1 呼び出しになるのか — なので、同期ループを設計する前に経験的に確認すること（既知の 2 行を 1 回の呼び出しで書き、その両方を読み返す）。
+:::
+
+## 型付きの値キーは（ほぼ）常に配列
+
+各セルは、対象カラムの型に対応する型付きの値キーをちょうど 1 つ運ぶ。そのほとんどは、単一の値を保持する場合でも配列だ：
+
+| カラムの型 | セルのキーと形 |
+|---|---|
+| select（単一・複数どちらも） | `select: ["opt_value"]` — 常に文字列の配列 |
+| user | `user: ["U01..."]` |
+| checkbox | `checkbox: [true]` |
+| rating | `rating: [3]` |
+| number | `number: [42]` |
+| date | `date: ["2026-08-06"]` |
+| timestamp | `timestamp: [1699999999]` |
+| text / notes | Block Kit の `rich_text` 構造 — プレーンな文字列は不可 |
+
+裸のスカラー（`select: "done"`）を送ると `invalid_input_type` で失敗する。裸の文字列になるのはレスポンス側の `text` 便宜フィールドだけであり、書き込み側はテキストカラムに対して決してそれを受け付けず、プレーンな文字列を送れば `invalid_blocks` / `invalid_text_block` で失敗する。
+
+**単一選択と複数選択のカラムはまったく同じ形で書き込む。** ドキュメントにも公式 SDK の型の union にも `multi_select` というセルキーは存在せず、どちらのカラム形式も `select: [...]` を通る。いくつのエントリが受理されるかを決めるのはカラムの `options.format` だ。
+
+:::warning[未検証]
+`options.format` が `single_select` のカラムに 2 つの値（`select: ["a", "b"]`）を送ったときの挙動は未定義だ — エラーになるのか、最初の値だけが残るのか、両方が保存されるのか、ドキュメントはいっさい述べていない。未テストとみなし、どちらの結果にも依存しないこと。
+:::
+
+## `key` / 汎用 `value` の形は非推奨
+
+Slack のドキュメントは、古い `key` フィールドプロパティが "will be deprecated in favor of `column_id`"、そして汎用の `value` フィールドも "will also be deprecated eventually in favor of typed values" だと明言している。初日からすべてのセルを `column_id` と上記の型付きキーの 1 つで指定すること — 古いサンプルやサードパーティのコードで見かけたとしても、Slack がすでに削除を予告している以上、`key` / `value` の形を前提に作らないこと。
+
+## レスポンスは素の `{"ok": true}`
+
+成功時の呼び出しが返すのはちょうど `{"ok": true}` だけだ — 更新された行のエコーも、リビジョントークンも、`list_metadata` もない。書き込みが反映されたことを確かめるには、[`items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/) または `items.list` で読み返す必要がある。
+
+コンテンツタイプには `application/json` を使うこと。フォームエンコードも名目上は受理されるが、`cells` はそれ自体が配列を含むオブジェクトの配列であり、この形をフォームエンコードしたボディは `invalid_array_arg` を返す。
+
+## 1 回の呼び出しあたりの `cells[]` 上限
+
+メソッドのドキュメントページに `cells[]` の正式なサブスキーマは存在しない — セルのプロパティ（`row_id`、`column_id`、型付きの値キー）はどれもサンプルかエラー文字列の中にしか現れない。[slack-ruby/slack-api-ref](https://github.com/slack-ruby/slack-api-ref) がミラーしている生のドキュメント JSON は `cells` を `minItems: 1, maxItems: 100` に制約しており、`over_cell_fields_limit` エラーが上限を超えたことを示す実行時のシグナルになる。
+
+:::warning[未検証]
+`maxItems: 100` という数字は Slack の内部ドキュメント JSON をサードパーティがミラーしたものに由来し、API へのライブ検証ではない — 実用上の上限は稼働中のサービスに対して確認されていない。積極的にバッチ化する前に、自分で実際の上限を経験的に見つけること（101 セルを送って `over_cell_fields_limit` を期待し、観測された上限が違えば二分探索する）。
+:::
+
+## コピペで使える Worker 側の例
+
+```ts
+const SLACK_API_BASE_URL = "https://slack.com/api";
+
+// Opaque Slack IDs, persisted by us: list_id + column_id come from
+// slackLists.create (or items.info); row_id comes from slackLists.items.create
+// when the bot first inserts the row.
+const LIST_ID = "F09ABCDE1FG";
+const STATUS_COLUMN_ID = "Col07XSTATUS01";
+
+// The bot writes the slug (options.choices[].value); Slack renders the label
+// chip. Choose slugs at slackLists.create time -- no API path edits an
+// existing column's option set afterwards (UI edits and todo_mode column
+// additions are the only post-creation schema changes; see schema-mutability.mdx).
+const STATUS_OPTION = {
+  todo: "todo",
+  doing: "doing",
+  done: "done",
+} as const;
+
+export async function setListItemStatus(
+  botToken: string,
+  rowId: string,
+  option: (typeof STATUS_OPTION)[keyof typeof STATUS_OPTION],
+): Promise<void> {
+  const res = await fetch(`${SLACK_API_BASE_URL}/slackLists.items.update`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${botToken}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify({
+      list_id: LIST_ID,
+      cells: [
+        {
+          row_id: rowId, // <- INSIDE the cell, not top-level
+          column_id: STATUS_COLUMN_ID,
+          select: [option], // <- ALWAYS an array, even single-select
+        },
+      ],
+    }),
+  });
+
+  const body = (await res.json()) as { ok?: boolean; error?: string };
+  if (body.ok !== true) {
+    throw new Error(`slackLists.items.update rejected: ${body.error}`);
+  }
+  // Success body is literally {"ok": true} -- no updated row is returned.
+}
+```
+
+これを GET やフォームエンコードの経路に通さないこと：オブジェクトの配列をフォームエンコードすると、前述のとおり `invalid_array_arg` になる。
+
+`select` の値がラベルではなくスラッグでなければならない理由は [select カラム](./select-columns.mdx)を参照。分岐に使えるエラーの全一覧は[エラーリファレンス](./errors-reference.mdx)を参照。

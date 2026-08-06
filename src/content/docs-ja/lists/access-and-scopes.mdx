@@ -1,0 +1,61 @@
+---
+title: アクセスとスコープ
+description: スコープ、招待制のデフォルト、そして access.set / access.delete の契約
+sidebar_position: 3
+---
+
+## スコープ
+
+API 全体はちょうど 2 つのスコープでカバーされる：`lists:read` と `lists:write` だ。どちらも **bot（`xoxb`）トークンとユーザートークンの両方**に対応しており、どちらのスコープページにも restricted・sensitive・管理者承認要のマーカーは付いていない。既存のアプリにどちらかのスコープを追加すると、OAuth の **再インストール** が必須になる。
+
+出典：[`lists:write` スコープ](https://docs.slack.dev/reference/scopes/lists.write/)。
+
+## スコープは必要条件だが十分条件ではない
+
+リストのデフォルトは招待制 — 「招待された人だけがアクセスできる」だ。正しいスコープを持つ bot トークンであっても、`slackLists.access.set` によってそのリストが bot のユーザー ID か bot の所属チャンネルに対して明示的に共有されるまでは `list_not_found` が返り続ける。
+
+管理者トグルによって、プランゲートとは独立にワークスペース単位または組織単位でリストを無効化できる（[インデックスページ](./index.mdx#有料プランによるゲート)を参照）。さらに別のトグルはリストの共有をオーナーのみに制限でき、その場合 bot は自分が所有していないリストに対して `access.set` を呼ぶことが一切できなくなる。
+
+:::warning[未検証]
+bot が自分で作成して **いない** リストへの書き込みアクセスをどうやって得るのかは、本当にドキュメント化されていない。`slackLists.access.set` は `user_ids` か `channel_ids` しか受け取らず、`app_ids` その他の bot 用引数はどこにもドキュメントがない。bot 自身のユーザー ID を `user_ids` に渡せば *おそらく* 動くはずだが、Slack はそれを明言していない。bot が所属するチャンネルへ共有するのがフォールバックだが、チャンネル共有をしたにもかかわらず `list_not_found` になったというコミュニティ報告が 1 件ある（ワークフロートークンの文脈であり、`xoxb` について決定的とは言えない）。[リストの作成](./creating-lists.mdx)にある「bot がリストを作る」パターンはこの穴を丸ごと回避する — リストの作成者は暗黙にアクセス権を持つため、bot がリストを作るのがドキュメント上きれいな唯一の経路になる。
+:::
+
+## `access.set` / `access.delete` の契約
+
+`slackLists.access.set` がアクセスを付与し、`slackLists.access.delete` がそれを完全に剥奪する。
+
+| 引数 | 値 | 備考 |
+|---|---|---|
+| `access_level` | `read` \| `write` \| `owner` | **必須、デフォルトなし。** 省略すると呼び出しが失敗する。 |
+| `user_ids` | ユーザー ID の配列 | `channel_ids` と排他。どちらか一方は必須。 |
+| `channel_ids` | チャンネル ID の配列 | `user_ids` と排他。どちらか一方は必須。 |
+
+- `read` — 「リストへの読み取りアクセスを付与する」
+- `write` — 「リストへの読み取りと書き込みのアクセスを付与する」
+- `owner` — `user_ids` で指定したユーザーをオーナーにする
+
+**オーナーはユーザー限定。** `access_level: "owner"` を `channel_ids` と組み合わせると `invalid_arguments` が返る — オーナーになれるのはユーザーだけで、チャンネルは決してなれない。
+
+Slack はまさにこの「読み取り専用ダッシュボード」のケース向けに、既成のサンプルを用意している：
+
+```json
+{ "list_id": "F1234567", "access_level": "read", "channel_ids": ["C7654321"] }
+```
+
+`slackLists.access.delete` は `access_level` 引数を取らない — これは完全な剥奪であり、格下げではない。あるエンティティを `write` から `read` へ落とすには、`read` を指定して `access.set` を呼び直す。
+
+:::warning[未検証]
+より低い `access_level` を指定して `access.set` を呼び直したときに、既存の付与が実際に格下げされるのか（それともメソッド名が "set" である以上 no-op なのか）は、Slack のドキュメントのどこにも明言されていない。完全な `access.delete` + 再付与を除けば、これが唯一のドキュメント化された降格経路だ。
+:::
+
+**付与は書き込み専用 — 監査のための読み返しはできない。** `access.list` も `access.get` も `slackLists.info` も存在しない。付与は書き込み専用であり、あるリストに対して現在誰が read を持ち誰が write を持っているのかをプログラムから列挙することはできない。唯一の監査経路は UI の共有ペインだ。
+
+スコープ：`lists:write`（bot トークンとユーザートークン）。レート制限：Tier 3（50+/分）。有料プランが必要 — [有料プランによるゲート](./index.mdx#有料プランによるゲート)を参照。
+
+出典：[`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/)。
+
+## `xwfp` トークンのバグ
+
+Workflow Builder の `xwfp` トークンで `items.create` / `items.update` が失敗するという未解決のバグが報告されている。これは `xwfp` に固有の問題であり、標準の bot（`xoxb`）トークンには影響しない。
+
+出典：[slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)（2026-08 時点でまだオープン）。
