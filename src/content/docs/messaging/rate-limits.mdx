@@ -40,10 +40,10 @@ before writing a custom retry loop.
 `chat.postMessage` carries `special` rate-limit behavior rather than a plain tier: apps may post
 **no more than one message per second, per channel**, regardless of whether the message goes out
 via `chat.postMessage`, an incoming webhook, or any other path into a channel. Short bursts above
-that rate are tolerated, but Slack doesn't guarantee every message in a burst will display — a
-tight loop posting many messages to the same channel in the same second risks silent drops rather
-than a clean 429. Space out high-volume posting (or batch content into fewer, larger messages)
-rather than relying on burst tolerance.
+that rate are tolerated, but Slack doesn't guarantee every message in a burst will display, and a
+sustained excess can still draw the standard `HTTP 429` + `Retry-After` response described above —
+implement that handling for posting calls too, not only for read methods. Space out high-volume
+posting (or batch content into fewer, larger messages) rather than relying on burst tolerance.
 
 ## The 2025–2026 Rate-Limit Changes for Non-Marketplace Apps
 

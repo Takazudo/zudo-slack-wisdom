@@ -10,10 +10,14 @@ sidebar_position: 2
 private group, or IM channel to send the message to"
 ([`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postMessage/)). In practice,
 prefer the encoded ID (`C0123456789`) over a name: IDs are stable across channel renames, and some
-name-based lookups depend on the app already being a member of the channel. A bot must be a member
-of a channel to post into it — public channels can be joined with `conversations.join`, but
-private channels require an explicit invite; there is no scope that lets an app force its way into
-a private channel it hasn't been added to.
+name-based lookups depend on the app already being a member of the channel.
+
+Membership requirements differ by channel type. A bot with the
+[`chat:write.public`](https://docs.slack.dev/reference/scopes/chat.write.public/) scope can post
+to any **public** channel without joining it first — that scope exists specifically to skip the
+join step. Without it, a bot must join public channels via `conversations.join` before posting.
+**Private** channels have no such shortcut: there is no scope that lets an app post into a private
+channel it hasn't been explicitly invited to.
 
 ## Threading with `thread_ts`
 
