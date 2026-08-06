@@ -8,7 +8,7 @@
  */
 
 import { readFile, readdir, access } from "node:fs/promises";
-import { join, extname, resolve, relative, dirname, sep } from "node:path";
+import { join, extname, resolve, relative, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -132,14 +132,26 @@ export async function resolveLinkDetail(href, distDir, basePath = "/", fileDir =
   const clean = href.split("#")[0].split("?")[0];
   if (!clean) return "root";
 
-  let absolute = clean;
-
-  // Resolve relative links against the file's directory within dist
-  if (!clean.startsWith("/")) {
-    // Relative link — resolve against the file's containing directory
-    const dirInDist = fileDir ? relative(distDir, fileDir) : "";
-    absolute = "/" + join(dirInDist, clean);
-  }
+  // Resolve relative links against the file's directory within dist, then
+  // run browser-style dot-segment removal (RFC 3986 §5.2.4) over the whole
+  // path: a `..` beyond the root is dropped rather than escaping past `/`,
+  // same as an actual browser resolving the href. This both matches real
+  // navigation (`../../../x` from a 2-deep page clamps to `/x`, it isn't
+  // invalid) and, as a side effect, guarantees the resolved path can never
+  // point outside distDir — `join(distDir, relPath)` below can't be tricked
+  // into probing a repo file that sits above dist/.
+  const dirInDist = !clean.startsWith("/") && fileDir ? relative(distDir, fileDir) : "";
+  const combined = dirInDist ? `${dirInDist}/${clean}` : clean;
+  const segments = combined.split("/").reduce((out, seg) => {
+    if (seg === "" || seg === ".") return out;
+    if (seg === "..") {
+      out.pop();
+      return out;
+    }
+    out.push(seg);
+    return out;
+  }, []);
+  const absolute = "/" + segments.join("/");
 
   // Strip base path prefix from the href to get the path relative to dist/
   let stripped = absolute;
@@ -149,17 +161,6 @@ export async function resolveLinkDetail(href, distDir, basePath = "/", fileDir =
 
   const relPath = stripped.startsWith("/") ? stripped.slice(1) : stripped;
   if (!relPath) return "root";
-
-  // Clamp to distDir: a relative link with more `..` segments than its
-  // containing directory is deep can otherwise escape dist/ (e.g.
-  // `join("docs", "../../package.json")` normalizes to `../package.json`),
-  // letting a file that exists elsewhere in the repo satisfy the existence
-  // check below for a link that actually 404s in the browser.
-  const resolvedDistDir = resolve(distDir);
-  const resolvedTarget = resolve(distDir, relPath);
-  if (resolvedTarget !== resolvedDistDir && !resolvedTarget.startsWith(resolvedDistDir + sep)) {
-    return "missing";
-  }
 
   // Has file extension → check exact path
   if (extname(relPath)) {
