@@ -14,21 +14,3 @@
 # When ANY of these stops being a known exception (e.g. someone
 # writes the missing JA mirror page), DELETE the entry — the
 # strict gate then surfaces real regressions in the same category.
-
-# --- JA getting-started -> JA sections not yet translated (#16) ---
-# The JA getting-started pages link at the JA mirrors of messaging,
-# events, lists, and data-surfaces, per the bilingual rule that
-# relative links stay inside their own locale. Those mirrors are
-# written by the sibling translation sub-issues, so the targets do
-# not exist on this branch yet:
-#   ../lists/*          -> #17, #18
-#   ../data-surfaces/*  -> #18
-#   ../messaging/*      -> #19
-#   ../events/*         -> #19
-# DELETE this whole block once #17-#19 have landed on
-# base/slack-wisdom-v1 — the links resolve on their own then.
-dist/ja/docs/getting-started/index.html:893:../messaging/index/
-dist/ja/docs/getting-started/index.html:893:../events/index/
-dist/ja/docs/getting-started/index.html:893:../lists/index/
-dist/ja/docs/getting-started/index.html:893:../data-surfaces/index/
-dist/ja/docs/getting-started/tokens-scopes-oauth/index.html:893:../lists/access-and-scopes.mdx

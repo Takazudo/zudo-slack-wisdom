@@ -1,0 +1,66 @@
+---
+title: select カラム — ラベルではなく値
+description: slackLists.items.update がラベルを拒否する理由と、select カラムのスラッグ設計
+sidebar_position: 7
+---
+
+## 概要
+
+select カラム（単一選択・複数選択）は、ステータスボードにおける最も一般的な書き込み対象だ — たとえばカンバン式の「todo / doing / done」カラムがそれにあたる。書き込みが受理されるかどうかは正しい文字列を送れるかにかかっているが、その文字列は人間がチップ上で目にするものではない。
+
+## `select` 配列が運ぶのは値であって、ラベルではない
+
+`select` 配列が運ぶのはカラムスキーマの `options.choices[].value` — 機械可読なスラッグ — であって、人間が読むチップの文字列である `choices[].label` ではない。ラベルを書き込むと `invalid_option_id` が返る。
+
+Slack のドキュメントは散文で select の値を "an array of List encoded option IDs" と説明し、例では `OptHIGH123` 形式のプレースホルダーを使っているため、`choices[]` に別途 `id` キーがあるかのように読める。だが実際にはない：**API のどこを見ても、choice オブジェクトに `id` キーは存在しない。** choice は確認したすべての面で厳密に `{value, label, color}` だ — [`slackLists.create`](https://docs.slack.dev/reference/methods/slackLists.create/) のリクエストとレスポンス、`items.info` のスキーマ、[Node SDK の `SlackListsSchemaColumnChoice`](https://github.com/slackapi/node-slack-sdk/blob/main/packages/web-api/src/types/request/slackLists.ts)、そして Java SDK の `ListColumnOptions.Choice`。**`value` フィールドこそがオプション ID である。** ドキュメント自身の実例がそれを証明している：カラム `Col018AL7649G` は `{"value": "in_progress", "label": "In Progress"}` を持ち、そのカラムに対する update のサンプルは `select: ["in_progress"]` を書き込んでいる。
+
+## ローカライズされたラベルの下に ASCII スラッグを置くパターン
+
+`value` と `label` は独立したフィールドなので、select のオプションは `value` に安定した ASCII スラッグを持たせつつ、`label` には英語以外を含む任意の人間向けテキストを置ける — 書き込み経路はラベルにいっさい触れない。
+
+これが実際に機能しているパターンであることを示す本番の証拠：
+
+- [navikt/saape-slackapp](https://github.com/navikt/saape-slackapp) はノルウェー語のチップを `{value: 'pending', label: 'Avventer'}, {value: 'in_progress', label: 'Pågår'}, ...` と宣言し、`select: [listStatus]` で切り替えている — 値は ASCII のままで、ローカライズされるのはラベルだけだ。
+- [n8n コミュニティノードの README](https://github.com/hoyo/n8n-nodes-slack-lists) は "Select columns accept and return the option *value* (e.g. `day_1`, `OptXXXXXX`)." と述べている。
+- [SirMaiquis/deno-mr-poc](https://github.com/SirMaiquis/deno-mr-poc) は label→value のリゾルバ（`choices.find(c => c.label === ...)` → `option.value` を送る）を実装している — ラベルがそのまま通るなら存在しないはずのコードだ。
+
+:::note[退化したケース]
+`value === label` で定義されたカラムであれば、ラベルの文字列を送ってもたまたま動く — その場合はそれが値でもあるからだ。これに無自覚に依存しないこと。`value` と `label` は独立に選び、あとからラベルを変更（翻訳や言い回しの調整）しても書き込みが壊れないようにしておく。
+:::
+
+## bot がリストを作るパターン
+
+`slackLists.create` で bot 自身にリストを作らせ、すべてのオプションの `value` を最初に自分で決めること。これは 2 つの問題を同時に解決する：
+
+1. **スラッグの制御。** 任意の表示ラベルの下に中立的な ASCII の値（`todo` / `doing` / `done`）を選べるため、ラベル↔ID の対応づけ問題がまるごと消える — スラッグは Worker のコード内のコンパイル時定数になる。
+2. **アクセス。** bot が自分で作成して **いない** リストへの書き込みアクセスをどう得るのかは、本当にドキュメント化されていない：[`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/) は `channel_ids` と `user_ids` しか受け取らず、`app_ids` や bot 用の引数はどこにも存在しない。それでいて `items.update` は明確にアクセスを強制する（`access_denied`、`no_permission`、`permission_denied`）。この穴を回避するドキュメント上きれいな唯一の経路がリストを作ることだ：Slack のドキュメントは新しいリストを「acting user が所有する」と説明しており、bot トークンでの `slackLists.create` 呼び出しにおける acting user は bot 自身である。リストが bot のチャンネルへ共有されているにもかかわらず `items.update` が `list_not_found` を返したという実際のコミュニティ報告もある（[slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)、GA 前・ワークフロートークンの文脈）。人間がリストを作って bot に共有するという経路は、使い捨ての呼び出しで実証されるまで、それを前提に設計しないこと。
+
+:::warning[未検証]
+作成者が自動的に書き込みアクセスを保持すること — つまり bot 自身の `xoxb` トークンが `slackLists.create` の呼び出し後にそのリストのオーナーとして扱われること — は推論であって確認済みではない。Slack のドキュメントは新しいリストが「acting user が所有する」と述べてはいるが、bot トークンでの呼び出しについて「bot ユーザー」だと明言してはおらず、実際のワークスペースに対してこれを決着させるはずだった検証スパイクはスキップされている（テスト用トークンが用意できなかった）。設計の前提にする前に、たとえば `access_level: "owner"` を指定した `access.set` のようなオーナー限定の操作を bot に試させて、所有権を経験的に確認すること。
+:::
+
+すでに人間がリストを作ってしまっている場合、それを発見するための `slackLists.info` も `slackLists.list` も存在しない。発見手段は `slackLists.items.info`（`lists:read` が必要）であり、これは `list.list_metadata.schema[]` を含むリストオブジェクト全体 — つまりすべての select カラムとその `id` および `options.choices[]` — を返す。一度手作業で呼び出し、そのうえで値をハードコードすること。
+
+## 単一選択と複数選択はまったく同じ形で書き込む
+
+`multi_select` という別のセルキーは存在しない。単一選択のカラムも複数選択のカラムも、同じ `select: [...]` 配列を通して書き込む — いくつの値が受理されるかを決めるのは書き込みの形ではなく、カラムの `options.format`（`single_select` か `multi_select` か）だ。
+
+:::warning[未検証]
+`single_select` 形式のカラムに 2 つの値（`select: ["a", "b"]`）を送ったときの挙動はドキュメント上未定義だ — エラーになるのか、片方の値だけが残るのか、黙って受理されるのか、いずれも未テストである。
+:::
+
+## 既存セルに対する置換か追加か
+
+:::warning[未検証]
+すでに `"A"` を保持しているセルに `select: ["B"]` を書き込んだとき、それが追加ではなく **置換** になると述べた Slack のドキュメントページは存在しない。`single_select` 形式のカラムであれば置換だけが筋の通る意味論であり、本番のアプリもそれに依存しているが、これは推論であってドキュメント化された契約ではない。追加と置換で効果が本当に分かれる `multi_select` 形式のカラムでは、これが二重に効いてくる。1 つの行に対して `items.update` を 2 回連続で呼び（`["A"]` を書いてから `["B"]` を書く）、`items.info` で読み返して厳密に `["B"]` であることを表明してから依存すること。2 つの形式は挙動が異なりうるので、`multi_select` 形式のカラムに対しても別途繰り返すこと。
+:::
+
+## `select: []` による選択の解除
+
+:::warning[未検証]
+`select: []` が値の入った select セルをクリアするかどうかはドキュメント化されていない。少なくとも 1 つの本番コードベース [Kero46/slack-review-reminder](https://github.com/Kero46/slack-review-reminder/blob/main/lib/list_io.ts) は、これに依存する代わりに空のセルを update のペイロードから意図的に除外している。設計上「ステータスなし」という明示的な状態が必要なら、実際の API に対して確認が取れるまでは空配列によるクリアに頼らず、実在するオプションの値（たとえば `"none"`）としてモデル化すること。
+:::
+
+## 関連
+
+書き込みの契約全体（`list_id` + `cells[]`、型付きの値キー、バッチ化）は[リストアイテムへの書き込み](./writing-cells.mdx)を参照。リスト作成後にオプションの集合が実質的に閉じてしまう理由は[スキーマの可変性](./schema-mutability.mdx)を参照。不正なスラッグが生むエラーについては[エラーリファレンス](./errors-reference.mdx)を参照。

@@ -1,0 +1,58 @@
+---
+title: リストの作成
+description: slackLists.create のスキーマ設計と、レスポンスが消える前に永続化すべきもの
+sidebar_position: 5
+---
+
+## `slackLists.create` の引数
+
+`slackLists.create` は `name`、`description_blocks`、`schema`、`copy_from_list_id`、`include_copied_list_records`、`todo_mode` を取る。`copy_from_list_id` と `schema` は排他であり、両方を渡すと `invalid_copy_and_schema_args` が返る。あとからスキーマを拡張する公認の方法はリストのコピーだ（後述の「スキーマは実質的に不変」を参照）。
+
+出典：[`slackLists.create`](https://docs.slack.dev/reference/methods/slackLists.create/)。
+
+## カラムの型
+
+Slack の一次ドキュメントは次を列挙している：`text`、`message`、`number`、`select`、`date`、`user`、`attachment`、`checkbox`、`email`、`phone`、`channel`、`rating`、`created_by`、`last_edited_by`、`created_time`、`last_edited_time`、`vote`、`canvas`、`reference`、`link`。マルチセレクトは独立した型ではなく、`select` カラム上の `options.format: "multi_select"` として表現される。
+
+:::caution[ドキュメントと SDK で型の一覧が食い違っている]
+Node SDK のリクエスト型はさらに `multi_select`、`rich_text`、`assignee`、`due_date`、`todo_*` をカラム型として挙げているが、これらは散文のドキュメントにはいっさい登場しない。`create` に送る内容についてはドキュメントを信じること — リストには公式の OpenAPI 仕様が存在せず、SDK の型は同じ散文から手作業で起こしたものであって、独立した裏付けではない。
+:::
+
+`created_by`、`last_edited_by`、`created_time`、`last_edited_time` の 4 カラムは **計算列** であり、書き込むと `uneditable_column` で失敗する。
+
+## select カラム：`{value, label, color}`
+
+`select` / `multi_select` のオプションは、確認したすべての面（`create` のリクエストとレスポンス、`items.info` のスキーマ、公式 3 SDK の型すべて）で厳密に `{value, label, color}` だ — ドキュメントの散文が select の値を「エンコードされたオプション ID」と呼んでいるにもかかわらず、`id` キーは存在しない。**`value` こそがオプション ID である。** 書き込みは常に `value`（機械可読なスラッグ）を指定するのであって、`label`（人間が目にするチップの文字列）ではない — ラベルを書き込むと、たまたま `value === label` で定義されたカラムでない限り `invalid_option_id` が返る。
+
+`slackLists.create` の上限：
+
+- **select カラムあたり 100 オプション**
+- **セルあたり最大 50 個まで選択可能**
+- **リストあたり 30 カラム**
+- 使用できるチップの色：`indigo`、`blue`、`cyan`、`pink`、`yellow`、`green`、`gray`、`red`、`purple`、`orange`、`brown`
+
+**ASCII のスラッグは作成時に自分で決める。** 人間ではなく bot 自身にリストを作らせれば、任意の表示ラベルの下で `todo` / `doing` / `done` のようなありふれた値を自分で選べる — 値がすでに知っているコンパイル時定数になるため、ラベル↔ID の逆引き問題がまるごと消える。人間がリストを作った場合、オプションの値は不透明な文字列（`OptXXXXXXXX` 形式）になり、`items.info` で一度読み出して保存しておく必要がある。
+
+:::warning[未検証]
+`slackLists.create` のスキーマのカラムは `is_primary_column` フラグを受け取り、これはリストビューとボードビューでアイテムのタイトルとして表示されるカラムを指定する。このフィールドはこのページの元になった調査ダイジェストの範囲外であり、実際の API に対して挙動を検証したダイジェストも、docs.slack.dev のページを引用したダイジェストも存在しない。これに依存する前に、最新のメソッドドキュメントで確認すること。
+:::
+
+## `todo_mode`
+
+`todo_mode: true` はタスク管理用の 3 カラムを追加する：Completed（`todo_completed`）、Assignee（`todo_assignee`）、Due date（`todo_due_date`）だ。これはフラグが作成時に引き起こす挙動として散文でドキュメント化されている。注目すべきは、これが作成後に **既存の** リストのスキーマを変更する唯一のドキュメント化された方法でもある点だ — `todo_mode: true` を指定した `slackLists.update` は、これらのカラムを持たないリストに同じカラムを追加する。不要なら作成時に `todo_mode: false` を設定すればよく、これは安心して頼れる。
+
+## `list_id` とすべての `column_id` を永続化する
+
+`slackLists.create` のレスポンスは `list_id` と `list_metadata`（各カラムの `column_id` を含む）を運ぶ。**create 呼び出しと同じステップで、この両方を捕まえて永続化すること。** 実行時に再発見する経路は存在しない：リストを列挙する `slackLists.list` もなければ、ID からスキーマを読む `slackLists.info` もない。唯一の読み取り経路は `slackLists.items.info` で、これは既存の row id を必要とする — ただしその行は自分が作ったものである必要はない。`items.create` の `initial_fields` は省略可能なので、書き込みアクセスさえあれば `list_id` に対して使い捨ての行を 1 つ作り、返ってきた row id ですぐに `items.info` を呼べば `list_metadata.schema[]` の全体を回収できる — 事前に行が存在している必要はない。書き込みアクセスがない場合、復旧手段は UI から手作業でマッピングを再構築することになる。
+
+## スキーマは実質的に不変
+
+`todo_mode` を除けば、既存の select カラムの選択肢を編集する API はドキュメント上ひとつも存在しない — 追加も、名前の変更も、色の変更も、並べ替えも、削除もできない — そして `slackLists.update` が受け取るのは `id`、`name`、`description_blocks`、`todo_mode` だけだ。それ以外に 12 個の `slackLists.*` メソッドでカラム定義に触れるものはない。
+
+:::warning[未検証]
+`column_id_to_create` は `column_id_not_provided` のエラー文字列（"The `column_id` or `column_id_to_create` field must be provided"）の中にしか現れない — エンドポイントのバリデータが認識していそうな、カラムを作成しうる代替手段だ。引数の定義もサンプルも SDK の型もなく、実際に使われている例も見つかっていない。機能ではなく、未実証の裂け目として扱うこと。
+:::
+
+スキーマはそれ以外では固定なので、**作成時に select のオプションを多めに用意しておくこと** — あとで必要になりそうな予備のスラッグを焼き込んでおく。「オプションをもう 1 つ増やしたい」に対する公認の回避策は新しいリストを作ることだ：`copy_from_list_id` + `include_copied_list_records` を指定した `slackLists.create` を使うが、これは新しい `list_id` と新しい `column_id` を発行するため、前節のとおりあらためて永続化し直す必要がある。
+
+なお人間はいつでも Slack の UI から手作業でスキーマを編集できる — オプションの追加、削除、ラベルの変更が可能だ。キャッシュした value→label のマップは運用の途中で陳腐化しうる：削除されたオプションは、それまで通っていた書き込みに対して `invalid_option_id` を返し始める。ラベルの変更は安全だ、書き込みが指定するのは `label` ではなく `value` だからだ。`invalid_option_id` が出たら、ハードコードした定数を信じるのではなく `items.info` 経由で `list_metadata.schema` を読み直すこと。

@@ -1,0 +1,46 @@
+---
+title: API サーフェス
+description: 12 個の slackLists.* メソッド、レートティア、そして API に検証可能な形で存在しないもの
+sidebar_position: 2
+---
+
+## 2025-09-02 に GA
+
+リストの Web API は 2025-09-02 に一般公開された — Slack 自身のチェンジログが "The following API methods are now publicly available for interacting with Lists in Slack!" と述べている。どのメソッドページにもスコープページにも、beta・waitlist・experimental・パートナー許可リストといったマーカーは付いていない。
+
+出典：[Introducing the Lists API](https://docs.slack.dev/changelog/2025/09/02/list-api/)。
+
+## 12 個のメソッド
+
+| メソッド | 読み書き | レートティア | 備考 |
+|---|---|---|---|
+| [`slackLists.create`](https://docs.slack.dev/reference/methods/slackLists.create/) | 書き | 記載なし | カラムの `schema` 一式を指定してリストを作成する。`list_id` と `list_metadata` を返す — ここですべての `column_id` を捕まえておくこと（[リストの作成](./creating-lists.mdx)を参照）。 |
+| `slackLists.update` | 書き | 記載なし | リストのメタデータのみ（`id`、`name`、`description_blocks`、`todo_mode`）を更新する — 汎用のスキーマエディタではない。 |
+| [`slackLists.items.create`](https://docs.slack.dev/reference/methods/slackLists.items.create/) | 書き | 矛盾あり — 後述 | 行を追加する。`initial_fields` は `{column_id, <型付きの値>}` の配列。`parent_item_id` を渡すとサブタスクになる。 |
+| `slackLists.items.update` | 書き | Tier 3（50+/分） | `cells: [{row_id, column_id, …型付きの値}]` でセルを更新する — `row_id` はトップレベルではなく各セルの内側にある。 |
+| `slackLists.items.list` | 読み | Tier 2（20+/分） | 全行をカーソルページネーションで返す（`limit` / `cursor` / `archived`）。存在する唯一の変更検知手段 — 後述の「変更イベントは存在しない」を参照。 |
+| `slackLists.items.info` | 読み | 記載なし | 1 行分に加えてリストのメタデータ・スキーマ・ビュー・上限をすべて返す — `create` 自身のレスポンスを除けば唯一のスキーマ読み取り経路であり、既存の row id を必要とする。 |
+| `slackLists.items.delete` | 書き | 記載なし | 行を 1 つ削除する。 |
+| `slackLists.items.deleteMultiple` | 書き | Tier 2（20+/分） | 複数の行を削除する。 |
+| `slackLists.download.start` | 読み | 記載なし | 非同期の一括エクスポート（CSV または JSON）を開始する — 全件ダンプにはページネーションより向いている。 |
+| `slackLists.download.get` | 読み | 記載なし | 上で開始したエクスポートを取得する。 |
+| [`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/) | 書き | Tier 3（50+/分） | read / write / owner のアクセスを付与する。[アクセスとスコープ](./access-and-scopes.mdx)を参照。 |
+| `slackLists.access.delete` | 書き | 記載なし | アクセスを剥奪する。 |
+
+スコープ↔メソッドの対応：`lists:read` が 4 つの読み取りメソッド（`items.list`、`items.info`、`download.start`、`download.get`）をカバーし、`lists:write` が残りの 8 つをカバーする。
+
+:::caution[`items.create` のレートティアが矛盾している]
+`slackLists.items.create` のメソッドページは Tier 2（20+/分）と記載しているが、Java SDK の機械可読な [`rate_limit_tiers.json`](https://github.com/slackapi/java-slack-sdk/blob/main/metadata/web-api/rate_limit_tiers.json) は Tier 3（50+/分）と記載している。どちらも公式の Slack ソースでありながら食い違っている。一括バックフィルのサイジングでは厳しいほうの数字（Tier 2）を前提にすること。
+:::
+
+## 検証済みの「存在しないもの」
+
+以下はいずれも、単にドキュメントに載っていないというだけでなく、実際の API ディスパッチャに対して確認した — 実在するメソッドへの未認証 POST は `not_authed` / `invalid_auth` を返すのに対し、存在しないメソッドは `unknown_method` を返すため、Slack 自身のディスパッチャが「ある」と「ない」を区別してくれる。
+
+- **リストの列挙はできない。** `slackLists.list` は存在しない（`unknown_method`）。ワークスペースのリスト一覧を Slack に問い合わせることはできない — `list_id` はすべて自分で永続化すること。
+- **単独のリスト情報／スキーマ読み取りはできない。** `slackLists.info` は存在しない（`unknown_method`。存在するはずのドキュメントページに対するソフト 404 のバイトサイズ比較でも裏付けた）。スキーマは `slackLists.create` のレスポンスか、既存の row id を要する `slackLists.items.info` からしか得られない。
+- **リスト全体を削除するメソッドはない。** 12 メソッドのサーフェスに存在しない。
+- **upsert なし／外部 ID キーなし。** ドキュメント化されたサーフェスのどこにも、冪等な書き込みのために呼び出し側が指定する外部キーを受け取るものはない。最も近いのは `items.update` の `row_id_to_create` だが、これも呼び出し側が row id を追跡することを前提としている。（これはドキュメント化されたメソッドサーフェス上での不在であり、上の 3 つとは違って個別にライブ検証はしていない。）
+- **リスト変更に対応する Events API のイベントはない。** [docs.slack.dev/reference/events](https://docs.slack.dev/reference/events/) の完全なイベントカタログに `list_item_created` / `list_item_updated` をはじめとするリスト系イベントは 1 つも含まれておらず、Socket Mode でも何も増えない。`slackLists.items.list` のポーリングだけが唯一の信頼できる inbound 経路であり、人がカードをドラッグしても購読可能なものは何も発火しない。
+
+先に知っておく価値のある、書き込み側の関連制約：プレーンテキストは拒否される — テキストカラムはプレーンな文字列ではなく Block Kit の `rich_text` ブロックとして書き込む必要がある。

@@ -1,0 +1,69 @@
+---
+title: エラーリファレンス
+description: slackLists.items.update の分岐に使えるエラーコードと、その原因および背景
+sidebar_position: 9
+---
+
+## 概要
+
+`slackLists.items.update` は失敗時に `{"ok": false, "error": "<code>"}` を返す。このページはドキュメント化されたエラーコードを原因ごとにまとめる。これにより Worker は、`ok` でないレスポンスをすべて同じように扱うのではなく `body.error` で分岐できる。
+
+## 全一覧
+
+| エラー | 意味 |
+|---|---|
+| `invalid_option_id` | スラッグが違う — `value` の代わりにラベルを書き込んだか、キャッシュしたあとでそのオプションがスキーマから削除されたか |
+| `invalid_input_type` | カラムの型に対して値キーが違うか、配列が必要な場所に裸のスカラーを渡した |
+| `invalid_array_arg` | 配列の引数が壊れている — たいていは JSON ではなくフォームエンコードのボディを送っている |
+| `invalid_column_id` / `column_not_found` | 永続化した `column_id` が古い |
+| `invalid_row_id` / `row_not_found` | 永続化した `row_id` が古い |
+| `column_id_not_provided` | セルに `column_id` がない（かつ、ドキュメント化されていない `column_id_to_create` も渡していない） |
+| `uneditable_column` | 対象が計算列（`created_by`、`last_edited_by`、`created_time`、`last_edited_time`）である |
+| `over_cell_fields_limit` | 1 回の呼び出しに含まれるセルが多すぎる（ドキュメント JSON では `maxItems: 100`） |
+| `over_row_maximum` | リストあたりのアイテム数の上限に達した（create 経路。この上限を示す唯一の権威あるシグナル） |
+| `list_not_found` | `list_id` が不正 — アクセス失敗の場合にも返る、後述 |
+| `no_permission` / `access_denied` / `permission_denied` | bot トークンがこのリストへのアクセス権を持っていない |
+| `paid_teams_only` | ワークスペースが無料プランである — リストは有料プランの機能 |
+| `lists_disabled_user_team` | 管理者がそのワークスペースでリストを無効化している（上のプランゲートとは別物） |
+| `missing_scope` | トークンに `lists:write` スコープがない |
+| `invalid_blocks` / `invalid_text_block` | text / notes カラムに対する `rich_text` セルの形が不正 |
+| `ratelimited` | レート制限に達した — `Retry-After` ヘッダーに従うこと |
+
+## select カラムのエラー
+
+`invalid_option_id` は、select カラムが本番で使われ始めると最も頻繁に目にすることになるエラーだ。ワイヤー上は同じに見える 2 つの異なる状況で発火する：
+
+- 送った値が `value` のスラッグではなく **ラベル** である — ラベルが決して受理されない理由は [select カラム](./select-columns.mdx)を参照。
+- そのオプションは **かつて存在していた** が、人間が UI でリストのスキーマを編集して削除した — [スキーマの可変性](./schema-mutability.mdx)を参照。キャッシュしたスラッグのマップはこれが起きたことを知りようがない。このエラーが予期しないものであれば `items.info` 経由で `list_metadata.schema` を読み直すこと。
+
+`invalid_input_type` と `invalid_array_arg` はどちらも値のエラーではなく形のエラーだ — 型付きの値キーの一覧と、単一の値であってもほぼすべてが配列で包まれる理由は[リストアイテムへの書き込み](./writing-cells.mdx)を参照。
+
+## 古い ID に起因するエラー
+
+`invalid_column_id` / `column_not_found` と `invalid_row_id` / `row_not_found` は、いずれも永続化した ID がもはや解決できないことを意味する。リストの構造を再発見する `slackLists.info` も `slackLists.list` も存在せず、「外部キーで行を探す」エンドポイントもないため、古い `row_id` からの唯一の復旧手段は、リストをページネーションで全件読み出し、自分の主キーを格納している場所（たとえばソース行の ID を写しているテキストカラム）からマッピングを再構築することだ。古い `column_id` は、リストのスキーマが自分の知らないところで変わったことを意味する — `items.info` 経由で `list_metadata.schema` を読み直すこと。
+
+## 権限とアクセスのエラー
+
+`list_not_found` は多義的だ：汎用的な「`list_id` が不正」というエラーであると同時に、トークンの保持者が正当なリストへのアクセス権を欠いているときに `items.update` が返すものでもある — リストが bot のチャンネルへ共有されていたにもかかわらずまさにこれが起きたという、コミュニティの報告（[slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)）がある。`list_not_found` が常に ID の打ち間違いや削除を意味すると決めつけないこと。アクセスの問題である可能性もある。このエラーを判別しにいく代わりに、bot がリストを作ることでアクセスの問題そのものを回避できる理由は [select カラム](./select-columns.mdx#bot-がリストを作るパターン)を参照。
+
+`no_permission`、`access_denied`、`permission_denied` はより直接的なアクセス拒否のファミリーであり、後述のプランゲートやスコープのエラーとは別物だ。
+
+## プランとスコープのエラー
+
+ゲートの対象が異なる 3 つのエラーがあり、これらは混同しやすい：
+
+- `paid_teams_only` — ワークスペース自体が無料プランである。リストには有料プランが必要だ。
+- `lists_disabled_user_team` — ワークスペースは有料だが、ワークスペースの管理者がリストをオフにしている。これは課金の状態ではなく管理者トグルであり、Worker のエラーハンドリングの分岐から見ると、明示的に両方をチェックしない限り 2 つのエラーは同じに見えてしまう。
+- `missing_scope` — トークン自体に `lists:write` がない。上の 2 つと違い、これはワークスペース管理者が制御する何かではなく、正しいスコープでアプリを再インストールすれば解決する。
+
+## リッチテキストのエラー
+
+`invalid_blocks` と `invalid_text_block` はどちらも、text / notes カラムが妥当な Block Kit の `rich_text` 構造以外のものを受け取ったことを意味する — 最もよくあるのはプレーンな文字列で、テキストカラムは書き込み経路でこれを決して受け付けない（[リストアイテムへの書き込み](./writing-cells.mdx#型付きの値キーは（ほぼ）常に配列)を参照）。
+
+## レート制限
+
+`slackLists.items.update` は **Tier 3（50+ リクエスト/分）** に位置し、これはドキュメントと Java SDK の機械可読な [`rate_limit_tiers.json`](https://github.com/slackapi/java-slack-sdk/blob/main/metadata/web-api/rate_limit_tiers.json) の両方が示すところで、このメソッドについては 2 つのソースが一致している。`ratelimited` は再試行までに何秒待つべきかを示す `Retry-After` ヘッダーを伴う。即座に再試行したり固定間隔で再試行したりせず、これに従うこと。
+
+## 関連
+
+これらのエラーが適用されるリクエスト／レスポンスの契約は[リストアイテムへの書き込み](./writing-cells.mdx)を参照。`invalid_option_id` の背後にある select の値のルールは [select カラム](./select-columns.mdx)を参照。スキーマ自体が API 由来の変更のほとんどに対して閉じている理由は[スキーマの可変性](./schema-mutability.mdx)を参照。
