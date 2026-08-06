@@ -1,0 +1,107 @@
+---
+title: Errors Reference
+description: Branchable error codes for slackLists.items.update, with causes and context
+sidebar_position: 9
+---
+
+## Overview
+
+`slackLists.items.update` returns `{"ok": false, "error": "<code>"}` on failure. This page
+groups the documented error codes by cause so a Worker can branch on `body.error` instead of
+treating every non-`ok` response the same way.
+
+## The Full Table
+
+| Error | Meaning |
+|---|---|
+| `invalid_option_id` | Wrong slug — either a label was written instead of a `value`, or the option was deleted from the schema after you cached it |
+| `invalid_input_type` | Wrong value key for the column type, or a bare scalar where an array was required |
+| `invalid_array_arg` | An array argument was mangled — usually a form-encoded body instead of JSON |
+| `invalid_column_id` / `column_not_found` | Stale persisted `column_id` |
+| `invalid_row_id` / `row_not_found` | Stale persisted `row_id` |
+| `column_id_not_provided` | A cell is missing `column_id` (and did not supply the undocumented `column_id_to_create`) |
+| `uneditable_column` | Target is a computed column (`created_by`, `last_edited_by`, `created_time`, `last_edited_time`) |
+| `over_cell_fields_limit` | Too many cells in one call (docs JSON: `maxItems: 100`) |
+| `over_row_maximum` | Per-list item cap reached (create path; the cap's only authoritative signal) |
+| `list_not_found` | Bad `list_id` — also reported for access failures, see below |
+| `no_permission` / `access_denied` / `permission_denied` | Bot token lacks access to this list |
+| `paid_teams_only` | Workspace is on a free plan — Lists is a paid-plan feature |
+| `lists_disabled_user_team` | An admin has disabled Lists for the workspace (distinct from the plan gate above) |
+| `missing_scope` | Token lacks the `lists:write` scope |
+| `invalid_blocks` / `invalid_text_block` | Malformed `rich_text` cell on a text/notes column |
+| `ratelimited` | Rate limit hit — honor the `Retry-After` header |
+
+## Select-Column Errors
+
+`invalid_option_id` is the error you will see most often once a select column is in
+production use. It fires in two distinct situations that look identical on the wire:
+
+- The value sent is a **label**, not a `value` slug — see
+  [Select Columns](./select-columns.mdx) for why labels are never accepted.
+- The option **used to exist** and was deleted by a human editing the list schema in the UI —
+  see [Schema Mutability](./schema-mutability.mdx). A cached slug map does not know this
+  happened; re-read `list_metadata.schema` via `items.info` when this error is unexpected.
+
+`invalid_input_type` and `invalid_array_arg` are both shape errors rather than value errors —
+see [Writing List Items](./writing-cells.mdx) for the typed-value-key table and why almost
+every value is array-wrapped even for a single value.
+
+## Stale-ID Errors
+
+`invalid_column_id` / `column_not_found` and `invalid_row_id` / `row_not_found` both mean a
+persisted ID no longer resolves. Since there is no `slackLists.info` or `slackLists.list` to
+re-discover a list's structure, and no "find row by external key" endpoint, the only recovery
+for a stale `row_id` is a full paginated read of the list to rebuild the mapping from
+whatever your own primary key is stored in (for example, a text column mirroring the source
+row's ID). A stale `column_id` means the list's schema changed out from under you — re-read
+`list_metadata.schema` via `items.info`.
+
+## Permission and Access Errors
+
+`list_not_found` is overloaded: it is the generic "bad `list_id`" error, but it is also what
+`items.update` returns when the token's holder lacks access to an otherwise-valid list — there
+is a community report
+([slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)) of
+exactly this happening despite the list being shared into the bot's channel. Do not assume
+`list_not_found` always means a typo'd or deleted ID; it can also mean an access problem. See
+[Select Columns](./select-columns.mdx#the-bot-creates-the-list-pattern) for why
+bot-creates-the-list sidesteps the access question rather than needing to disambiguate this
+error.
+
+`no_permission`, `access_denied`, and `permission_denied` are the more direct access-denied
+family, distinct from the plan-gate and scope errors below.
+
+## Plan and Scope Errors
+
+Three errors gate on different things and are easy to conflate:
+
+- `paid_teams_only` — the workspace itself is on a free plan; Lists requires a paid plan.
+- `lists_disabled_user_team` — the workspace is paid, but a workspace admin has turned Lists
+  off. This is an admin toggle, not a billing state, and both errors can look identical from
+  inside a Worker's error-handling branch unless you check for both explicitly.
+- `missing_scope` — the token itself lacks `lists:write`. Unlike the two errors above, this is
+  fixable by reinstalling the app with the correct scope, not by anything the workspace admin
+  controls.
+
+## Rich Text Errors
+
+`invalid_blocks` and `invalid_text_block` both mean a text/notes column received something
+other than a valid Block Kit `rich_text` structure — most commonly a plain string, which text
+columns never accept on the write path (see
+[Writing List Items](./writing-cells.mdx#typed-value-keys-are-almost-always-arrays)).
+
+## Rate Limiting
+
+`slackLists.items.update` sits on **Tier 3 (50+ requests/min)**, per both the docs and the
+Java SDK's machine-readable
+[`rate_limit_tiers.json`](https://github.com/slackapi/java-slack-sdk/blob/main/metadata/web-api/rate_limit_tiers.json)
+— the two sources agree for this method. `ratelimited` carries a `Retry-After` header stating
+how many seconds to wait before retrying; honor it rather than retrying immediately or on a
+fixed interval.
+
+## Related
+
+For the request/response contract these errors apply to, see
+[Writing List Items](./writing-cells.mdx). For the select-value rules behind
+`invalid_option_id`, see [Select Columns](./select-columns.mdx). For why the schema itself is
+closed to most API-driven changes, see [Schema Mutability](./schema-mutability.mdx).
