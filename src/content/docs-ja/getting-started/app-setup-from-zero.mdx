@@ -1,0 +1,44 @@
+---
+title: ゼロからのアプリセットアップ
+description: Slack アプリを作成し、ワークスペース 1 つにインストールして、Worker が必要とする認証情報を集める
+sidebar_position: 2
+---
+
+## マニフェストからアプリを作る
+
+出発点は [api.slack.com/apps](https://api.slack.com/apps) で、**Create New App > From an app manifest** を選ぶ。ワークスペースを指定し、マニフェスト（JSON または YAML）を貼り付けて確定するだけでよい。マニフェストはスコープ、イベント購読、bot ユーザー、Socket Mode といったアプリ定義のすべてを 1 ファイルに収めたものだ。環境を新しく用意するたびに同じ設定を画面上でクリックし直すのではなく、バージョン管理に載せて運用する（[App manifests](https://docs.slack.dev/app-manifests)）。
+
+:::note
+マニフェストにはスキーマのバージョンが 2 つある。`version_metadata` を省略した場合のデフォルトはバージョン 1 で、Deno Slack SDK 上に構築するアプリではバージョン 2 が必須になる。このサイトの例はバージョン 1 を前提としている。
+:::
+
+## bot ユーザーを有効にする
+
+マニフェストからなら bot ユーザーを直接宣言できる（`features.bot_user`）。ゼロから画面上で組み立てる場合は **App Home** で追加する。bot ユーザーはアプリにワークスペース内での安定したアイデンティティを与えるもので、メッセージを投稿する主体であり、後述の bot トークンが認証する対象でもある。
+
+## ワークスペース 1 つにインストールする
+
+自分のワークスペースでしか動かさないアプリなら、インストールはリダイレクトフローではなくクリック 1 回で済む。理由は [OAuth リダイレクトなしでインストールする](./tokens-scopes-oauth.mdx#oauth-リダイレクトなしでインストールする)を参照。アプリの **OAuth & Permissions** ページで **Install to Workspace** をクリックし、要求されているスコープを確認して承認すればよい。Slack はその場でトークンを発行し、同じページに表示する。
+
+## 認証情報を集める
+
+セットアップから出てくるシークレットは 2 つで、どちらも Worker のシークレットである。クライアント側に置く値ではない。Wrangler のシークレットとして保存する方法は [Worker Backend: シークレットと設定](../worker-backend/secrets-and-config.mdx)にまとめてある。
+
+| 認証情報 | 形式 | 取得場所 |
+|---|---|---|
+| bot トークン | `xoxb-...` | インストール後の **OAuth & Permissions** ページ |
+| signing secret | 16 進数文字列 | **Basic Information** ページの **App Credentials** |
+
+:::danger
+どちらも本番のシークレットとして扱うこと。コミットしない、ログに出さない、ブラウザへ送らない。リクエストの検証も Slack API の呼び出しも、すべて Worker の内側で完結させる。
+:::
+
+Socket Mode も有効にした場合は、3 つ目の認証情報として app-level トークン（`xapp-...`）が加わる。`connections:write` スコープを付けて生成すると **Basic Information > App-Level Tokens** に現れる。このサイトの Worker バックエンドのパターンは Socket Mode ではなく HTTP ベースの Events API 配信を使うため、たいていの構成では不要だ。トークンの全体像は[トークン・スコープ・OAuth](./tokens-scopes-oauth.mdx)を参照。
+
+## 早い段階で効いてくるアプリ設定
+
+- **OAuth & Permissions > Scopes** -- アプリに必要な bot スコープはインストール前にすべて追加しておく。あとから足すと再インストールが必要になり、その際に bot トークンがローテーションされる（[スコープ変更後の再インストール](./tokens-scopes-oauth.mdx#スコープ変更後の再インストール)を参照）
+- **Event Subscriptions** -- Events API 用に Worker の HTTP エンドポイントを Slack へ登録する場所。詳細はここではなく Events セクションで扱う
+- **App Home** -- bot ユーザーに Messages タブを表示するか、DM を受け付けるかを制御する
+
+裏取りに使ったソース: [docs.slack.dev/quickstart](https://docs.slack.dev/quickstart)、[docs.slack.dev/app-manifests](https://docs.slack.dev/app-manifests)、[docs.slack.dev/authentication/verifying-requests-from-slack](https://docs.slack.dev/authentication/verifying-requests-from-slack)。
