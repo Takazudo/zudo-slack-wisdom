@@ -20,7 +20,14 @@
     "setup:doc-skill:claude": "bash scripts/setup-doc-skill.sh --target claude",
     "setup:doc-skill:codex": "bash scripts/setup-doc-skill.sh --target codex",
     "setup:doc-skill:both": "bash scripts/setup-doc-skill.sh --target both",
-    "b4push": "pnpm check && pnpm build"
+    "check:html": "pnpm dlx html-validate \"dist/**/*.html\"",
+    "check:pin-parity": "node scripts/check-pin-parity.mjs",
+    "check:wrangler-pin": "node scripts/check-wrangler-pin.mjs",
+    "check:links": "node scripts/check-links.js --strict-broken --allowlist=.check-links-allowlist",
+    "check:template-drift": "bash scripts/check-template-drift.sh",
+    "format:md": "pnpm dlx @takazudo/mdx-formatter --write \"src/content/**/*.{md,mdx}\"",
+    "format:md:check": "pnpm dlx @takazudo/mdx-formatter --check \"src/content/**/*.{md,mdx}\"",
+    "b4push": "bash scripts/run-b4push.sh"
   },
   "dependencies": {
     "@takazudo/zfb": "2.2.0",

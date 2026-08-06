@@ -20,6 +20,14 @@ Documentation site built with [zudo-doc](https://github.com/zudolab/zudo-doc) �
 - `pnpm build` — static HTML export to `dist/`
 - `pnpm check` — TypeScript type checking
 - `pnpm preview` — serve the built `dist/`
+- `pnpm b4push` — full local quality gate before pushing (see `scripts/run-b4push.sh`): mdx format check, template drift check, pin parity check, wrangler pin check, `pnpm check`, `pnpm build`, HTML validation, link check
+- `pnpm format:md` / `pnpm format:md:check` — format (or check formatting of) `.md`/`.mdx` files under `src/content/`
+- `pnpm check:pin-parity` — verify the `@takazudo/zfb*` package group stays on one exact version (`scripts/check-pin-parity.mjs`)
+- `pnpm check:wrangler-pin` — verify the installed `wrangler` matches the version the installed `@takazudo/zfb` binary expects (`scripts/check-wrangler-pin.mjs`)
+- `pnpm check:template-drift` — diff host files (`pages/`, `src/styles/global.css`, the `claudeSkills` files) against the matching `create-zudo-doc` release, fetched on demand and cached under `node_modules/.cache/` (`scripts/check-template-drift.sh`); genuine intentional divergences go in `.template-drift-allowlist`
+- `pnpm check:html` — validate built HTML (`.htmlvalidate.json` rules) via `pnpm dlx html-validate`
+- `pnpm check:links` — broken-link check on built `dist/` + absolute-link check on MDX source (`scripts/check-links.js`); known exceptions go in `.check-links-allowlist`
+- `pnpm setup:doc-skill` — generate the `zudo-slack-wisdom` skill (see "Doc Skill" below) + symlink it into the user-scope skills directory
 
 ## Key Directories
 
@@ -44,9 +52,55 @@ Everything else — layout, header, sidebar, footer, doc chrome, islands, and th
 
 ### Frontmatter
 
-- Required: `title` (string)
-- Optional: `description`, `sidebar_position` (number), `category`
-- Sidebar order is driven by `sidebar_position`
+Schema is the zudo-doc package default (`buildDocsSchema`, shipped by `@takazudo/zudo-doc`, validated by `zfb check`; override via `buildDocsSchema` in `zfb.config.ts` if ever needed). Unknown keys are passed through, not rejected.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `title` | string | Yes | Page title, rendered as the page h1 |
+| `description` | string | No | Subtitle / meta description |
+| `category` | string | No | Category override (defaults to the containing directory) |
+| `sidebar_position` | number | No | Sort order within category (lower = higher). **Always set this** for predictable ordering |
+| `sidebar_label` | string | No | Custom text for sidebar display (overrides `title`) |
+| `tags` | string[] | No | Cross-category grouping tags |
+| `search_exclude` | boolean | No | Exclude from search results |
+| `pagination_next` / `pagination_prev` | string \| null | No | Override next/prev page link (`null` to hide) |
+| `draft` | boolean | No | Exclude from build entirely |
+| `unlisted` | boolean | No | Built but noindexed, hidden from sidebar/nav |
+| `hide_sidebar` | boolean | No | Hide the left sidebar, center content |
+| `hide_toc` | boolean | No | Hide the right-side table of contents |
+| `wide` | boolean | No | Widen the content column |
+| `doc_history` | boolean | No | Per-page override for the docHistory feature |
+| `standalone` | boolean | No | Hidden from sidebar nav but still indexed |
+| `slug` | string | No | Custom URL slug override |
+| `generated` | boolean | No | Build-time generated content (skips the bilingual-translation requirement below) |
+| `category_no_page` | boolean | No | Category has no landing page (just groups items) |
+| `category_sort_order` | `"asc"` \| `"desc"` | No | Sort order for pages within the category |
+
+### File Names & Links
+
+- **Kebab-case file names**: `my-article.mdx`, not `myArticle.mdx` or `my_article.mdx`.
+- **Relative links between docs**: use the `.mdx` extension so the remark plugin can resolve and validate them at build time:
+
+  ```markdown
+  [Link text](./sibling-page.mdx)
+  [Link text](../other-category/page.mdx)
+  [Link text](../other-category/page.mdx#anchor)
+  ```
+
+  Absolute hrefs that bypass the base path, and links to files that don't exist, are both caught by `pnpm check:links`.
+
+### Mermaid Diagrams
+
+Mermaid is enabled (bundled by `@takazudo/zudo-doc`, no extra dependency needed). Use fenced code blocks:
+
+````markdown
+```mermaid
+
+graph TB
+  A --> B
+
+```
+````
 
 ### Admonitions
 
@@ -68,18 +122,73 @@ Do NOT use h1 (`#`) in doc content — the page title from frontmatter is render
 
 Admonitions (above), tabbed content (`<Tabs>` / `<TabItem>`, `<CodeGroup>`), and block math (`<MathBlock>`) work the same way — no import. Full reference: https://zudo-doc.takazudomodular.com/docs/components/
 
-## i18n
+## i18n & Bilingual Rule
 
 - English (default): `/docs/...` — content in `src/content/docs/`
 - Japanese: `/ja/docs/...` — content in `src/content/docs-ja/`
-- Japanese docs should mirror the English directory structure
+- Japanese docs mirror the English directory structure (same relative path under `docs-ja/`)
 - Both `pages/docs/[[...slug]].tsx` and `pages/[locale]/docs/[[...slug]].tsx` are self-contained doc-route stubs shipped by the generator — required so `pnpm dev` doesn't 404 on doc pages (a zfb dev-mode limitation on package-injected dynamic routes). Don't delete them.
+
+**Bilingual rule**: every content PR that adds or changes a doc page carries **both** the English (`docs/`) and Japanese (`docs-ja/`) versions of that page. Code blocks, Mermaid diagrams, and any other non-prose content must be **byte-identical** between the two languages — only the surrounding prose is translated. If a Japanese version doesn't exist yet, create it in the same PR.
+
+**Exception**: pages with `generated: true` in frontmatter (the `claude/`, `claude-md/`, `claude-skills/` auto-generated categories — see "Doc Skill" below and `claudeResources` in "Enabled Features") do not require a Japanese translation; they're regenerated on every build and are EN-only by design.
+
+## Content Categories
+
+Top-level directories under `src/content/docs/`, mapped to header nav entries via `categoryMatch` in the `headerNav` list in `zfb.config.ts`. Every category has an `index.mdx`:
+
+- `getting-started/` — Overview, what this site covers
+- `worker-backend/` — Cloudflare Worker backend patterns (bot tokens / signing secrets stay server-side)
+- `messaging/` — Slack messaging APIs
+- `events/` — Slack Events API
+- `lists/` — Slack Lists API (the deep, research-backed section per the epic)
+- `data-surfaces/` — Data surface patterns
+
+Auto-generated directories (no header nav entry, managed by the `claudeResources` build integration — see "Doc Skill" below):
+
+- `claude/`, `claude-md/`, `claude-skills/` — regenerated on every `pnpm build`; do not hand-edit
+
+## Content Creation Workflow
+
+### Adding a New Article
+
+1. Create the English `.mdx` file in the appropriate category under `src/content/docs/`
+2. Add frontmatter with at least `title` and `sidebar_position`
+3. Write content starting with `## h2` headings (not `# h1`)
+4. Create the matching Japanese file under `src/content/docs-ja/` at the same relative path
+5. Keep code blocks and Mermaid diagrams identical between languages — only translate prose
+6. Run `pnpm format:md` to format the MDX files
+7. Run `pnpm b4push` (or at least `pnpm build` + `pnpm check:links`) to verify the site builds and links resolve
+
+### Adding a New Category
+
+1. Create the directory under `src/content/docs/` (kebab-case) and the mirrored directory under `src/content/docs-ja/`
+2. Create `index.mdx` in both with `title`, `description`, and `sidebar_position`
+3. Add a `headerNav` entry in `zfb.config.ts` with `categoryMatch` pointing at the directory name
+4. Run `pnpm b4push` to verify
+
+## Doc Skill
+
+`pnpm setup:doc-skill` (`scripts/setup-doc-skill.sh`) generates the `zudo-slack-wisdom` skill from this site's built docs and symlinks it into the user-scope skills directory (`~/.claude/skills/` and/or `~/.codex/skills/`). The generated `.claude/skills/zudo-slack-wisdom/` / `.codex/skills/zudo-slack-wisdom/` directories are gitignored — do not track or hand-edit them; re-run `pnpm setup:doc-skill` to refresh. The `src/content/docs/claude*/` pages consumed by that skill are written by the `claudeResources` build integration on every `pnpm build`; edit the site's `.claude/` sources (`CLAUDE.md`, skills, commands, agents), not those generated pages, to change their content.
 
 ## Enabled Features
 
 - **search** — Full-text search via Pagefind
-- **claudeResources** — Auto-generated docs for Claude Code resources
+- **i18n** — English + Japanese bilingual content (see above)
+- **claudeResources** — Auto-generated docs for Claude Code resources (`.claude/` → `src/content/docs/claude*`)
+- **claudeSkills** — Seeds the `.claude/skills/zudo-doc-*` helper skills (version-bump, design-system, translate)
+- **skillSymlinker** — Powers `pnpm setup:doc-skill` (see "Doc Skill" above)
 - **sidebarResizer** — Draggable sidebar width
 - **sidebarToggle** — Show/hide desktop sidebar
+- **tocToggle** — Show/hide the table of contents
+- **imageEnlarge** — Click-to-enlarge images
+- **dynamicPageTransition** — Animated page transitions
 - **docHistory** — Document edit history
 - **llmsTxt** — Generates llms.txt for LLM consumption
+- **cjkFriendly** — CJK-aware typography (line breaking, spacing) for the Japanese content
+
+## Hosting & CI/CD
+
+- **Hosting**: Cloudflare Workers static assets (adapter: `@takazudo/zfb-adapter-cloudflare`), served at `https://zudo-slack-wisdom.takazudomodular.com`
+- **Deploy config, PR preview checks, and the production deploy workflow** are set up by a separate sub-issue (deploy config: `wrangler.toml`, `main-deploy.yml`, `pr-checks.yml`) — not part of this quality-gates task
+- **Secrets** (GitHub Actions): `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `IFTTT_PROD_NOTIFY` (optional — production-deploy notification)
