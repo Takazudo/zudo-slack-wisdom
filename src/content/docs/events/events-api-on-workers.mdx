@@ -1,0 +1,106 @@
+---
+title: Events API on Workers
+description: The url_verification handshake, acking fast, retries, and event dedupe for an Events API endpoint running on a Worker
+sidebar_position: 2
+---
+
+## Registering a Request URL
+
+Event Subscriptions live under your app's settings on api.slack.com. Once
+enabled, you point Slack at a single **Request URL** -- a route on your
+Worker -- and Slack starts sending both the handshake below and, once you
+subscribe to event types, live traffic to it.
+[Request URLs are case-sensitive](https://docs.slack.dev/apis/events-api/using-http-request-urls/).
+
+## The `url_verification` Handshake
+
+Before Slack activates a Request URL, it POSTs a one-time challenge to
+confirm you control the endpoint:
+
+```json
+{
+  "token": "Jhj5dZrVaK7ZwHHjRyZWjbDl",
+  "challenge": "3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P",
+  "type": "url_verification"
+}
+```
+
+Your Worker must answer with HTTP 200 and echo the `challenge` value back.
+Plaintext, form-encoded (`challenge=...`), and JSON
+(`{"challenge": "..."}`) responses are all accepted
+([reference](https://docs.slack.dev/reference/events/url_verification/)). A
+minimal handler branches on `type` before doing anything else:
+
+```typescript
+const body = await request.json<{ type: string; challenge?: string }>();
+
+if (body.type === "url_verification") {
+  return Response.json({ challenge: body.challenge });
+}
+```
+
+:::warning[Verify the signature first]
+The handshake request is signed the same way every other event is. Route it
+through signature verification before this branch runs -- skipping that here
+means anyone who guesses your Request URL can probe it. See
+[Verifying Requests](../worker-backend/verifying-requests.mdx) for the
+`X-Slack-Signature` / `X-Slack-Request-Timestamp` check
+([source](https://docs.slack.dev/authentication/verifying-requests-from-slack)).
+:::
+
+## Ack Fast, Do the Work in `waitUntil`
+
+Once subscribed, every matching event arrives as its own POST, and Slack
+expects a 2xx response **within 3 seconds**
+([source](https://docs.slack.dev/apis/events-api/)). On a Worker that means
+returning the response before any Slack Web API call, D1 write, or AI
+summarization finishes -- hand that work to `ctx.waitUntil()` instead of
+awaiting it inline before responding. See
+[The 3-Second Ack](../worker-backend/three-second-ack.mdx) for the pattern.
+
+## Retries and Event Dedupe
+
+Missing the 3-second window doesn't drop the event. Slack retries up to
+three times: the first retry lands nearly immediately, the second after
+about 1 minute, and the third (and final) after about 5 minutes
+([source](https://docs.slack.dev/apis/events-api/)) -- so a single slow or
+flaky response can result in the same event landing on your endpoint up to
+four times total (the original delivery plus three retries).
+
+Each retry carries two headers
+([source](https://docs.slack.dev/apis/events-api/)):
+
+- **`X-Slack-Retry-Num`** -- the attempt number: `1`, `2`, or `3`.
+- **`X-Slack-Retry-Reason`** -- why Slack is retrying: `http_timeout` (no 2xx
+  within 3 seconds), `connection_failed`, `ssl_error`, `http_error`,
+  `too_many_redirects`, or `unknown_error`.
+
+Don't use the retry headers to dedupe, though -- they only tell you this
+delivery *is* a retry, not whether you already processed the underlying
+event. Every event envelope carries a stable `event_id`; key your dedupe
+check on that (a short-TTL KV or D1 row is enough) and return 2xx for an
+`event_id` you've already handled instead of erroring, since an error just
+spends another retry without changing the outcome.
+
+:::tip[Also skip your own bot's messages]
+Message events fired by your own bot user come back through the same
+subscription. Check `event.bot_id` (or compare against your bot's user ID)
+before acting, or a bot that posts in response to messages can end up
+triggering itself in a loop.
+:::
+
+## Subscription Scopes vs. Event Types
+
+Event access rides on the same OAuth scope system as everything else
+([source](https://docs.slack.dev/apis/events-api/)): each event type in the
+[event reference](https://docs.slack.dev/reference/events/) lists which
+[scope](https://docs.slack.dev/reference/scopes) grants it -- `files:read`
+for `file_created`, `reactions:read` for `reaction_added`, and so on.
+The scope is what actually authorizes delivery -- request only the scopes
+your event handlers actually consume, per the minimal-scope principle in
+[Tokens, Scopes & OAuth](../getting-started/tokens-scopes-oauth.mdx).
+
+Team-level events also carry a per-app ceiling of 30,000 deliveries per
+workspace per rolling 60 minutes; exceeding it produces an
+`app_rate_limited` event instead of the traffic you subscribed to
+([source](https://docs.slack.dev/apis/events-api/)).

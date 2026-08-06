@@ -1,0 +1,73 @@
+---
+title: Socket Mode for Local Dev
+description: "Why the WebSocket transport doesn't fit a deployed Worker, and how to use it while iterating locally"
+sidebar_position: 3
+---
+
+## What Socket Mode Is
+
+Socket Mode replaces the HTTP Request URL with a WebSocket connection your
+app opens outward to Slack. Instead of Slack POSTing to a URL you expose,
+your app calls the `apps.connections.open` Web API method with an app-level
+token (prefixed `xapp-`) and gets back a one-time WebSocket URL to connect
+to; events and interactivity payloads both arrive as messages over that same
+socket
+([source](https://docs.slack.dev/apis/events-api/using-socket-mode)).
+
+The app-level token is generated once per app -- not per installation -- and
+is separate from the bot token (`xoxb-...`) used for outbound Web API calls.
+See [Tokens, Scopes & OAuth](../getting-started/tokens-scopes-oauth.mdx) for
+the full token taxonomy.
+
+A Socket Mode connection isn't permanent: the WebSocket URL refreshes
+regularly, and your app is expected to reconnect to the new URL promptly to
+avoid missing traffic
+([source](https://docs.slack.dev/apis/events-api/using-socket-mode)). Up to
+10 concurrent connections are allowed per app, and apps using Socket Mode
+are not currently accepted into the public Slack Marketplace
+([source](https://docs.slack.dev/apis/events-api/using-socket-mode)).
+
+## Why It Doesn't Fit a Deployed Worker
+
+Holding a WebSocket open and reconnecting it on Slack's schedule both
+require a process that keeps running between messages. A Worker doesn't
+have that: a handler runs for the duration of one request -- extended
+briefly by `ctx.waitUntil()` for background work after the response is
+sent -- and then the isolate is free to be torn down. There's no slot in
+that lifecycle for a connection that has to stay open indefinitely and
+reconnect itself whenever Slack decides to rotate the URL. The Events API's
+plain HTTP POST is the transport that actually matches a Worker's
+per-request model, which is why it's this project's production path (see
+[Events API on Workers](./events-api-on-workers.mdx)).
+
+## Where It Shines: Local Development
+
+The trade Socket Mode makes -- an outward connection instead of an inbound
+URL -- is exactly what a local dev loop wants. Socket Mode "allows your app
+to use the Events API and interactive features -- without exposing a public
+HTTP Request URL"
+([source](https://docs.slack.dev/apis/events-api/using-socket-mode)), which
+means no tunnel (ngrok, a Cloudflare Tunnel, etc.) and no re-registering a
+Request URL every time your local address changes. Point a local script, or
+a Bolt SDK's Socket Mode adapter, at your app-level token and it starts
+receiving live events and interactivity from your dev workspace immediately.
+
+## Migration Path: Socket Mode Dev -> Events API Prod
+
+Both transports deliver the same event and interactivity payload shapes, so
+handler logic doesn't change between them -- only how the payload arrives:
+
+1. **Local dev** -- run against Socket Mode. No public URL, fast iteration,
+   no signature verification to stand up yet (Socket Mode payloads arrive
+   over an authenticated connection, not a signed POST).
+2. **Deploy** -- once the Worker has a public URL, switch the app's Event
+   Subscriptions (and Interactivity Request URL) over to it and complete
+   the `url_verification` handshake (see
+   [Events API on Workers](./events-api-on-workers.mdx)).
+3. **Production** -- the deployed Worker receives the same events over
+   signed HTTP. Turn Socket Mode off for that environment, or keep it
+   enabled if a second local or staging workspace still uses it.
+
+Keep the function that actually handles an event or action transport-agnostic
+-- have it take a parsed payload, not a raw request -- so swapping the
+delivery mechanism doesn't touch business logic.
