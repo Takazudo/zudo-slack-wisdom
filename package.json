@@ -22,6 +22,7 @@
     "setup:doc-skill:codex": "bash scripts/setup-doc-skill.sh --target codex",
     "setup:doc-skill:both": "bash scripts/setup-doc-skill.sh --target both",
     "check:html": "pnpm dlx html-validate \"dist/**/*.html\"",
+    "check:category-meta": "node scripts/check-category-meta.mjs",
     "check:pin-parity": "node scripts/check-pin-parity.mjs",
     "check:wrangler-pin": "node scripts/check-wrangler-pin.mjs",
     "check:links": "node scripts/check-links.js --strict-broken --allowlist=.check-links-allowlist",
