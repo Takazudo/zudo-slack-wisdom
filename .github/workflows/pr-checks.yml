@@ -56,6 +56,10 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
         with:
+          # No `packageManager` field in package.json to auto-infer from (unlike
+          # the sibling repos this workflow was copied from) — pnpm/action-setup
+          # v4 fails setup without either that field or this explicit version.
+          version: 10.25.0
           dest: ~/setup-pnpm-${{ github.job }}
 
       - name: Setup Node.js
@@ -104,6 +108,10 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
         with:
+          # No `packageManager` field in package.json to auto-infer from (unlike
+          # the sibling repos this workflow was copied from) — pnpm/action-setup
+          # v4 fails setup without either that field or this explicit version.
+          version: 10.25.0
           dest: ~/setup-pnpm-${{ github.job }}
 
       - name: Setup Node.js
@@ -129,6 +137,10 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
         with:
+          # No `packageManager` field in package.json to auto-infer from (unlike
+          # the sibling repos this workflow was copied from) — pnpm/action-setup
+          # v4 fails setup without either that field or this explicit version.
+          version: 10.25.0
           dest: ~/setup-pnpm-${{ github.job }}
 
       - name: Setup Node.js
@@ -168,6 +180,10 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
         with:
+          # No `packageManager` field in package.json to auto-infer from (unlike
+          # the sibling repos this workflow was copied from) — pnpm/action-setup
+          # v4 fails setup without either that field or this explicit version.
+          version: 10.25.0
           dest: ~/setup-pnpm-${{ github.job }}
 
       - name: Setup Node.js
@@ -211,6 +227,10 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
         with:
+          # No `packageManager` field in package.json to auto-infer from (unlike
+          # the sibling repos this workflow was copied from) — pnpm/action-setup
+          # v4 fails setup without either that field or this explicit version.
+          version: 10.25.0
           dest: ~/setup-pnpm-${{ github.job }}
 
       - name: Setup Node.js
@@ -249,6 +269,10 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
         with:
+          # No `packageManager` field in package.json to auto-infer from (unlike
+          # the sibling repos this workflow was copied from) — pnpm/action-setup
+          # v4 fails setup without either that field or this explicit version.
+          version: 10.25.0
           dest: ~/setup-pnpm-${{ github.job }}
 
       - name: Setup Node.js

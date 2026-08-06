@@ -55,6 +55,10 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
         with:
+          # No `packageManager` field in package.json to auto-infer from (unlike
+          # the sibling repos this workflow was copied from) — pnpm/action-setup
+          # v4 fails setup without either that field or this explicit version.
+          version: 10.25.0
           dest: ~/setup-pnpm-${{ github.job }}
 
       - name: Setup Node.js
@@ -94,6 +98,10 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
         with:
+          # No `packageManager` field in package.json to auto-infer from (unlike
+          # the sibling repos this workflow was copied from) — pnpm/action-setup
+          # v4 fails setup without either that field or this explicit version.
+          version: 10.25.0
           dest: ~/setup-pnpm-${{ github.job }}
 
       - name: Setup Node.js
@@ -132,6 +140,10 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
         with:
+          # No `packageManager` field in package.json to auto-infer from (unlike
+          # the sibling repos this workflow was copied from) — pnpm/action-setup
+          # v4 fails setup without either that field or this explicit version.
+          version: 10.25.0
           dest: ~/setup-pnpm-${{ github.job }}
 
       - name: Setup Node.js
@@ -289,7 +301,11 @@ jobs:
   # ---------------------------------------------------------------------------
   notify:
     name: Deploy Notification
-    needs: [build-site, build-history, deploy]
+    # html-validate is included so its failure is distinguishable below —
+    # without it, a validation failure only surfaces here as a skipped
+    # `deploy` (deploy's `needs: [..., html-validate, ...]` skips it too),
+    # which the status logic couldn't tell apart from an actual cancellation.
+    needs: [build-site, html-validate, build-history, deploy]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -301,6 +317,7 @@ jobs:
           IFTTT_PROD_NOTIFY: ${{ secrets.IFTTT_PROD_NOTIFY }}
           RAW_COMMIT_MSG: ${{ github.event.head_commit.message }}
           BUILD_SITE_RESULT: ${{ needs.build-site.result }}
+          HTML_VALIDATE_RESULT: ${{ needs.html-validate.result }}
           BUILD_HISTORY_RESULT: ${{ needs.build-history.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
           GITHUB_SHA_VAL: ${{ github.sha }}
@@ -312,6 +329,8 @@ jobs:
             STATUS="zudo-slack-wisdom deploy succeeded!"
           elif [ "$BUILD_SITE_RESULT" = "failure" ]; then
             STATUS="zudo-slack-wisdom deploy failed (site build)"
+          elif [ "$HTML_VALIDATE_RESULT" = "failure" ]; then
+            STATUS="zudo-slack-wisdom deploy failed (html validate)"
           elif [ "$BUILD_HISTORY_RESULT" = "failure" ]; then
             STATUS="zudo-slack-wisdom deploy failed (history build)"
           elif [ "$DEPLOY_RESULT" = "failure" ]; then
