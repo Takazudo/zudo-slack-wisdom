@@ -1,0 +1,48 @@
+---
+title: SDK Support
+description: Which SDK versions bind Lists, the generic-call escape hatch for older pins, and no-code gaps
+sidebar_position: 4
+---
+
+## Official SDKs
+
+Established by unpacking published npm/PyPI artifacts and bisecting versions, not by docs alone.
+
+| SDK | Lists support since | Current status |
+|---|---|---|
+| `@slack/web-api` (Node) | **7.13.0** (2025-11-25) — 7.12.0 has zero bindings | All 12 methods bound on `client.slackLists.*` with typed Arguments/Response pairs; present through 8.0.0 (2026-07-14). |
+| `slack_sdk` (Python) | **3.39.0** (2025-11-20) — 3.38.0 has zero | All 12 as `slackLists_*` on `WebClient`, `AsyncWebClient`, and `LegacyWebClient`; present through 3.43.0 (2026-06-30). |
+| `java-slack-sdk` | **1.48.0** (merged 2025-12-11) | Bound. |
+| Bolt (JS/Python) | Transitive | `@slack/bolt` 5.0.0 → `@slack/web-api` ^8.0.0 (always Lists-capable). `slack_bolt` 1.30.0 only requires `slack_sdk` >=3.38.0 — a **floor**, not a guarantee: an unpinned install typically resolves to the latest satisfying release (Lists-capable), but a locked or constrained environment can still land on exactly 3.38.0, which has zero Lists bindings. Pin `slack_sdk` >=3.39.0 explicitly if you depend on Lists. |
+| `deno-slack-api` | **Not shipped** | [slackapi/deno-slack-api#129](https://github.com/slackapi/deno-slack-api/issues/129) still open. |
+
+Sources: [node-slack-sdk#2421](https://github.com/slackapi/node-slack-sdk/pull/2421) (the Node
+binding PR).
+
+## Older Pins: the Generic-Call Escape Hatch
+
+Projects pinned below the versions above (`@slack/web-api` ≤7.12.0, `slack_sdk` ≤3.38.0) have no
+typed `slackLists.*` bindings. Slack's docs explicitly sanction falling back to each SDK's generic
+raw-call method, passing the method name and arguments as plain data instead of using a typed
+helper. The call shape is SDK-specific, not a single shared name:
+
+- Node (`@slack/web-api`): `client.apiCall(methodName, options)`
+- Python (`slack_sdk`): `client.api_call(api_method, params=...)` (snake_case — `apiCall` does not
+  exist on the Python client)
+
+This works against any Lists method on any SDK version — it is simply untyped.
+
+## No-Code Platforms: Verified Absent
+
+As of 2026-08-06, none of Zapier, Make, or n8n ships a native Slack Lists trigger, action, or
+module:
+
+- **Zapier's** Slack app enumerates its full trigger/action set — Canvas create/edit is present —
+  with no Lists entry; only the generic "API Request (Beta)" raw call reaches Lists methods.
+- **Make's** Slack module reference (checked 2026-08-05) has zero `slackLists` occurrences; only
+  the generic "Make an API Call" module works.
+- **n8n's** Slack node resources stop at Channel / File / Message / Reaction / Star / User /
+  UserGroup — zero `slackLists` hits across the n8n-io GitHub org.
+
+A cron or automation built on any of these three platforms needs a raw HTTP call to
+`slack.com/api/slackLists.*` rather than a native node.

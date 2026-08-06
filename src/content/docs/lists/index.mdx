@@ -1,6 +1,66 @@
 ---
 title: Lists
+description: What Slack Lists are, the paid-plan gate, and when to reach for one
 sidebar_position: 1
 ---
 
-Placeholder — lists content lands in a later sub-issue.
+## What a Slack List Is
+
+A Slack List is a structured collection of rows and typed columns — a lightweight spreadsheet
+that is a Slack-native surface in its own right, not something that lives inside a channel; it is
+created standalone and then explicitly shared into channels or with people via
+`slackLists.access.set` (see [Access and Scopes](./access-and-scopes.mdx)). Each column has a type (`select`, `user`, `date`, `number`, `checkbox`,
+`rating`, `text`, …), and a list renders in either a **table** layout or a **board** layout —
+items grouped by one column's value (for example a `select` "Status" column with generic options
+`todo` / `doing` / `done`), with cards movable between the groups. Board layout is the one
+genuinely Kanban-shaped surface Slack offers natively; nothing else in the platform renders
+swimlanes.
+
+The Lists Web API (`slackLists.*`, 12 methods) went generally available on 2025-09-02. See
+[API Surface](./api-surface.mdx) for the full method table.
+
+## The Paid-Plan Gate
+
+Lists require a paid Slack plan. Two distinct gates return two distinct errors:
+
+| Error | Cause |
+|---|---|
+| `paid_teams_only` | The workspace is on the Free plan |
+| `lists_disabled_user_team` | An admin has explicitly disabled Lists — independent of plan |
+
+Any paid tier qualifies — Pro, Business+, or Enterprise; Lists are **not** Enterprise-only.
+Downgrading to Free makes existing lists read-only and blocks creating new ones. A second,
+separate admin toggle can additionally restrict list sharing to owners only, which would block a
+bot from calling `slackLists.access.set` (see [Access and Scopes](./access-and-scopes.mdx)).
+
+:::warning[Unverified]
+The exact error↔cause mapping above (`paid_teams_only` for the plan gate,
+`lists_disabled_user_team` for the admin toggle) is docs-derived, not empirically confirmed
+against a live disabled workspace.
+:::
+
+Source: [Manage list settings in Slack](https://slack.com/intl/en-gb/help/articles/28932867593875-Manage-list-settings-in-Slack).
+
+## When to Choose a List
+
+A List is the heaviest of Slack's bot-writable surfaces: per-row/per-cell writes, a permanent
+row-id bookkeeping burden (no upsert, no external-ID key — see
+[Creating Lists](./creating-lists.mdx)), a hard per-list item cap, and no change events (polling
+is the only inbound path). Reach for one only when the team genuinely needs a **board** — a
+pipeline of stages with cards moving between them (generic stages A → B → C, or a `todo` /
+`doing` / `done` triage) — and will keep using it as a board after the novelty wears off.
+
+For anything that just needs to be *visible* in Slack — a status snapshot, a small table, a link
+out to a real dashboard — a simpler surface is usually a better trade. See
+[Data Surfaces](../data-surfaces/index.mdx) for the comparison across Slack's bot-writable
+display surfaces and where Lists ranks among them.
+
+## In This Section
+
+- [API Surface](./api-surface.mdx) — the 12 `slackLists.*` methods, rate tiers, and verified
+  absences
+- [Access and Scopes](./access-and-scopes.mdx) — scopes, the access-grant contract, and the
+  invite-only default
+- [SDK Support](./sdk-support.mdx) — which SDK versions bind Lists, and what no-code platforms
+  lack
+- [Creating Lists](./creating-lists.mdx) — schema design and what to persist at creation time
