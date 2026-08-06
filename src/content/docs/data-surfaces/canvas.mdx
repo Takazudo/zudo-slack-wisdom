@@ -4,7 +4,7 @@ description: The canvases.create / canvases.edit write path, channel canvases, t
 sidebar_position: 3
 ---
 
-A canvas is a markdown document surface built into Slack -- "simple but powerful documents"
+A canvas is a markdown document surface built into Slack — "simple but powerful documents"
 that live either attached to a channel or on their own
 ([surfaces/canvases](https://docs.slack.dev/surfaces/canvases/)). This page covers the
 bot-facing write path: creating one, keeping it in sync, granting read-only access, and where
@@ -34,19 +34,19 @@ standalone document the bot has to share out by link. Both `canvases.create` and
 }
 ```
 
-## Editing a canvas -- one operation per call
+## Editing a canvas — one operation per call
 
 `canvases.edit`'s own docs state it plainly: "Only one operation per API call is currently
 supported"
 ([reference/methods/canvases.edit](https://docs.slack.dev/reference/methods/canvases.edit)).
-The request shape is a `changes` array, and that array can carry several change objects -- but
+The request shape is a `changes` array, and that array can carry several change objects — but
 each one is still a single atomic operation:
 
-- `insert_after` / `insert_before` -- add content relative to an existing section
-- `insert_at_start` / `insert_at_end` -- add content at either end of the document
-- `replace` -- overwrite a section
-- `delete` -- remove a section
-- `rename` -- change the canvas title
+- `insert_after` / `insert_before` — add content relative to an existing section
+- `insert_at_start` / `insert_at_end` — add content at either end of the document
+- `replace` — overwrite a section
+- `delete` — remove a section
+- `rename` — change the canvas title
 
 Because there's no cheap "patch this one cell" operation, the refresh pattern that stays sane
 for a bot-owned canvas regenerated from source data is a **whole-document `replace`**: build the
@@ -72,22 +72,22 @@ diff the previous document and send incremental changes.
 ## Granting read-only access
 
 `canvases.access.set` takes a `canvas_id`, an `access_level` of `read`, `write`, or `owner`, and
-either `channel_ids` or `user_ids` -- not both
+either `channel_ids` or `user_ids` — not both
 ([reference/methods/canvases.access.set](https://docs.slack.dev/reference/methods/canvases.access.set)).
 The order matters: Slack's docs say to "share the canvas link in the channel or with the user
-you are trying to set access levels for, respectively" -- for the `user_ids` form specifically,
+you are trying to set access levels for, respectively" — for the `user_ids` form specifically,
 "you must have sent the user the canvas directly first," or the `access.set` call fails. Share
 the canvas before you set access on it, not after.
 
 Read access is a real ceiling, not just a UI hint. Someone holding view-only access to a canvas
 "cannot make changes or comments"
-([Manage access permissions for canvases and lists](https://slack.com/help/articles/15678967614611-Manage-access-permissions-for-canvases-and-lists)) --
+([Manage access permissions for canvases and lists](https://slack.com/help/articles/15678967614611-Manage-access-permissions-for-canvases-and-lists)) —
 canvases don't have the carve-out Lists has, where a viewer can still comment on an item.
 
 ## Persistence as a channel tab
 
 A canvas created (or later attached) with a `channel_id` sits in the channel header as its own
-tab, alongside Messages -- durable UI real estate a pinned message doesn't get. It doesn't
+tab, alongside Messages — durable UI real estate a pinned message doesn't get. It doesn't
 scroll out of view as the channel gets used, and there's no equivalent of a channel member
 accidentally unpinning it.
 
@@ -96,10 +96,10 @@ accidentally unpinning it.
 | Limit | Value | Source |
 |---|---|---|
 | Operations per `canvases.edit` call | 1 | [canvases.edit](https://docs.slack.dev/reference/methods/canvases.edit) |
-| `document_content` markdown size | 1 MiB / 1,048,576 characters -- applies per change when a `changes` array has more than one entry | [canvases.edit](https://docs.slack.dev/reference/methods/canvases.edit), [surfaces/canvases](https://docs.slack.dev/surfaces/canvases/) |
-| Table cells per table | 300 -- any mix of rows x columns | [surfaces/canvases](https://docs.slack.dev/surfaces/canvases/) |
+| `document_content` markdown size | 1 MiB / 1,048,576 characters — applies per change when a `changes` array has more than one entry | [canvases.edit](https://docs.slack.dev/reference/methods/canvases.edit), [surfaces/canvases](https://docs.slack.dev/surfaces/canvases/) |
+| Table cells per table | 300 — any mix of rows x columns | [surfaces/canvases](https://docs.slack.dev/surfaces/canvases/) |
 | `canvases.edit` rate limit | Tier 3 (50+ requests/min) | [canvases.edit](https://docs.slack.dev/reference/methods/canvases.edit) |
-| Required scope | `canvases:write` -- create, edit, and access.set all need it | [scopes/canvases.write](https://docs.slack.dev/reference/scopes/canvases.write/) |
+| Required scope | `canvases:write` — create, edit, and access.set all need it | [scopes/canvases.write](https://docs.slack.dev/reference/scopes/canvases.write/) |
 
 :::note[What a canvas can't do]
 No board layout, no columns, no per-cell writes. If the content is really a status board rather
