@@ -1,0 +1,171 @@
+---
+title: Choosing a Dashboard Surface
+description: A ranked comparison of the five places a Slack bot can publish read-mostly data, and the decision rule for picking one.
+sidebar_position: 2
+---
+
+Scenario: a bot -- for example a Cloudflare Worker cron job -- periodically publishes a status
+board into Slack. The team should be able to look at it where they already work; they should
+not be able to edit it out from under the bot. Five surfaces can hold that data. This ranks
+them for that specific goal -- a dashboard, not a document and not a form.
+
+## Ranking at a glance
+
+| # | Surface | Bot-writable | Read-only enforcement | Refresh cost | Visual ceiling |
+|---|---|---|---|---|---|
+| 1 | Pinned `chat.update` message | Yes | Absolute | 1 API call | Table block, up to 100 rows |
+| 2 | Slack Lists | Yes (12 GA methods) | Configurable, with holes | Per-row create/update, owned row-id state | A real Kanban board |
+| 3 | Channel bookmark to an external dashboard | Yes (`bookmarks.add`) | Your own app decides | Zero | Unlimited -- it's your UI |
+| 4 | Canvas | Yes | Configurable | 1 call, but a whole-document replace | Markdown document, tables only |
+| 5 | App Home tab | Yes (`views.publish`) | Yes | O(users) calls per refresh | Full Block Kit, per-user |
+
+## 1. Pinned `chat.update` Block Kit message -- build this first
+
+**Bot-writable:** Yes. Call `chat.postMessage` once, pin the result, then call `chat.update` on
+every refresh.
+
+**Read-only enforcement:** Absolute, and it needs zero configuration. Only the app that posted
+the message can edit it -- there's no ACL to set, no share dialog to get wrong, and no admin
+override that hands someone else write access to the message body. It's the only surface here
+whose read-only property can't be misconfigured
+([reference/methods/chat.update](https://docs.slack.dev/reference/methods/chat.update)).
+
+**Refresh cost:** Exactly one API call per refresh. Editing a message's blocks in place produces
+no channel notification -- correct behavior for a dashboard -- and no "edited" flag.
+
+**Visual ceiling:** Higher than its reputation suggests. Block Kit's Table block renders up to
+100 rows x 20 columns, 10,000 characters total
+([reference/block-kit/blocks/table-block](https://docs.slack.dev/reference/block-kit/blocks/table-block)),
+alongside sections, context lines, and card/carousel-style blocks. What it can't do: Kanban
+swimlanes, per-row threads, filtering, CSV export.
+
+**Hard limits:** The Table block caps above, general Block Kit per-message block limits, and
+any channel member can unpin the message (unpinning doesn't delete it).
+
+**Verdict: default choice.** One API call, no state to persist, no cap policy, no manual setup,
+and the strongest read-only guarantee on this list. A Slack List gets you a real board and
+per-item threads for roughly ten times the code and operational surface. Ship this first;
+upgrade only if the team asks for columns after seeing it.
+
+## 2. Slack Lists -- the only real board, and the longest bill
+
+**Bot-writable:** Yes. Twelve `slackLists.*` methods, all bot-token (`xoxb`) compatible with
+the `lists:read` + `lists:write` scopes. Three prerequisites before any of it works: a paid
+plan (any paid tier, not Enterprise-only), those two scopes (adding them forces an OAuth
+reinstall), and per-list access -- scopes alone still yield `list_not_found` until the list is
+shared with the bot or its channel.
+
+**Read-only enforcement:** Not automatic, but genuinely configurable and server-enforced.
+`slackLists.access.set` takes a required `access_level` of exactly `read`, `write`, or `owner`,
+and read-only is closed under escalation -- a viewer can re-share view access but can never
+grant edit. Known holes: viewers can still comment in an item's thread, an owner or admin can
+delete any list they can view, and the UI's own share dialog defaults to "Can edit" (a human
+sharing by hand has to remember to change it -- the API can't fall into this because the
+parameter is required).
+
+**Refresh cost:** The highest on this list. There's no upsert and no idempotency key on any
+method -- two identical `items.create` calls make two rows -- so the caller has to persist the
+returned row id and branch create-vs-update on it itself. `items.list` has no filter or search
+beyond `limit` / `cursor` / `archived`, so recovering a lost id mapping means paginating the
+whole list.
+
+**Visual ceiling:** The only surface here that renders an actual board. Board layout groups
+items by field, supports saved views and per-item threads, and gives a view-only user a
+look-but-don't-touch board -- they can filter and read, but can't drag cards or save views.
+
+**Hard limits:** 1,000 items + subtasks per list on Pro/Business+ (5,000 on Enterprise Grid);
+schema is effectively frozen after creation (no add/remove/retype columns via API, 30-column
+cap); no `slackLists.info` and no list enumeration, so the list id and every column id have to
+be persisted at create time or they're gone; Board layout and views are UI-only and the
+default view is owner-only, so a bot-created list still needs a human with write access to
+click the board into existence.
+
+:::caution[Unverified: auto-archive at the row cap]
+Whether hitting the item cap auto-archives the oldest rows, or simply fails new creates with
+`over_row_maximum`, is reported by prior research but was never confirmed against Slack's own
+docs or the live API -- the verification spike for this project was skipped (no test token
+available). Treat `over_row_maximum` as the only authoritative signal until this is checked
+empirically, and don't design a mirror that assumes silent eviction at the cap.
+:::
+
+**Verdict: adopt only if the team demands a board.** It's the sole surface with real columns,
+and a read-only list sidesteps the usual Lists dealbreaker (no change events, because the bot
+is the only writer). But it costs permanent row-id bookkeeping, a cap-eviction policy you can't
+fully verify yet, an un-evolvable schema, manual view setup a bot can't perform, and a human
+co-owner in the loop.
+
+## 3. Channel bookmark to an external dashboard -- the null option
+
+**Bot-writable:** Yes -- `bookmarks.add` with the `bookmarks:write` scope pins a link into the
+channel's bookmark bar.
+
+**Read-only enforcement:** The Slack side is just a link; your own dashboard's auth model
+governs everything else.
+
+**Refresh cost:** Zero. The dashboard renders live data -- there's nothing to sync.
+
+**Visual ceiling:** Unlimited. It's your own UI, which will always out-render anything Slack
+can draw natively.
+
+**Hard limits:** It isn't *in* Slack -- one click-through, plus whatever login friction your
+dashboard imposes. Nothing is glanceable from the channel itself.
+
+**Verdict: do this regardless of what else you build.** Zero cost, full fidelity, always fresh.
+Its only weakness -- not glanceable in-channel -- is exactly what option 1 patches for one API
+call.
+
+## 4. Canvas -- a document, not a dashboard
+
+**Bot-writable:** Yes -- `canvases.create` to make one, `canvases.edit` to update it later.
+
+**Read-only enforcement:** Configurable via `canvases.access.set` with `access_level: "read"`,
+and stricter than Lists in one respect -- a canvas viewer can't comment at all. Setup is
+order-sensitive: the canvas has to be shared into the channel (or with the user) before access
+can be granted for it.
+
+**Refresh cost:** `canvases.edit` supports one operation per API call, so the only refresh
+pattern that stays sane for a bot-regenerated document is a whole-document `replace` -- one
+call, but the full document gets rebuilt and resent every time.
+
+**Visual ceiling:** A markdown-flavored document -- headings, tables, checklists. No board, no
+columns, no widget layout.
+
+**Hard limits:** One edit operation per call, a 1 MiB content cap, and document-shaped
+rendering only. See [Canvas](./canvas.mdx) for the full write path and every limit, re-verified
+against current Slack docs.
+
+**Verdict: skip for dashboards.** Its one structural edge over a pinned message -- a channel
+canvas is a persistent tab that never scrolls out of the channel -- rarely earns back what it
+costs: no update notification, a whole-document resend on every refresh, and a renderer with no
+numeric or board layout. Use Canvas for prose -- runbooks, meeting notes, project plans -- not
+status boards.
+
+## 5. App Home -- read-only, but nobody can share it
+
+**Bot-writable:** Yes -- `views.publish`.
+
+**Read-only enforcement:** Yes, cleanly -- users can't edit an app's Home tab at all. The
+cleanest read-only story on this list, after the pinned message.
+
+**Refresh cost:** O(users). App Home is a one-to-one space shared by a single user and the app,
+so every refresh is one `views.publish` call per user, and the bot has to track who those users
+are.
+
+**Visual ceiling:** Full Block Kit, same as a message -- but rendered privately, per user.
+
+**Hard limits:** No shareable link. There's no way to post "look here" and point the team at
+one URL; each person has to navigate to the app's Home tab themselves.
+
+**Verdict: worst fit for a shared team dashboard.** Per-user privacy is a feature for
+personalized views and an anti-feature for "one board the whole channel looks at." Reach for
+this only when each viewer genuinely needs to see different data.
+
+## Decision rule
+
+Do you want the numbers visible in Slack, or does the team need to work a board? If it's the
+numbers: the pinned `chat.update` message (#1), optionally backed by a bookmark to a fuller
+external dashboard (#3), and stop there. If the team genuinely works a pipeline as a board --
+stages A through C, with cards moved by hand, and the whole channel glancing at the same
+board -- Slack Lists (#2), read-only for everyone but the bot, a bounded working set under the
+row cap, and one named human holding write access. Canvas and App Home lose to those three in
+every read-only-dashboard scenario examined here.
