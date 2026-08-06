@@ -1,0 +1,167 @@
+---
+title: Permissions and Ownership
+description: "access.set semantics, what a \"Can view\" grant actually allows, five read-only holes, and who can own a bot-managed list"
+sidebar_position: 23
+---
+
+Read-only access on a Slack List is real and server-enforced — but "read-only" turns out to mean
+something more specific, and less absolute, than it sounds. This page covers the grant mechanism,
+what a viewer can and cannot actually do, five holes worth knowing before you rely on read-only
+for anything sensitive, and how ownership works for a bot-managed list.
+
+## `access.set` — the only way to grant access
+
+[`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/) is a
+write method (`lists:write`, Tier 3 — 50+/min) with a required `access_level` argument — there
+is no default, and omitting it fails the call. Exactly three values are documented:
+
+| `access_level` | Grants |
+|---|---|
+| `read` | Read access to the list |
+| `write` | Read **and** write access |
+| `owner` | Makes the specified user in `user_ids` the owner |
+
+Grantees are `user_ids` **or** `channel_ids` — mutually exclusive, and at least one is required.
+`access_level: "owner"` combined with `channel_ids` returns `invalid_arguments`: only users can
+be owners, never a channel. Slack's own docs ship a canned sample for exactly the read-only
+dashboard case:
+
+```json
+{ "list_id": "F1234567", "access_level": "read", "channel_ids": ["C7654321"] }
+```
+
+A few contract details worth knowing before you build on this method:
+
+- **There is no read-back.** No `access.list`, no `access.get`, no `slackLists.info`. Grants are
+  write-only — you cannot programmatically audit who currently holds read vs write access. The
+  only audit path is the UI Share pane.
+- **`access.delete` is a full revoke**, with no `access_level` argument — there is no partial
+  revoke. To demote a write grant down to read, re-call `access.set` with `access_level: "read"`.
+- **Paid plan required.** A free workspace gets `paid_teams_only`. A separate admin toggle that
+  disables Lists workspace- or org-wide produces the distinct error `lists_disabled_user_team`.
+- **SDK typing gap:** the Node SDK types `access_level` as a plain `string`, not a
+  `'read' | 'write' | 'owner'` union — a typo in the value compiles cleanly and only fails at
+  request time.
+
+:::warning[Unverified]
+Whether re-calling `access.set` with `access_level: "read"` on an entity that already holds
+`write` actually **downgrades** it (as opposed to being a no-op, or requiring `access.delete`
+first) is never stated outright in the docs. The method is named "set," which implies replace,
+but that is inference, not a documented guarantee. This project's verification spike was
+skipped, so this keeps its unverified status — confirm the downgrade path against a real grant
+before depending on it as your only way to walk back an accidental write grant.
+:::
+
+## What "Can view" means in the UI
+
+:::warning[Unverified]
+The mapping from the API's `access_level: "read"` to the UI's **"Can view"** role label is
+inferred from there being exactly three API values and exactly three UI states — no Slack page
+states the mapping verbatim. Treat it as almost certainly correct, but unconfirmed by this
+project's (skipped) verification spike.
+:::
+
+Under that mapping, a "Can view" holder gets exactly two rights beyond viewing: *share the list
+with other people*, and *grant others view access*. Granting **edit** access is reserved to
+owners and write-holders. The practical consequence: read-only is **closed under escalation** —
+if no human on the list holds write, no human can hand write access to anyone, because a viewer
+can only ever propagate more viewing, never editing. It is *not* closed under propagation on its
+own — viewers can keep spreading view access onward — unless the owner turns on limited sharing
+(see hole 3 below).
+
+## What a viewer can and cannot do
+
+| Viewers **can** | Viewers **cannot** |
+|---|---|
+| Switch Board ↔ Table layout, adjust filters/sort/group ad hoc | Drag cards between board columns *(unverified — see below)* |
+| Switch between existing saved views | Add, edit, or delete items, cells, or columns; assign people |
+| Open item detail panes | Save a view — edit access is required to save |
+| Read **and post comments** in item threads | Set the default view — owner-only, UI-only *(unverified — see below)* |
+| Possibly download CSV *(unverified)* | |
+
+Layout and filter changes are a per-viewer preference with no documented access gate — anyone
+with access can adjust how the list looks for themselves, and everyone can switch between
+views someone else already saved. Opening item detail panes works the same way.
+
+The one genuine carve-out worth calling out on its own: **viewers can read and post comments in
+list item threads.** This is explicitly different from Slack canvases, where view-only is
+closer to silent. On a list, read-only protects the *data* — cells, columns, rows — not the
+*conversation* attached to each row.
+
+:::warning[Unverified]
+Three specific "cannot" claims above were flagged for empirical verification and kept their
+unverified status because this project's spike was skipped:
+
+- **Dragging cards between board columns** is described in Slack's own board-layout wording as
+  "you can move items between columns," and a drag is presumably the write to the group-by field
+  that a viewer cannot make — but no page states a board-specific restriction rule in those
+  words. See [Board Layout](./board-layout.mdx) for the layout mechanics this restriction
+  applies to.
+- **Setting the default view is owner-only.** Reported by the source research, never directly
+  confirmed against a real grant.
+- **CSV download for a `read`-only user** is suggestive rather than confirmed —
+  `slackLists.download.start` only requires the `lists:read` scope, which hints a viewer-level
+  token could call it, but nobody observed this live.
+
+None of these change the overall picture (a viewer's surface stays narrow either way) — they
+matter only if your dashboard's threat model depends on one of them specifically.
+:::
+
+## The five read-only holes
+
+None of these are fatal to a read-only dashboard design, but all five are worth knowing before
+you treat "read access" as a hard security boundary:
+
+1. **Viewers can comment** in item threads (above). Read-only is not silent.
+2. **Admins can delete it.** Owners and admins can delete any list they can view — no ACL stops
+   a workspace or org admin, regardless of who owns the list.
+3. **Viewers can re-share view access onward**, spreading further than you granted — unless the
+   owner sets Share → Advanced settings → **"Only you can share"**. Turn this on for any
+   dashboard where the audience needs to stay bounded.
+4. **Public-channel leak.** Sharing a list that is set to "Only invited people can access" into a
+   **public** channel makes it visible to the entire workspace or Enterprise org — not just that
+   channel's members. If the mirrored data is sensitive, share into a **private** channel only.
+5. **The UI share dialog defaults to "Can edit."** The API itself cannot fall into this (the
+   `access_level` argument is required, with no default), but a human sharing the list by hand
+   through the UI will grant the whole channel write access unless they change the dropdown
+   away from its default.
+
+**Bonus trap, not access-related but adjacent:** a Form workflow published on a list inserts
+items regardless of anyone's access level, with an audience of "All members" by default —
+publish no form on a list a bot is meant to own exclusively. Separately, whether "notify when
+field changes" automations fire on API-originated writes (not just human edits) is undocumented;
+see the setup checklist in [The One-Way Mirror Pattern](./one-way-mirror.mdx) for why that
+matters for a cron-driven sync.
+
+## Ownership topologies for a bot-managed list
+
+:::warning[Unverified]
+`slackLists.create` creates a list "owned by the acting user" — with a bot token (`xoxb`), that
+should be the bot itself, but Slack's docs never literally say "bot user," only "acting user."
+This is inference carried forward from the source research, not a directly confirmed fact.
+:::
+
+The practical catch either way: **the default view, and Board layout / group-by setup, are
+owner-configured and UI-only — and a bot cannot click a UI.** That forces a choice between two
+topologies, each of which leaves exactly one human holding write:
+
+- **(a) Human creates and configures the list first** — sets up Board layout, group-by, and the
+  default view by hand — then grants the bot `write` access and the channel `read` access. The
+  bot never needs to be the owner.
+- **(b) Bot creates the list**, then promotes a human via
+  `access.set` with `access_level: "owner"` and the operator's `user_ids`. This is legal only
+  while the bot is still the owner — "only the current owner can set another user as the
+  owner." Do this promotion **early**: there is no documented recovery path if the app is
+  uninstalled while the bot remains sole owner.
+
+Either topology gives the team read-only access as a guarantee — but not literally every human;
+record the operator's name (the one human with write) in your runbook so the guarantee has a
+named owner behind it. Guests, separately, only ever see lists shared into channels they already
+belong to.
+
+## Related
+
+- [Board Layout](./board-layout.mdx) — the layout mechanics behind the "viewers cannot drag
+  cards" restriction.
+- [The One-Way Mirror Pattern](./one-way-mirror.mdx) — the setup checklist that applies these
+  access rules end to end (private channel, "Only you can share," no Form workflow).

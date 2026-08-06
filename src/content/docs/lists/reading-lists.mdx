@@ -1,0 +1,149 @@
+---
+title: Reading Lists
+description: items.list cursor pagination, items.info as the only schema read-back, and async export via download.start/download.get
+sidebar_position: 20
+---
+
+Four of the twelve `slackLists.*` methods are read-only, and they answer three different
+questions:
+
+| Method | Answers | Needs | Rate tier |
+|---|---|---|---|
+| [`items.list`](https://docs.slack.dev/reference/methods/slackLists.items.list/) | "What rows exist?" | `list_id` | Tier 2 (20+/min) |
+| [`items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/) | "What is the schema, and what are the limits?" | `list_id` + an existing `row_id` | not stated in the source research |
+| [`download.start`](https://docs.slack.dev/reference/methods/) / `download.get` | "Give me everything as a file" | `list_id` | not stated in the source research |
+
+There is no fifth option. `slackLists.list` (enumerate a workspace's lists) and `slackLists.info`
+(read schema without a row) do not exist — confirmed by a live probe against `slack.com/api`
+that returned `unknown_method` for both, backed by a soft-404 byte-size control on their
+would-be docs pages. Whatever you need to read back, it comes through one of the three rows
+above, and `list_id` is never rediscoverable — you own persisting it from the moment
+`slackLists.create` returns it.
+
+## `items.list` — every row, no query language
+
+`items.list` takes exactly three arguments beyond `list_id`: `limit`, `cursor`, and `archived`.
+That is the whole surface — no filter, no search, no sort, no "find the row where X equals Y."
+Pagination follows the standard Slack cursor shape: pass `limit`, read
+`response_metadata.next_cursor` off the response, and pass that cursor back until it comes back
+empty.
+
+```typescript
+export async function listAllItems(
+  botToken: string,
+  listId: string,
+  archived = false,
+): Promise<ListItem[]> {
+  const items: ListItem[] = [];
+  let cursor: string | undefined;
+
+  do {
+    const res = await fetch("https://slack.com/api/slackLists.items.list", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${botToken}`,
+        "content-type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({ list_id: listId, limit: 100, cursor, archived }),
+    });
+    const body = (await res.json()) as {
+      ok: boolean;
+      items?: ListItem[];
+      response_metadata?: { next_cursor?: string };
+    };
+    if (!body.ok) throw new Error("slackLists.items.list failed");
+    items.push(...(body.items ?? []));
+    cursor = body.response_metadata?.next_cursor || undefined;
+  } while (cursor);
+
+  return items;
+}
+```
+
+A full sweep of 1,000 rows is roughly 10 paginated calls at a `limit` of 100 — comfortably
+inside Tier 2 (20+/min) for a once-per-cron-tick reconcile pass. `items.list` also returns
+`updated_by` on each row, which is the only signal for "did a human touch this row" — useful
+for flagging out-of-band edits on a list a bot is supposed to own exclusively (see
+[No Events, No Idempotency](./no-events-no-idempotency.mdx)).
+
+What `items.list` does **not** return: row counts. There is no total, no `has_more` beyond the
+cursor, nothing. If you need to know how full the list is, that comes from `items.info` instead
+(next section).
+
+:::tip[There is no "does this row exist" call]
+Because `items.list` has no filter parameter, the only way to check whether a specific row
+exists is to already know its `row_id` (from your own database) or to paginate the entire list
+and look. Persist `row_id` per source row at write time — see
+[No Events, No Idempotency](./no-events-no-idempotency.mdx) — so you never need the second
+option in normal operation. Reserve a full paginated scan for the recovery case: if your
+`row_id` mapping is ever lost, the only way to rebuild it is one full `items.list` sweep,
+matched against a value you also wrote into a text column on each row (your own primary key).
+There is no faster path — no filter, no search, no query parameter exists to narrow the scan.
+:::
+
+### The `archived` flag
+
+`archived` is a boolean, not a filter value — it switches which set of rows the call returns
+(active vs archived), it does not let you mix a query with an archived condition. Pass
+`archived: true` specifically to see what auto-archive removed; see
+[Item Caps and Auto-Archive](./item-caps.mdx) for why that pass matters and how often to run it.
+
+## `items.info` — the only schema read-back, and it needs a row first
+
+`items.info` returns one row **plus** the full list metadata: name, schema (every column and its
+type), views, and limits. It is the only place to read the schema back after creation — besides
+the response of `slackLists.create` itself — and the catch is baked into its argument list: it
+takes a `row_id`, not just a `list_id`. You cannot ask "what does this list look like" without
+already holding a row to ask about.
+
+That makes `items.info` a *recovery* tool, not a discovery tool. The intended flow is:
+
+1. **Persist `list_id` and every `column_id` at `slackLists.create` time.** The creation response
+   is the only place these ever come back without needing a row first.
+2. If that persistence is ever lost, `items.info` against any known row rebuilds the schema —
+   but you still need one row id to start from.
+
+### The sentinel-row pattern
+
+Two things only `items.info` can tell you — the schema, and `list_limits` (`row_count`,
+`row_count_limit`, `archived_row_count`) — both require a row id as the price of admission.
+Spending one of your mirrored data rows on this is wasteful and fragile (that row could get
+deleted by your own cap-eviction logic, taking your only handle on the list with it). The
+practical fix, drawn from the source research: create one throwaway **sentinel row** at list
+creation time, never delete it, and always call `items.info` against that fixed row id whenever
+you need schema or limits — a permanent, cheap anchor that never competes with your actual
+mirrored working set.
+
+```typescript
+// Created once, alongside the list, and never touched again except as
+// the fixed target for items.info schema/limit reads.
+const SENTINEL_ROW_ID = "Rec0SENTINEL01"; // persisted at list-creation time
+```
+
+:::note
+The exact shape of `list_limits` (which fields it carries beyond `row_count` /
+`row_count_limit` / `archived_row_count`) comes from the source research pass over Slack's
+documentation, not from a live probe against a real list — the verification spike for this
+project was skipped (no test token was available). Treat the field list as reported, and
+confirm it against a real `items.info` response before depending on a field this page does not
+name explicitly.
+:::
+
+## `download.start` / `download.get` — async bulk export
+
+For a full dump rather than an incremental read, `download.start` kicks off an asynchronous
+CSV or JSON export and `download.get` fetches the result once it is ready. This is the better
+tool than paginating `items.list` when you want an ad hoc full snapshot (a manual audit, a
+one-off backfill check) rather than a programmatic per-row read — it costs one export job
+instead of ~10 paginated calls per 1,000 rows, and it does not compete with your regular
+`items.list` reconcile-pass rate budget. Both methods are read scope (`lists:read`), same as
+`items.list` and `items.info`.
+
+## Related
+
+- [No Events, No Idempotency](./no-events-no-idempotency.mdx) — why `items.list` is the *only*
+  inbound signal, and how to persist `row_id` so you rarely need a full scan.
+- [Item Caps and Auto-Archive](./item-caps.mdx) — what the `archived` flag on `items.list` is
+  for, and how `list_limits` from `items.info` fits into cap policy.
+- [The One-Way Mirror Pattern](./one-way-mirror.mdx) — where the sentinel-row pattern and the
+  reconcile pass come together in a full sync design.

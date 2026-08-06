@@ -1,0 +1,110 @@
+---
+title: No Events, No Idempotency
+description: Polling is the only inbound path for Lists, there is no upsert, and the caller owns the row-id mapping
+sidebar_position: 21
+---
+
+Two structural gaps shape everything about integrating with Slack Lists from a Worker: there is
+no way to be *told* a list changed, and there is no way to write to a row *idempotently*. Neither
+is a maturity gap likely to close later — both are absences confirmed against Slack's own
+documented surface, not just undocumented corners.
+
+## There is no push signal — polling is the only inbound path
+
+The full Slack Events API catalog was checked for list events and has none:
+`slackLists.items.create` / `items.update` / `items.delete` never fire a corresponding
+`list_item_created`, `list_item_updated`, or any other event. Socket Mode adds nothing, because
+it delivers the same event catalog over a different transport. `slackLists.items.list` — plain
+polling — is the only reliable inbound signal Lists offers.
+
+The practical edge of this: **a human dragging a card between board columns emits nothing you
+can subscribe to.** If your Worker needs to know "did anything change since my last tick," the
+only honest answer comes from calling `items.list` again and diffing.
+
+:::warning[Unverified]
+Workflow Builder has a trigger called "When a list item is updated," which *could* — in
+principle — post a channel message on change and offer a push-flavored escape hatch. But
+whether it also fires on item **create** is undocumented, there is no separate "created"
+trigger, and depending on a workflow automation's exact firing rules for programmatic
+correctness is fragile even where it works. This project's verification spike (which would
+have settled the create-vs-update firing question empirically) was skipped — treat this trigger
+as a possible notification convenience, never as the mechanism your sync correctness depends on.
+Poll `items.list` for anything that matters.
+:::
+
+## There is no upsert — the caller owns the row-id mapping
+
+`slackLists.items.create`'s complete argument set is `list_id` plus optional
+`duplicated_item_id`, `parent_item_id`, and `initial_fields`. `duplicated_item_id` clones an
+existing row — it is not a dedupe key, and nothing resembling one exists. The method's error
+table has no `duplicate_item`, `already_exists`, or `conflict` code. **Two identical `items.create`
+calls produce two rows, silently — every time.**
+
+`items.create` returns the new row's id as `item.id` (a `Rec…`-prefixed string). That id is the
+entire relationship between a Slack row and your source record — there is no `find-or-create`,
+no caller-supplied external key, nothing that lets you ask "does a row for source-record #482
+already exist." You are the only party tracking that mapping, and you must:
+
+1. **Persist the returned `row_id` to your database in the same step as the create — before any
+   other work.** A failure between "row created in Slack" and "id saved to my database" orphans
+   a Slack row you can never address again, and guarantees the next run creates a duplicate for
+   the same source record.
+2. **Branch create-vs-update on whether your source record already carries a stored `row_id`.**
+   An additive, nullable column on the source table (plus an index) is enough: `NULL` means
+   "never synced, call `items.create`"; a populated value means "call `items.update`."
+3. **Address every cell write by `column_id` and typed value key, not the deprecated `key` /
+   generic `value` forms** — Slack has already announced those will be removed.
+
+```typescript
+// The nullable column IS the idempotency key. NULL means never synced;
+// populated means items.update, never items.create, for this record.
+interface SourceRow {
+  id: number;
+  slackRowId: string | null; // set atomically with the create call, never after
+}
+```
+
+## The cron re-run duplication trap
+
+Duplicates are not only a cross-run risk — they happen *within* a single run too, and the
+mechanism is subtler than "the cron fired twice." Slack SDKs ship a default retry policy that
+retries network-level failures (timeouts, connection resets). If an `items.create` call times
+out on your side but actually succeeded on Slack's, the SDK's default retry sends the same
+create again — server-side, that is two full creates, indistinguishable from two real source
+rows.
+
+:::tip[Two independent guards, not one]
+Set `retryConfig` explicitly on create calls rather than trusting SDK defaults, so a
+client-observed timeout does not silently become a second row. Separately, guard the cron
+handler itself against overlapping its own next tick with a run lock or lease — if one tick is
+still mid-sync when the next fires, both can create rows for the same not-yet-persisted source
+record. These are different failure modes (retry-level vs scheduler-level) and neither guard
+substitutes for the other.
+:::
+
+## Reconcile sweeps — the correctness backstop
+
+Because there is no push signal, treat an infrequent (hourly or daily) full reconcile pass as
+required, not optional — it is the only way you find out what changed outside your own writes.
+
+1. Paginate `items.list` in full (see [Reading Lists](./reading-lists.mdx)) and diff the
+   returned `row_id` set against your database's stored mapping.
+2. **Run the same pass again with `archived: true`.** This is the only way to see what
+   auto-archive silently removed — see [Item Caps and Auto-Archive](./item-caps.mdx) for why
+   that matters for a growing source table.
+3. `items.list` returns `updated_by` on every row — use it to flag rows last touched by someone
+   other than the bot, a signal that a human edited a row the sync otherwise assumes it owns
+   exclusively.
+
+At roughly 10 paginated calls per 1,000 rows (Tier 2, 20+/min), a reconcile pass is cheap enough
+to run on every cron tick if the list stays within a bounded working set — see
+[Item Caps and Auto-Archive](./item-caps.mdx) for why you want that bound regardless.
+
+## Related
+
+- [Reading Lists](./reading-lists.mdx) — the `items.list` cursor-pagination mechanics behind
+  every reconcile pass.
+- [Item Caps and Auto-Archive](./item-caps.mdx) — why the `archived: true` reconcile pass exists
+  and how it interacts with the per-list row cap.
+- [The One-Way Mirror Pattern](./one-way-mirror.mdx) — the full sync design these mechanics
+  compose into.

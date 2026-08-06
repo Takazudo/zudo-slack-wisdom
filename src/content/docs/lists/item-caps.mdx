@@ -1,0 +1,113 @@
+---
+title: Item Caps and Auto-Archive
+description: The 1,000/5,000 row ceiling, the over_row_maximum error, and why a mirror must self-cap well under it
+sidebar_position: 22
+---
+
+A Slack List has a hard per-list capacity, and treating that ceiling as something you can grow
+into is the single most common design mistake for a list fed by an external, growing data
+source.
+
+## The number: 1,000 items and subtasks, 5,000 on Enterprise Grid
+
+Slack's help article "Use lists in Slack" states the limit verbatim: **1,000 items plus
+subtasks** on Pro and Business+, **5,000 on Enterprise Grid**. Moving to a higher paid tier
+changes *capacity*, not access — Lists themselves are already available on any paid plan (see
+the surface overview in this section's earlier pages); Enterprise Grid only raises the ceiling.
+
+**Subtasks (rows created with `parent_item_id`) count against the same budget as top-level
+rows.** A list with 900 top-level rows and 150 subtasks is already over the standard-tier limit
+— there is no separate subtask allowance. If your source data has a parent/child shape, budget
+for the combined row count, not just the rows you think of as "the real records."
+
+## `over_row_maximum` — the only documented cap signal
+
+`slackLists.items.create` documents an `over_row_maximum` error. That is the one authoritative,
+Slack-stated signal that a list is full — it is what you should branch retry/backoff or
+alerting logic on, not an inferred row count from your own tracking.
+
+:::warning[Unverified]
+Two related questions about this cap were flagged for empirical verification and the
+verification spike for this project was skipped (no test token was available), so both keep
+their unverified status from the source research rather than being upgraded to confirmed fact:
+
+- **Whether hitting the cap auto-archives the oldest rows at all.** This is *reported*, not
+  documented by Slack and not observed live. If it turns out to be false, hitting the cap may
+  simply hard-fail creates with `over_row_maximum` instead of silently archiving anything — a
+  meaningfully different failure mode (loud vs silent) for exactly the design this section
+  cares about.
+- **Whether archived rows still count against the cap**, i.e. whether archiving frees headroom
+  or only hides rows from the default `items.list` view. This decides whether explicit
+  `items.deleteMultiple` calls are mandatory for a long-lived mirror, or whether letting rows
+  auto-archive is enough on its own.
+
+Until confirmed against a live workspace, treat `over_row_maximum` as the only fact you can
+build error handling on, and do not assume auto-archive is a reliable capacity release valve.
+:::
+
+If the *reported* oldest-first auto-archive behavior is real, it is the nastiest failure mode
+available here: a row your own database still points at silently disappears from the list, with
+no event and no error — until a later `items.update` against that `row_id` fails. Nothing about
+that failure is loud until it is too late to be a minor issue.
+
+## Mitigation: self-cap well under the limit, evict explicitly
+
+The source research's bottom line, and the design this whole section leans on: **never let a
+list be the system of record for a growing table.** Concretely:
+
+- **Mirror only a bounded active working set** — e.g. non-archived or currently-relevant source
+  rows — never a full history.
+- **Hard-cap your own mirror well under 1,000** (300–500 is the suggested range from the source
+  research). This leaves headroom for growth without ever depending on how the platform behaves
+  at the actual ceiling.
+- **When over your own ceiling, remove the oldest rows yourself with `items.deleteMultiple`**
+  (Tier 2, 20+/min) rather than relying on whatever Slack's own auto-archive does. Explicit
+  deletion means you choose the victims and keep your `row_id` map clean and accurate — it does
+  not silently disagree with what your database thinks is still in the list.
+- **Avoid subtasks (`parent_item_id`) entirely** if the row budget is tight — they share the
+  same cap with no separate allowance, so a parent/child shape effectively halves your usable
+  budget for a given self-imposed ceiling.
+
+```typescript
+// Self-imposed ceiling, well under Slack's 1,000-row cap. Evict the
+// oldest rows explicitly rather than depending on Slack's own
+// (reported, unverified) auto-archive behavior.
+const MIRROR_ROW_CEILING = 400;
+
+async function evictOldestIfOverCeiling(
+  botToken: string,
+  listId: string,
+  currentRowIds: readonly string[], // ordered oldest-first by your own db
+): Promise<void> {
+  if (currentRowIds.length <= MIRROR_ROW_CEILING) return;
+  const toEvict = currentRowIds.slice(0, currentRowIds.length - MIRROR_ROW_CEILING);
+  await fetch("https://slack.com/api/slackLists.items.deleteMultiple", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${botToken}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify({ list_id: listId, row_ids: toEvict }),
+  });
+  // Remove the same row_ids from your own mapping table in the same
+  // operation — do not let the two stores drift apart.
+}
+```
+
+## Reading how full the list is
+
+`items.list` returns no counts at all. The only place capacity numbers surface is
+`list_limits` on an `items.info` response (`row_count`, `row_count_limit`, `archived_row_count`)
+— see the sentinel-row pattern in [Reading Lists](./reading-lists.mdx) for how to read this
+without spending one of your mirrored rows on the lookup. Check it periodically rather than only
+reacting to `over_row_maximum` after the fact — proactive eviction against your own ceiling
+should keep you far enough from the real cap that the error never fires in normal operation.
+
+## Related
+
+- [Reading Lists](./reading-lists.mdx) — the sentinel-row pattern for reading `list_limits`
+  without spending a working-set row.
+- [No Events, No Idempotency](./no-events-no-idempotency.mdx) — the `archived: true` reconcile
+  pass that is the only way to see what auto-archive (if real) removed.
+- [The One-Way Mirror Pattern](./one-way-mirror.mdx) — where self-capping and explicit eviction
+  fit into the full sync design.
