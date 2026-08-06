@@ -92,7 +92,8 @@ empirically, and don't design a mirror that assumes silent eviction at the cap.
 and a read-only list sidesteps the usual Lists dealbreaker (no change events, because the bot
 is the only writer). But it costs permanent row-id bookkeeping, a cap-eviction policy you can't
 fully verify yet, an un-evolvable schema, manual view setup a bot can't perform, and a human
-co-owner in the loop.
+co-owner in the loop. See [Lists](../lists/index.mdx) for the full write path, schema rules, and
+every method.
 
 ## 3. Channel bookmark to an external dashboard — the null option
 
