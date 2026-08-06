@@ -7,6 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "prepare": "lefthook install",
     "dev": "run-p dev:zfb dev:history",
     "build": "zfb build",
     "preview": "zfb preview",
@@ -49,6 +50,7 @@
     "@types/node": "^22.0.0",
     "pagefind": "^1.4.0",
     "npm-run-all2": "^7.0.2",
-    "wrangler": "4.85.0"
+    "wrangler": "4.85.0",
+    "lefthook": "^1.11.0"
   }
 }
