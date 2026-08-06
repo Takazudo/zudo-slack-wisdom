@@ -1,0 +1,100 @@
+---
+title: Rate Limits
+description: The Tier 1-4 model, Retry-After handling, per-channel posting limits, and the 2025-2026 non-Marketplace app changes — verified 2026-08-06
+sidebar_position: 5
+---
+
+**Verified against [docs.slack.dev](https://docs.slack.dev/) as of 2026-08-06.** Rate limits are
+one of the more actively-changing parts of the platform (see the non-Marketplace section below) —
+re-check the primary sources before depending on exact numbers in production.
+
+## The Tier Model
+
+Every Web API method is assigned one of four rate-limit tiers, plus a `special` tier for methods
+with bespoke rules. All Slack plans get the same tier for a given method — a method's Facts
+section on its reference page states which tier applies
+([Rate limits](https://docs.slack.dev/apis/web-api/rate-limits/)):
+
+| Tier | Rate | Character |
+|---|---|---|
+| 1 | 1+ per minute | Infrequent access, small bursts tolerated |
+| 2 | 20+ per minute | Most methods; occasional bursts allowed |
+| 3 | 50+ per minute | Larger quota; sporadic bursts welcome |
+| 4 | 100+ per minute | Generous burst behavior |
+| Special | Varies per method | Method-specific rules — `chat.postMessage` is one of these (see below) |
+
+The limit is scoped **per API method, per workspace/team, per app** — hitting a limit on one
+method against one workspace doesn't throttle other methods or other workspaces the same app is
+installed in.
+
+## `Retry-After` Handling
+
+A rate-limited call returns `HTTP 429 Too Many Requests` with a `Retry-After` header giving the
+number of seconds to wait before retrying. Treat this as authoritative rather than rolling your
+own backoff schedule from scratch — sleep for (at least) the stated duration, then retry the exact
+same call. Every official SDK's built-in retry handler already implements this; reach for it
+before writing a custom retry loop.
+
+## Message-Posting Limits: ~1/sec/Channel
+
+`chat.postMessage` carries `special` rate-limit behavior rather than a plain tier: apps may post
+**no more than one message per second, per channel**, regardless of whether the message goes out
+via `chat.postMessage`, an incoming webhook, or any other path into a channel. Short bursts above
+that rate are tolerated, but Slack doesn't guarantee every message in a burst will display — a
+tight loop posting many messages to the same channel in the same second risks silent drops rather
+than a clean 429. Space out high-volume posting (or batch content into fewer, larger messages)
+rather than relying on burst tolerance.
+
+## The 2025–2026 Rate-Limit Changes for Non-Marketplace Apps
+
+This is the change most likely to bite a bot built and distributed outside the official Slack
+Marketplace, and it directly affects `conversations.history` and `conversations.replies` —
+methods a bot commonly uses to read channel/thread content, not to post it.
+
+**What changed:** for apps that are commercially distributed but not approved for the Slack
+Marketplace, `conversations.history` and `conversations.replies` were cut from their normal Tier 3
+allowance (50+ requests/minute, up to 999 objects per request) down to **1 request per minute,
+returning a maximum of 15 objects per request**. Marketplace-approved apps and internal
+customer-built apps (single-workspace apps built for your own org, not commercially distributed)
+keep the original Tier 3 limits
+([`conversations.history`](https://docs.slack.dev/reference/methods/conversations.history/)).
+
+**Rollout timeline:**
+
+- **2025-05-29** — effective immediately for any app created on or after this date, and for any
+  *new* installation of an existing non-Marketplace app. Slack's stated rationale: "unvetted
+  applications have the potential to exfiltrate large amounts of sensitive conversational data,"
+  and the changes are meant to prevent bulk data exfiltration through these two methods.
+- **2026-03-03** — the grace period for *already-installed* non-Marketplace apps ended on this
+  date; existing installations that had been unaffected by the May 2025 change became subject to
+  the same 1-request-per-minute / 15-object limit from this date forward.
+
+As of this page's verification date (2026-08-06), that grace period has already elapsed — **any
+non-Marketplace, non-internal app's existing installations are now subject to the reduced limit**,
+not just newly-created ones. A bot that reads channel or thread history and isn't Marketplace-
+approved should assume the 1-request-per-minute ceiling applies today, regardless of when it was
+first installed.
+
+Sources: [Rate limit changes for non-Marketplace apps](https://docs.slack.dev/changelog/2025/05/29/rate-limit-changes-for-non-marketplace-apps/)
+(original changelog + FAQ), [Clarifying rate limit changes for non-Marketplace apps](https://docs.slack.dev/changelog/2025/06/03/rate-limits-clarity/)
+(follow-up clarification), and the [`conversations.history`](https://docs.slack.dev/reference/methods/conversations.history/)
+method reference, which documents the tier split directly on the method page.
+
+:::note[If bulk history reads are a hard requirement]
+Slack points at the [Real-time Search API](https://docs.slack.dev/apis/web-api/real-time-search-api/)
+as the sanctioned alternative for searching message/file content without large exports — but as of
+2026-08-06 it is scoped to "select partners," not a drop-in replacement any app can adopt. Getting
+Marketplace-approved is the path that keeps the original Tier 3 limits on
+`conversations.history`/`conversations.replies` directly.
+:::
+
+## Applying This to a Dashboard Bot
+
+The [pinned-dashboard pattern](./updating-in-place.mdx#the-pinned-dashboard-pattern) — one
+`chat.update` call per refresh — sits comfortably inside every limit on this page: it's a single
+`special`-tier `chat.update` call (which shares the same per-channel posting-rate family as
+`chat.postMessage`), refreshing on a cron interval far looser than once per second. The
+non-Marketplace change above matters for the *read* side instead — a sync job that pulls source
+data via `conversations.history`/`conversations.replies` on a non-Marketplace app needs to budget
+for 1 request/minute, 15 objects/request, not the Tier 3 numbers the method's base documentation
+still shows as the default case.
