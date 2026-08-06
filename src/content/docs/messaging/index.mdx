@@ -1,0 +1,36 @@
+---
+title: Messaging
+description: "Posting, in-place updates, formatting, and rate limits for Slack's core messaging API"
+sidebar_position: 1
+---
+
+## What This Section Covers
+
+`chat.postMessage` and `chat.update` are the two methods behind almost everything a bot puts into
+a channel — a one-off notification, a threaded reply, or a pinned status board a cron job
+refreshes in place. Getting them right is mostly about three things: building the message body
+correctly (Block Kit vs. plain `mrkdwn`), knowing what `chat.update` can and cannot do, and
+staying inside the rate limits both methods enforce.
+
+## In This Section
+
+- [Posting and Block Kit](./posting-and-block-kit.mdx) — `chat.postMessage` essentials: channel
+  resolution, `thread_ts` threading, `blocks` + `text` fallback, the common block types, and the
+  unfurl flags
+- [Updating in Place](./updating-in-place.mdx) — `chat.update`'s absolute read-only guarantee, the
+  pinned-dashboard pattern, and Table block limits
+- [Formatting](./formatting.mdx) — `mrkdwn` vs. Block Kit `rich_text`, escaping, mentions, links,
+  date tokens, and when plain `mrkdwn` beats blocks
+- [Rate Limits](./rate-limits.mdx) — the Tier 1–4 model, `Retry-After` handling, the
+  per-channel message-posting limit, and the 2025–2026 rate-limit changes for non-Marketplace
+  apps
+
+## Two Methods, One Constraint
+
+Both methods write to the same surface (a channel message) but under different constraints:
+`chat.postMessage` creates a new message and can be called by any app with the right scope;
+`chat.update` can only ever touch a message the calling app itself posted — see
+[Updating in Place](./updating-in-place.mdx) for why that makes it the strongest read-only
+guarantee Slack offers a bot-writable surface. If the goal is a live-refreshing status board
+rather than a stream of notifications, `chat.update` on a pinned message is the pattern to reach
+for first.

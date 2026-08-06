@@ -1,0 +1,110 @@
+---
+title: Schema Mutability — What Can (and Cannot) Change After Creation
+description: Why select-column options are effectively closed post-create, and the narrow exceptions
+sidebar_position: 8
+---
+
+## Overview
+
+The blanket claim "the schema is fixed at creation and cannot be altered via API" is close to
+true but not exactly true. The nuance matters for anyone designing a select column that
+mirrors an external status field: over-provisioning options at create time is cheap; adding
+one later is not.
+
+## `slackLists.update` Accepts Only Four Fields
+
+[`slackLists.update`](https://docs.slack.dev/reference/methods/slackLists.update/) is the only
+method that mutates an existing list's top-level shape, and it accepts exactly `id`, `name`,
+`description_blocks`, and `todo_mode`. None of the 12 `slackLists.*` methods touches a
+column's type, name, or option set directly.
+
+## No Documented Path Adds, Renames, or Removes a Select Option
+
+Writes are validated against the column's existing definition: sending an option value that
+is not in `options.choices[]` fails with `invalid_option_id` (the `items.create` variant of
+the same error reads "Option ID provided does not match column definition"). The cell shape
+`{column_id, select: string[]}` has no structural room to carry a new option's label or color
+— there is nowhere in the write contract to *define* an option, only to *select* one that
+already exists.
+
+This is reinforced by what's absent from the error registry: there is no
+`option_id_to_create` anywhere across the roughly 50 documented Lists errors, while row and
+column creation analogues (`row_id_to_create`, `column_id_to_create`) both exist. That
+asymmetry is structural evidence the option set is deliberately closed to the API — row and
+column creation got an escape hatch; option creation did not.
+
+## The One Real Exception: `todo_mode`
+
+`slackLists.update` with `todo_mode: true` causes task-tracking columns to be added to an
+**existing** list — Completed (`todo_completed`), Assignee (`todo_assignee`), and Due date
+(`todo_due_date`) — per the method's own usage prose. This is the one documented,
+post-creation schema addition in the entire API surface. Conversely, creating a list with
+`todo_mode: false` is safe to treat as final for those three columns.
+
+## `column_id_to_create` — An Undocumented Crack, Not a Feature
+
+`column_id_to_create` is named only inside the `column_id_not_provided` error string ("The
+`column_id` or `column_id_to_create` field must be provided"). It has no argument definition
+on any method's docs page, no worked sample, and is absent from all three official SDKs'
+types.
+
+:::warning[Undocumented — do not rely on this]
+`column_id_to_create` has zero confirmed real-world usage (code search finds only mirrors of
+the same error string, never an actual call site) and no live-API verification exists either
+way. Treat it as an unproven validator artifact, not a supported column-creation path. If a
+new column is genuinely needed, use the sanctioned recreate-with-`copy_from_list_id`
+workaround below instead of probing this field in production.
+:::
+
+## Humans Can Still Edit the Schema in the UI
+
+Everything above describes the API surface. A human with edit access can add options, delete
+options, and rename labels directly in the Slack UI at any time — schema mutability is
+"closed to the API," not "closed, full stop."
+
+This has one direct operational consequence: a cached `value` → `label` map can go stale
+mid-life. A deleted option starts returning `invalid_option_id` on writes that used to
+succeed; a label rename is safe by contrast, because writes address `value`, never `label`.
+On an unexpected `invalid_option_id`, re-read `list_metadata.schema` via `items.info` rather
+than trusting a hardcoded constant that assumes the schema never changed.
+
+## The Sanctioned Workaround: Recreate via `copy_from_list_id`
+
+The documented API path for "I need one more option" is a **new list**:
+[`slackLists.create`](https://docs.slack.dev/reference/methods/slackLists.create/) with
+`copy_from_list_id` and `include_copied_list_records`. You cannot pass both
+`copy_from_list_id` and `schema` in the same call — that combination fails with
+`invalid_copy_and_schema_args` — so the new list starts as an exact schema copy of the source,
+and any option additions still have to happen by hand in the UI afterward, or by recreating
+again with a hand-edited source list. Either way, this mints a brand-new `list_id` and new
+`column_id`s for every column, which you have to re-persist.
+
+## Computed Columns Are Unwritable
+
+`created_by`, `last_edited_by`, `created_time`, and `last_edited_time` are computed by Slack
+and always return `uneditable_column` on a write attempt, regardless of schema state.
+
+## Limits to Design Around
+
+From `slackLists.create`'s documented constraints:
+
+| Limit | Value |
+|---|---|
+| Options per select column | 100 |
+| Selected values per cell | 50 |
+| Allowed chip colors | `indigo`, `blue`, `cyan`, `pink`, `yellow`, `green`, `gray`, `red`, `purple`, `orange`, `brown` |
+
+## Practical Consequence: Over-Provision at Creation Time
+
+Because no API path edits an existing column's option set, the working pattern is to
+**over-provision status options when the list is created** — bake in spare slugs you don't
+use yet, up to the 100-option cap. Adding a genuinely new option later means either a human
+edits the list by hand in the UI, or the list gets rebuilt via the `copy_from_list_id`
+workaround above.
+
+## Related
+
+For the write contract that this closed option set constrains, see
+[Writing List Items](./writing-cells.mdx) and [Select Columns](./select-columns.mdx). For
+`invalid_option_id` and the other errors this page's constraints produce, see
+[Errors Reference](./errors-reference.mdx).

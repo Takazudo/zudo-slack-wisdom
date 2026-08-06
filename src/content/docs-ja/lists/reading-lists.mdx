@@ -1,0 +1,96 @@
+---
+title: リストの読み取り
+description: items.list のカーソルページネーション、スキーマを読み戻す唯一の手段としての items.info、download.start/download.get による非同期エクスポート
+sidebar_position: 20
+---
+
+12 個ある `slackLists.*` メソッドのうち 4 つが読み取り専用で、それぞれ異なる 3 つの問いに答える。
+
+| メソッド | 答えるもの | 必要なもの | レート階層 |
+|---|---|---|---|
+| [`items.list`](https://docs.slack.dev/reference/methods/slackLists.items.list/) | 「どんな行が存在するか」 | `list_id` | Tier 2（20+/min） |
+| [`items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/) | 「スキーマはどうなっていて、上限はいくつか」 | `list_id` と既存の `row_id` | 元調査に記載なし |
+| [`download.start`](https://docs.slack.dev/reference/methods/) / `download.get` | 「全部まとめてファイルでほしい」 | `list_id` | 元調査に記載なし |
+
+5 つ目の選択肢は存在しない。`slackLists.list`（ワークスペースのリストを列挙する）と `slackLists.info`（行なしでスキーマを読む）はどちらも存在しない — `slack.com/api` への実プローブが両方に `unknown_method` を返して確認済みで、それぞれの「あるはずの」ドキュメントページに対するソフト 404 のバイトサイズ対照でも裏付けられている。何を読み戻すにせよ、上の 3 行のいずれかを通ることになる。そして `list_id` は決して再発見できない — `slackLists.create` が返した瞬間から、それを永続化する責任は呼び出し側にある。
+
+## `items.list` — 全行、ただしクエリ言語なし
+
+`items.list` が `list_id` 以外に取る引数はちょうど 3 つ、`limit`、`cursor`、`archived` だけ。これが表面のすべてで、フィルタも検索もソートも「X が Y と等しい行を探す」もない。ページネーションは Slack 標準のカーソル形式に従う。`limit` を渡し、レスポンスから `response_metadata.next_cursor` を読み、それが空で返ってくるまでカーソルを渡し続ける。
+
+```typescript
+export async function listAllItems(
+  botToken: string,
+  listId: string,
+  archived = false,
+): Promise<ListItem[]> {
+  const items: ListItem[] = [];
+  let cursor: string | undefined;
+
+  do {
+    const res = await fetch("https://slack.com/api/slackLists.items.list", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${botToken}`,
+        "content-type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({ list_id: listId, limit: 100, cursor, archived }),
+    });
+    const body = (await res.json()) as {
+      ok: boolean;
+      items?: ListItem[];
+      response_metadata?: { next_cursor?: string };
+    };
+    if (!body.ok) throw new Error("slackLists.items.list failed");
+    items.push(...(body.items ?? []));
+    cursor = body.response_metadata?.next_cursor || undefined;
+  } while (cursor);
+
+  return items;
+}
+```
+
+1,000 行を一巡すると `limit` 100 でおよそ 10 回のページネーション呼び出しになる — cron 1 ティックにつき 1 回の照合パスなら Tier 2（20+/min）に余裕で収まる。`items.list` は各行に `updated_by` も返す。これは「この行を人間が触ったか」を知る唯一のシグナルで、bot が排他的に所有しているはずのリストで発生した想定外の編集を検知するのに使える（[イベントなし、冪等性なし](./no-events-no-idempotency.mdx)を参照）。
+
+`items.list` が返さないもの: 行数。合計もなければ、カーソル以外の `has_more` もなく、何もない。リストがどれだけ埋まっているかを知りたいなら、それは `items.info` の側から取る（次節）。
+
+:::tip[「この行は存在するか」を尋ねる呼び出しはない]
+`items.list` にフィルタ引数がない以上、特定の行が存在するかを確認する手段は、その `row_id` を（自分のデータベースから）すでに知っているか、リスト全体をページングして探すかのどちらかしかない。書き込み時にソース行ごとの `row_id` を永続化しておけば（[イベントなし、冪等性なし](./no-events-no-idempotency.mdx)を参照）、通常運用で後者に頼る必要はなくなる。全件ページネーションスキャンは復旧ケース専用にとっておくこと。`row_id` のマッピングが失われた場合、それを再構築する唯一の方法は `items.list` の全件スイープ 1 回で、各行のテキスト列に一緒に書き込んでおいた値（自分側の主キー）と突き合わせることになる。これより速い経路はない — スキャンを絞り込むためのフィルタも検索もクエリパラメータも存在しない。
+:::
+
+### `archived` フラグ
+
+`archived` はフィルタ値ではなくブール値だ — 呼び出しが返す行の集合そのもの（アクティブかアーカイブ済みか）を切り替えるもので、クエリにアーカイブ条件を混ぜられるわけではない。自動アーカイブが何を取り除いたのかを見るには `archived: true` を明示的に渡す。なぜそのパスが重要で、どれくらいの頻度で回すべきかは[アイテム上限と自動アーカイブ](./item-caps.mdx)を参照。
+
+## `items.info` — スキーマを読み戻す唯一の手段。ただし先に行が要る
+
+`items.info` は 1 行に**加えて**リストのメタデータ一式（名前、スキーマ（全列とその型）、ビュー、上限）を返す。作成後にスキーマを読み戻せる場所は、`slackLists.create` 自身のレスポンスを除けばここだけだ — そして落とし穴が引数リストに焼き込まれている。このメソッドは `list_id` だけでなく `row_id` を取る。尋ねるための行をすでに持っていないかぎり、「このリストはどんな形をしているのか」とは訊けない。
+
+つまり `items.info` は*発見*のためのツールではなく*復旧*のためのツールだ。想定されている流れはこうなる。
+
+1. **`slackLists.create` の時点で `list_id` とすべての `column_id` を永続化する。** 作成レスポンスは、これらが行なしで返ってくる唯一の場所だ。
+2. その永続化データが失われた場合、既知の行に対する `items.info` でスキーマを再構築できる — ただし出発点となる行 ID は 1 つ必要になる。
+
+### センチネル行パターン
+
+`items.info` にしか教えられないものが 2 つある — スキーマと `list_limits`（`row_count`、`row_count_limit`、`archived_row_count`）— そのどちらも入場料として行 ID を要求する。ミラーしているデータ行の 1 つをこの用途に充てるのは無駄が多く、しかも脆い（その行が自前の上限退避ロジックで削除されると、リストへの唯一のハンドルごと失われる）。元調査から導かれる実践的な解決策は、リスト作成時に使い捨ての**センチネル行**を 1 つ作り、決して削除せず、スキーマや上限が必要になったら常にその固定行 ID に対して `items.info` を呼ぶことだ — 実際のミラー作業セットと競合しない、恒久的で安価なアンカーになる。
+
+```typescript
+// Created once, alongside the list, and never touched again except as
+// the fixed target for items.info schema/limit reads.
+const SENTINEL_ROW_ID = "Rec0SENTINEL01"; // persisted at list-creation time
+```
+
+:::note
+`list_limits` の正確な形（`row_count` / `row_count_limit` / `archived_row_count` 以外にどんなフィールドを持つか）は、実際のリストに対するライブプローブではなく Slack ドキュメントを対象とした元調査パスに由来する — このプロジェクトの検証スパイクはスキップされた（テストトークンが用意できなかった）。フィールドリストは「報告されている内容」として扱い、このページが明示していないフィールドに依存する前に、実際の `items.info` レスポンスで確認すること。
+:::
+
+## `download.start` / `download.get` — 非同期の一括エクスポート
+
+差分読み取りではなく全件ダンプが欲しい場合、`download.start` が CSV または JSON の非同期エクスポートを開始し、`download.get` が完了後の結果を取得する。プログラムから行単位で読むのではなく、その場かぎりの全体スナップショット（手動監査、一度きりのバックフィル確認）が欲しいときは、`items.list` をページングするよりこちらのほうが適したツールだ — 1,000 行あたり約 10 回のページネーション呼び出しではなくエクスポートジョブ 1 件で済み、通常の `items.list` 照合パス用のレート予算とも競合しない。どちらのメソッドも `items.list` や `items.info` と同じ読み取りスコープ（`lists:read`）で動く。
+
+## 関連ページ
+
+- [イベントなし、冪等性なし](./no-events-no-idempotency.mdx) — なぜ `items.list` が*唯一*の受信シグナルなのか、そして全件スキャンをほとんど不要にする `row_id` の永続化について。
+- [アイテム上限と自動アーカイブ](./item-caps.mdx) — `items.list` の `archived` フラグが何のためにあり、`items.info` の `list_limits` が上限ポリシーにどう組み込まれるか。
+- [ワンウェイミラーパターン](./one-way-mirror.mdx) — センチネル行パターンと照合パスが、完全な同期設計の中でどう噛み合うか。

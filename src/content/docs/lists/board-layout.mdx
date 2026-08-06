@@ -1,0 +1,109 @@
+---
+title: Board Layout
+description: Board is a real distinct layout mode, entirely UI-configured, with no API argument anywhere
+sidebar_position: 24
+---
+
+Slack Lists render an actual Kanban-style board — this is the feature that makes Lists worth
+the operational overhead documented across the rest of this section. But the board exists
+entirely on the UI side of a hard line: nothing in the 12-method API surface knows a board
+exists.
+
+## A genuine layout mode, not a grouped table
+
+Slack's help article documents exactly two layouts for a list: **table layout** ("organises
+items by rows and fields by columns") and **board layout** ("items are grouped by field, and
+you can move items between columns"). Switching is a UI action — filters icon → Layout →
+Board/Table — and a "Group by" control picks which column's values become the board's columns.
+Layouts are savable as named, shareable **Views**.
+
+:::note[Where the word "drag" comes from]
+Slack's own pages never use the words "drag" or "Kanban" — every locale rendering checked says
+only "move items between columns." Drag-and-drop as the specific interaction was confirmed by a
+third-party hands-on article (ClearFeed, 2026-05-07), not by Slack itself. Treat the *existence*
+of board layout and column-grouping as Slack-stated fact; treat "drag-and-drop" specifically as
+third-party-confirmed wording, not a direct quote from Slack. See
+[Permissions and Ownership](./permissions.mdx) for what a viewer is and is not able to do to a
+board once it exists.
+:::
+
+## UI-only: no API argument anywhere in the 12-method surface
+
+`slackLists.create` takes exactly `name`, `description_blocks`, `schema`, `copy_from_list_id`,
+`include_copied_list_records`, and `todo_mode` — no `view`, `layout`, `board`, or `group_by`
+argument, checked against the full argument list. The only place a view appears in the API at
+all is the **read-side** `views[]` array returned by `slackLists.items.info`, whose documented
+example shows only `record` and `table` types — no board type in the sample. There is no
+create-time, update-time, or read-time API path that sets up, describes, or confirms a board.
+
+**A human sets up the board once, by hand, every time.** This is the same constraint that
+drives the ownership topologies in [Permissions and Ownership](./permissions.mdx): a bot can
+create a list and grant access, but only a human clicking through the UI can turn on Board
+layout, pick a group-by column, and save it as the default view.
+
+:::warning[Unverified]
+Two board-specific questions were flagged for empirical verification and kept their unverified
+status because this project's spike (which would have settled them against a live workspace)
+was skipped:
+
+- **Which column types Board layout can group by.** Every worked example in Slack's own
+  documentation uses a single-select status column, which is *suggestive* that select is the
+  supported (or only well-supported) groupable type — but no page enumerates which column types
+  the "Group by" control actually accepts. Confirm the board renders correctly for your chosen
+  column type before committing a design to it; do not assume user, date, or other column types
+  work as a group-by axis.
+- **Whether `items.info`'s `views[]` can ever report a board-type view.** The one documented
+  example shows `record` and `table` only. That is evidence board views are omitted from the
+  documented example, not proof the field can never contain one — treat "no board type in
+  `views[]`" as reported, not exhaustively confirmed.
+
+Neither question blocks the pattern in [The One-Way Mirror Pattern](./one-way-mirror.mdx) — it
+only means the one-time manual board setup there needs a live check before you commit to it.
+:::
+
+## Saved Views
+
+Anyone with list access — including read-only viewers — can switch between views someone else
+already saved; that switching is per-viewer and non-destructive. **Saving a new view requires
+edit access** — a read-only viewer's layout and filter adjustments are ephemeral, gone the
+moment they navigate away. Setting the **default** view (the one everyone sees on first open) is
+narrower still: owner-only, and only settable in the UI, with no API path — see
+[Permissions and Ownership](./permissions.mdx) for the unverified nuance in that specific claim
+and how it shapes who needs to be the list's owner.
+
+## Recreation loses all views
+
+Schema is effectively frozen after `slackLists.create` — no documented API adds, removes, or
+retypes a column, and the sanctioned API-level workaround is to create a **new** list via
+`copy_from_list_id` + `include_copied_list_records` (you cannot pass both `copy_from_list_id`
+and `schema` in the same call). That mints a new `list_id` and new `column_id`s you must
+re-persist everywhere.
+
+`copy_from_list_id` alone does not add the option you were missing — it reproduces the
+**exact** schema of the source list, options and all. Getting an actual schema change out of
+this two-step: copy to get a fresh, non-frozen `list_id`, then have a human edit that new list's
+column options **by hand in the Slack UI** (adding, renaming, or recoloring select options is a
+UI-only operation, never an API one). The copy step solves "the old `list_id` is frozen"; the
+manual edit step solves "I need a different option set." Skipping the second step just leaves
+you with a second list carrying the same missing option.
+
+**Analysis, not a directly documented Slack fact:** views — including Board layout and its
+group-by setting — are configured per list entirely through the UI, and nothing in the copy/
+create API surface mentions carrying views across to the new list. Since the new list is a
+genuinely different object with its own `list_id`, and view setup has no API representation to
+begin with, there is no mechanism by which the new list could inherit the old one's Board
+layout, group-by column, or default view automatically. Budget for **re-doing the manual board
+setup** — Board layout, group-by, default view — as part of any schema change that requires
+recreating the list, not just for re-pointing `list_id`/`column_id` references in code.
+
+This is the strongest reason to treat "the schema needs to change" as an expensive, mostly-manual
+event rather than something you casually reach for: it is not a `migrations/*.sql`-style
+additive change, it is a new object that a human has to re-configure by hand before it looks
+like a board again.
+
+## Related
+
+- [Permissions and Ownership](./permissions.mdx) — who can save and set views, and the ownership
+  topology that determines who is available to click Board layout into existence.
+- [The One-Way Mirror Pattern](./one-way-mirror.mdx) — the full setup checklist, including the
+  one-time manual board configuration step.

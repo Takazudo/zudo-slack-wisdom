@@ -1,0 +1,167 @@
+---
+title: Web API with fetch
+description: Calling the Slack Web API from a Worker with plain fetch — Bearer auth, JSON vs form encoding, and honoring Retry-After.
+sidebar_position: 5
+---
+
+## Overview
+
+A Worker calls `slack.com/api/*` with the Workers runtime's native `fetch`
+— no SDK required. This isn't just "fewer dependencies for its own sake":
+the official `@slack/web-api` package depends on `axios`, which relies on
+Node.js APIs the Workers runtime doesn't provide by default. It only works
+with the `nodejs_compat` compatibility flag enabled, and even then it's a
+lot of dependency weight for what is, underneath, an HTTP POST with a
+bearer token. Community fetch-based clients exist for Workers specifically
+(e.g. `slack-edge`,
+[`@sagi.io/workers-slack`](https://sagi.io/slack-api-for-cloudflare-workers)),
+but plain `fetch` is enough for most integrations and keeps the Worker
+dependency-free. See
+[slackapi/node-slack-sdk#1335](https://github.com/slackapi/node-slack-sdk/issues/1335)
+for the compatibility discussion.
+
+## Bearer auth
+
+Every Web API call authenticates with the bot token in an `Authorization`
+header:
+
+```typescript
+const SLACK_API_BASE_URL = "https://slack.com/api";
+
+async function callSlackApi<T>(
+  method: string,
+  body: Record<string, unknown>,
+  botToken: string,
+): Promise<T> {
+  const res = await fetch(`${SLACK_API_BASE_URL}/${method}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${botToken}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const json = (await res.json()) as { ok: boolean; error?: string } & T;
+  if (!json.ok) {
+    throw new Error(`${method} rejected: ${json.error}`);
+  }
+  return json;
+}
+```
+
+## JSON vs form encoding — use JSON, always
+
+The Web API accepts both `application/x-www-form-urlencoded` and
+`application/json` bodies. Form encoding is the older path and it breaks
+down the moment an argument is structured data: an array of objects has no
+clean form-encoded representation, and Slack's own guidance is to use
+JSON-encoded bodies for exactly this reason.
+
+:::danger[Arrays of objects require JSON — form-encoding them fails]
+Any method whose payload includes an array of objects —
+`chat.postMessage`'s `blocks`, `slackLists.items.update`'s `cells`, and
+similar — **must** be sent as `application/json`. Form-encoding an array of
+objects produces `invalid_array_arg`. This isn't a style choice: send
+`content-type: application/json` and a `JSON.stringify`'d body for any call
+whose arguments include arrays or nested objects, and there's no need to
+special-case simpler methods differently — JSON works for every Web API
+method, not just the ones that require it.
+:::
+
+```typescript
+// slackLists.items.update -- cells is an array of objects with typed value
+// keys. Sending this as application/x-www-form-urlencoded raises
+// invalid_array_arg; it must be application/json.
+await callSlackApi("slackLists.items.update", {
+  list_id: listId,
+  cells: [
+    { row_id: rowId, column_id: statusColumnId, select: [statusValue] },
+  ],
+}, botToken);
+```
+
+## Honoring `Retry-After`
+
+Web API methods are grouped into rate-limit tiers (Tier 1 through Tier 4,
+roughly 1+ to 100+ requests/minute per method per workspace), plus a
+special tier for a few high-traffic methods like `chat.postMessage`. When a
+call is rate-limited, Slack responds `429 Too Many Requests` with a
+`Retry-After` header giving the number of seconds to wait before retrying
+that specific method against that specific workspace.
+
+```typescript
+async function callSlackApiWithRetry<T>(
+  method: string,
+  body: Record<string, unknown>,
+  botToken: string,
+  maxRetries = 3,
+): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(`${SLACK_API_BASE_URL}/${method}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${botToken}`,
+        "content-type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (res.status === 429) {
+      const retryAfterSeconds = Number(res.headers.get("retry-after") ?? "1");
+      if (attempt === maxRetries) {
+        throw new Error(`${method} rate-limited after ${maxRetries} retries`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, retryAfterSeconds * 1000));
+      continue;
+    }
+
+    const json = (await res.json()) as { ok: boolean; error?: string } & T;
+    if (!json.ok) {
+      throw new Error(`${method} rejected: ${json.error}`);
+    }
+    return json;
+  }
+  throw new Error(`${method}: unreachable`);
+}
+```
+
+:::tip[A rate limit is per method, per workspace]
+Getting `429` from `chat.postMessage` says nothing about whether
+`slackLists.items.update` is also limited. There's no global backoff to
+apply — back off the specific method that returned `429`, and let every
+other call proceed normally.
+:::
+
+:::warning[A long Retry-After can outlive ctx.waitUntil()'s budget]
+Sleeping in-isolate is fine for the short delays Slack typically sends, but
+`Retry-After` has no documented upper bound, and background work registered
+with `ctx.waitUntil()` only gets roughly 30 seconds after the response is
+sent (see [Three-Second Ack](./three-second-ack.mdx)). If this retry runs
+inside that background work and `Retry-After` is long enough to blow the
+budget, the runtime cancels the pending promise mid-wait. For a call where
+that matters, don't loop-and-sleep past a couple of retries in-Worker —
+persist "retry this later" state (KV, D1, a queue) and let the next cron
+tick or a dedicated retry path pick it up instead.
+:::
+
+## Gotchas
+
+- **Form-encoding an array-shaped argument is the most common cause of a
+  confusing `invalid_array_arg`.** If a method's arguments include arrays of
+  objects (Block Kit `blocks`, Lists `cells`, and similar), send
+  `application/json` — there's no reason to use form encoding for any Web
+  API call from a Worker.
+- **A `200` response does not mean success, and not every response is
+  `200`.** Most Web API responses are `200` with the real result in the
+  JSON body's `ok` field — check `json.ok`, not just `res.ok` — but `429`
+  and transient HTTP-level errors (timeouts, `5xx`) do happen and need
+  their own handling, as the retry helper above does for `429`.
+- **`Retry-After` is authoritative — don't guess your own backoff.** Slack
+  tells you exactly how long to wait; a shorter self-chosen delay just
+  produces another `429`.
+- **Bulk operations should batch, not loop-and-call.** Methods like
+  `slackLists.items.update` accept multiple entries in one call (up to a
+  documented cap); a cron mirroring many rows should build one batched call
+  per tick rather than one Web API call per row — see [Cron
+  Posting](./cron-posting.mdx).

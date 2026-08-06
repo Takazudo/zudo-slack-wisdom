@@ -1,0 +1,179 @@
+---
+title: Cron Posting
+description: Scheduled Workers that mirror external data into Slack -- overlap protection, freshness stamps, and batching under rate tiers.
+sidebar_position: 6
+---
+
+## Overview
+
+The same Worker that handles inbound webhooks can also run on a clock.
+A [Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
+fires a `scheduled()` handler on a schedule you define in `wrangler.toml`,
+independent of any HTTP request:
+
+```toml
+[triggers]
+crons = ["*/5 * * * *"]
+```
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return await handleRequest(request, env, ctx);
+  },
+
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(syncToSlack(env));
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+A common shape: mirror rows from an external database into a Slack channel
+as a status board. The default surface for that is a single message,
+posted once and edited in place — `chat.postMessage` on the first run, then
+`chat.update` on every subsequent tick. Editing in place is the only Slack
+surface whose read-only property needs no configuration at all: "only
+messages posted by the authenticated user can be updated," so there's no
+share dialog or ACL to misconfigure, and editing produces no channel
+notification.
+
+```typescript
+async function syncToSlack(env: Env): Promise<void> {
+  const rows = await fetchExternalData(env);
+  const blocks = buildStatusBlocks(rows);
+
+  const messageTs = await env.KV.get("status-board:message-ts");
+  if (!messageTs) {
+    const res = await callSlackApi<{ ts: string }>(
+      "chat.postMessage",
+      { channel: env.STATUS_CHANNEL_ID, blocks },
+      env.SLACK_BOT_TOKEN,
+    );
+    await env.KV.put("status-board:message-ts", res.ts);
+  } else {
+    await callSlackApi(
+      "chat.update",
+      { channel: env.STATUS_CHANNEL_ID, ts: messageTs, blocks },
+      env.SLACK_BOT_TOKEN,
+    );
+  }
+}
+```
+
+Just as with a webhook handler, `ctx.waitUntil()` matters here too: the
+Workers runtime considers a `scheduled()` invocation finished as soon as the
+function returns, so the actual Slack call needs to be registered with
+`waitUntil()` or the runtime may tear the isolate down before it completes.
+
+## Overlap protection: a run lock
+
+Cron Triggers don't guarantee mutual exclusion — if a tick's work
+occasionally takes longer than the interval between triggers (a slow
+upstream API, a large batch), two invocations can end up running at once.
+For a mirror job that posts a single message, two overlapping runs racing
+to `chat.update` the same `ts` don't corrupt anything, but they do waste a
+Web API call and can post a half-built board if the two runs read
+different snapshots of the source data mid-flight. A short-TTL lease in
+KV is enough to serialize runs:
+
+```typescript
+const LOCK_KEY = "status-board:sync-lock";
+const LOCK_TTL_SECONDS = 60; // Longer than a single tick should ever take.
+
+async function withRunLock(env: Env, fn: () => Promise<void>): Promise<void> {
+  const existing = await env.KV.get(LOCK_KEY);
+  if (existing) {
+    console.log("[cron] previous run still holds the lock, skipping this tick");
+    return;
+  }
+
+  await env.KV.put(LOCK_KEY, String(Date.now()), { expirationTtl: LOCK_TTL_SECONDS });
+  try {
+    await fn();
+  } finally {
+    await env.KV.delete(LOCK_KEY);
+  }
+}
+```
+
+:::warning[KV locking is best-effort, not exact]
+KV is eventually consistent, so this lease can't guarantee perfect mutual
+exclusion under high concurrency. For a job that fires every minute or less
+often, and where the worst case is "skip one tick," this is more than
+sufficient. If a run genuinely needs exact single-flight guarantees, reach
+for a [Durable Object](https://developers.cloudflare.com/durable-objects/)
+instead.
+:::
+
+## Freshness stamps
+
+A status board that goes stale silently is worse than one that's visibly
+behind. Stamp every post with when the data was actually pulled, not just
+when the message happened to render:
+
+```typescript
+function buildStatusBlocks(rows: StatusRow[]): unknown[] {
+  const syncedAt = new Date().toISOString();
+  return [
+    // ... table/section blocks built from rows ...
+    {
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `Last synced: ${syncedAt}` }],
+    },
+  ];
+}
+```
+
+If a tick fails partway (the run lock times out, the upstream fetch
+errors), the previous message keeps its old timestamp rather than silently
+looking current. Combine this with alerting on "the freshness stamp hasn't
+moved in N ticks" if the board is important enough to notice going stale.
+
+## Batching under rate tiers
+
+A tick that touches many rows should not turn into one Web API call per
+row. `slackLists.items.update`'s `cells` argument batches multiple rows
+and columns in a single call — this is the mechanism, not just an
+optimization: `items.update` runs at Tier 3 (roughly 50+/min), so a naive
+per-row loop over a few hundred changed rows can burn through the budget in
+one tick and start hitting `429`s. Group changed cells into one call (up to
+the documented `cells` cap) instead:
+
+```typescript
+// Batch every changed cell from this tick into as few calls as the
+// documented per-call cap allows, rather than one call per row.
+const CELLS_PER_CALL = 100;
+
+async function syncListChanges(
+  env: Env,
+  changedCells: Array<{ row_id: string; column_id: string; select: string[] }>,
+): Promise<void> {
+  for (let i = 0; i < changedCells.length; i += CELLS_PER_CALL) {
+    const batch = changedCells.slice(i, i + CELLS_PER_CALL);
+    await callSlackApiWithRetry(
+      "slackLists.items.update",
+      { list_id: env.STATUS_LIST_ID, cells: batch },
+      env.SLACK_BOT_TOKEN,
+    );
+  }
+}
+```
+
+Honoring `Retry-After` on any `429` still applies here exactly as it does
+outside a cron context — see [Web API with fetch](./web-api-with-fetch.mdx).
+
+## Gotchas
+
+- **A `scheduled()` handler that returns without `ctx.waitUntil()` can be
+  killed mid-sync.** Same rule as [Three-Second Ack](./three-second-ack.mdx),
+  just without an HTTP response driving it — wrap the real work.
+- **The run lock's TTL must outlive the slowest realistic tick, not the
+  average one.** A lock that expires while a slow run is still legitimately
+  in progress lets a second run start concurrently, defeating the point.
+- **A cron job has no caller to report errors to.** Unlike a webhook
+  handler, there's no HTTP response to carry a failure back — log loudly
+  (and alert, if the board matters) inside the `scheduled()` handler itself,
+  because a silent failure just means the freshness stamp stops moving.
+- **`* * * * *` (every minute) is the finest Cron Trigger granularity.** If
+  a tick routinely runs long, shrink the batch or the per-call timeout
+  rather than trying to schedule more often than once a minute.

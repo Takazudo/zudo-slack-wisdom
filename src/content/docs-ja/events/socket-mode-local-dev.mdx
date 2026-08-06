@@ -1,0 +1,67 @@
+---
+title: ローカル開発のための Socket Mode
+description: WebSocket というトランスポートがデプロイ済み Worker に合わない理由と、ローカルで反復開発するときの使い方
+sidebar_position: 3
+---
+
+## Socket Mode とは
+
+Socket Mode は HTTP の Request URL を、アプリ側から Slack に向けて張る WebSocket 接続に
+置き換えるものだ。公開した URL に Slack が POST してくるのではなく、アプリがアプリレベル
+トークン（接頭辞は `xapp-`）を使って Web API の `apps.connections.open` メソッドを呼び、
+返ってきた 1 回限りの WebSocket URL に接続する。イベントもインタラクティビティのペイロードも、
+どちらもその同じソケット上のメッセージとして届く
+([出典](https://docs.slack.dev/apis/events-api/using-socket-mode))。
+
+アプリレベルトークンはアプリごとに 1 回だけ生成されるもので -- インストールごとではない --、
+Web API の送信呼び出しに使う bot トークン（`xoxb-...`）とは別物だ。トークンの全体像は
+[トークン、スコープ、OAuth](../getting-started/tokens-scopes-oauth.mdx)を参照。
+
+Socket Mode の接続は恒久的なものではない。WebSocket URL は定期的に更新され、アプリはトラ
+フィックの取りこぼしを避けるため速やかに新しい URL へ再接続することが求められる
+([出典](https://docs.slack.dev/apis/events-api/using-socket-mode))。同時接続はアプリあたり
+最大 10 本まで許容され、また Socket Mode を使うアプリは現在のところ公開の Slack Marketplace
+には受け付けられていない
+([出典](https://docs.slack.dev/apis/events-api/using-socket-mode))。
+
+## デプロイ済み Worker に合わない理由
+
+WebSocket を開いたままにすることも、Slack のスケジュールに合わせて再接続することも、
+メッセージとメッセージの間も動き続けるプロセスを必要とする。Worker にはそれがない。
+ハンドラーが動くのは 1 リクエストのあいだだけで -- レスポンス送信後のバックグラウンド処理の
+ため `ctx.waitUntil()` でわずかに延長されることはある -- そのあとは isolate がいつ破棄されても
+おかしくない。無期限に開き続け、Slack が URL をローテーションするたびに自力で再接続しなければ
+ならない接続の居場所は、このライフサイクルの中にはない。Worker のリクエスト単位のモデルに
+実際に噛み合うトランスポートは Events API のただの HTTP POST であり、それがこのプロジェクトの
+本番経路になっている理由でもある（[Workers での Events API](./events-api-on-workers.mdx)を
+参照）。
+
+## 本領を発揮する場面: ローカル開発
+
+Socket Mode が選んだトレードオフ -- 受信用の URL ではなく外向きの接続 -- は、ローカルの開発
+ループがまさに求めているものだ。Socket Mode は「公開の HTTP Request URL を晒すことなく、
+アプリが Events API とインタラクティブ機能を使えるようにする」
+([出典](https://docs.slack.dev/apis/events-api/using-socket-mode))。つまりトンネル（ngrok や
+Cloudflare Tunnel など）は不要で、ローカルのアドレスが変わるたびに Request URL を登録し直す
+必要もない。ローカルのスクリプト、あるいは Bolt SDK の Socket Mode アダプターにアプリレベル
+トークンを渡せば、開発用ワークスペースのイベントとインタラクティビティをすぐに受け取り
+始める。
+
+## 移行の道筋: Socket Mode の開発環境 -> Events API の本番環境
+
+どちらのトランスポートでもイベントとインタラクティビティのペイロードの形は同じなので、
+ハンドラーのロジックは両者で変わらない -- 変わるのはペイロードの届き方だけだ。
+
+1. **ローカル開発** -- Socket Mode で動かす。公開 URL は不要、反復は速く、署名検証をまだ
+   用意しなくてよい（Socket Mode のペイロードは署名付きの POST ではなく、認証済みの接続を
+   通って届く）。
+2. **デプロイ** -- Worker に公開 URL ができたら、アプリの Event Subscriptions（および
+   Interactivity Request URL）をそちらに切り替え、`url_verification` のハンドシェイクを
+   済ませる（[Workers での Events API](./events-api-on-workers.mdx)を参照）。
+3. **本番** -- デプロイ済みの Worker が、署名付き HTTP で同じイベントを受け取る。その環境では
+   Socket Mode をオフにする。もう 1 つのローカル環境やステージング用ワークスペースがまだ使う
+   なら有効のままでもよい。
+
+イベントやアクションを実際に処理する関数は、トランスポートに依存しない形に保つこと --
+生のリクエストではなくパース済みのペイロードを受け取る形にしておけば、配信方式を差し替えても
+ビジネスロジックには手が入らない。

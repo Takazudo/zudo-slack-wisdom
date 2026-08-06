@@ -1,0 +1,113 @@
+---
+title: fetch による Web API 呼び出し
+description: Worker から素の fetch で Slack Web API を呼ぶ -- Bearer 認証、JSON とフォームエンコーディング、そして Retry-After の尊重。
+sidebar_position: 5
+---
+
+## 概要
+
+Worker から `slack.com/api/*` を呼ぶには、Workers ランタイム標準の `fetch` があれば足り、SDK は要らない。これは「依存を減らすこと自体が目的」という話ではない。公式の `@slack/web-api` パッケージは `axios` に依存しており、その `axios` は Workers ランタイムが既定では提供しない Node.js の API に依拠している。`nodejs_compat` 互換性フラグを有効にして初めて動くうえ、その中身はといえば bearer トークン付きの HTTP POST でしかない。それにしては依存の重さが釣り合わない。Workers 向けの fetch ベースのクライアントもコミュニティから出ている（`slack-edge`、[`@sagi.io/workers-slack`](https://sagi.io/slack-api-for-cloudflare-workers) など）が、たいていの連携には素の `fetch` で十分であり、Worker を依存ゼロに保てる。互換性まわりの議論は [slackapi/node-slack-sdk#1335](https://github.com/slackapi/node-slack-sdk/issues/1335) を参照。
+
+## Bearer 認証
+
+Web API の呼び出しは、いずれも `Authorization` ヘッダーに載せた bot トークンで認証する。
+
+```typescript
+const SLACK_API_BASE_URL = "https://slack.com/api";
+
+async function callSlackApi<T>(
+  method: string,
+  body: Record<string, unknown>,
+  botToken: string,
+): Promise<T> {
+  const res = await fetch(`${SLACK_API_BASE_URL}/${method}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${botToken}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const json = (await res.json()) as { ok: boolean; error?: string } & T;
+  if (!json.ok) {
+    throw new Error(`${method} rejected: ${json.error}`);
+  }
+  return json;
+}
+```
+
+## JSON とフォームエンコーディング -- 常に JSON を使う
+
+Web API は `application/x-www-form-urlencoded` と `application/json` のどちらのボディも受け付ける。フォームエンコーディングは古いほうの経路で、引数が構造化データになった途端に破綻する。オブジェクトの配列にはきれいなフォームエンコード表現が存在せず、まさにこの理由から Slack 自身も JSON エンコードされたボディを使うよう案内している。
+
+:::danger[オブジェクトの配列には JSON が必須 -- フォームエンコードすると失敗する]
+`chat.postMessage` の `blocks`、`slackLists.items.update` の `cells` のように、ペイロードにオブジェクトの配列を含むメソッドは**必ず** `application/json` で送らなければならない。オブジェクトの配列をフォームエンコードすると `invalid_array_arg` になる。これはスタイルの選択ではない。引数に配列やネストしたオブジェクトを含む呼び出しでは、`content-type: application/json` と `JSON.stringify` したボディを送ること。そして、もっと単純なメソッドだけ別扱いにする必要もない。JSON は必須のメソッドに限らず、すべての Web API メソッドで動くからだ。
+:::
+
+```typescript
+// slackLists.items.update -- cells is an array of objects with typed value
+// keys. Sending this as application/x-www-form-urlencoded raises
+// invalid_array_arg; it must be application/json.
+await callSlackApi("slackLists.items.update", {
+  list_id: listId,
+  cells: [
+    { row_id: rowId, column_id: statusColumnId, select: [statusValue] },
+  ],
+}, botToken);
+```
+
+## `Retry-After` を尊重する
+
+Web API のメソッドはレート制限のティア（Tier 1 から Tier 4、ワークスペースごと・メソッドごとにおよそ毎分 1 回以上から 100 回以上）に分類され、加えて `chat.postMessage` のようなトラフィックの多いいくつかのメソッド向けに特別なティアがある。レート制限にかかると、Slack は `429 Too Many Requests` を返し、`Retry-After` ヘッダーで、そのメソッドをそのワークスペースに対して再試行するまで待つべき秒数を示してくる。
+
+```typescript
+async function callSlackApiWithRetry<T>(
+  method: string,
+  body: Record<string, unknown>,
+  botToken: string,
+  maxRetries = 3,
+): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(`${SLACK_API_BASE_URL}/${method}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${botToken}`,
+        "content-type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (res.status === 429) {
+      const retryAfterSeconds = Number(res.headers.get("retry-after") ?? "1");
+      if (attempt === maxRetries) {
+        throw new Error(`${method} rate-limited after ${maxRetries} retries`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, retryAfterSeconds * 1000));
+      continue;
+    }
+
+    const json = (await res.json()) as { ok: boolean; error?: string } & T;
+    if (!json.ok) {
+      throw new Error(`${method} rejected: ${json.error}`);
+    }
+    return json;
+  }
+  throw new Error(`${method}: unreachable`);
+}
+```
+
+:::tip[レート制限はメソッド単位・ワークスペース単位]
+`chat.postMessage` が `429` を返したからといって、`slackLists.items.update` も制限されているとは限らない。適用すべきグローバルなバックオフは存在しない。`429` を返した当のメソッドだけを後退させ、ほかの呼び出しは普段どおり進めればよい。
+:::
+
+:::warning[長い Retry-After は ctx.waitUntil() の予算を超えうる]
+Slack が通常返してくる程度の短い遅延なら、アイソレート内で待つのは問題ない。ただし `Retry-After` に上限は明記されておらず、`ctx.waitUntil()` で登録したバックグラウンド処理に与えられるのはレスポンス送信後およそ 30 秒だけである（[3 秒 ack](./three-second-ack.mdx) を参照）。このリトライがそのバックグラウンド処理の内側で走り、`Retry-After` が予算を吹き飛ばすほど長ければ、ランタイムは待機中の Promise を途中でキャンセルする。それが問題になる呼び出しでは、Worker のなかで数回を超えてループしながら待たないこと。「あとでリトライする」という状態を（KV、D1、キューに）永続化し、次の cron の実行や専用のリトライ経路に拾わせるほうがよい。
+:::
+
+## つまずきどころ
+
+- **配列を取る引数をフォームエンコードするのが、分かりにくい `invalid_array_arg` の最大の原因。** メソッドの引数にオブジェクトの配列（Block Kit の `blocks`、Lists の `cells` など）が含まれるなら `application/json` で送ること。そもそも Worker から Web API を呼ぶうえで、フォームエンコーディングを使う理由はどこにもない。
+- **`200` は成功を意味しないし、すべてのレスポンスが `200` でもない。** Web API のレスポンスは多くの場合 `200` で、本当の結果は JSON ボディの `ok` フィールドに入っている。見るべきは `res.ok` ではなく `json.ok` だ。とはいえ `429` や一過性の HTTP レベルのエラー（タイムアウト、`5xx`）も実際に起きるので、上のリトライヘルパーが `429` に対して行っているように、それぞれの処理が要る。
+- **`Retry-After` が正であり、自前のバックオフを当て推量しない。** 待つべき時間は Slack が正確に教えてくれる。それより短い遅延を自分で決めても、もう一度 `429` を食らうだけである。
+- **一括操作はループで呼ばずにバッチにまとめる。** `slackLists.items.update` のようなメソッドは 1 回の呼び出しで複数のエントリを受け付ける（ドキュメント化された上限まで）。多数の行をミラーする cron なら、1 行につき 1 回 Web API を呼ぶのではなく、1 ティックにつき 1 回のバッチ呼び出しを組み立てるべきだ。[Cron による定期投稿](./cron-posting.mdx)を参照。

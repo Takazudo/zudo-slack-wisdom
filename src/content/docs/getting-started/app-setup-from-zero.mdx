@@ -1,0 +1,44 @@
+---
+title: App Setup From Zero
+description: Create a Slack app, install it to one workspace, and collect the credentials your Worker needs
+sidebar_position: 2
+---
+
+## Create The App From A Manifest
+
+Start at [api.slack.com/apps](https://api.slack.com/apps) and choose **Create New App > From an app manifest**. Pick the workspace, paste a manifest (JSON or YAML), and confirm. A manifest is the whole app definition -- scopes, event subscriptions, the bot user, Socket Mode -- in one file, so keep it in version control instead of re-clicking the same settings on every new environment ([App manifests](https://docs.slack.dev/app-manifests)).
+
+:::note
+Manifests have two schema versions. Version 1 is the default when `version_metadata` is omitted; version 2 is required for apps built on the Deno Slack SDK. This site's examples target version 1.
+:::
+
+## Enable The Bot User
+
+A manifest can declare the bot user directly (`features.bot_user`); building from scratch instead, add one under **App Home**. The bot user is what gives the app a stable identity in the workspace -- it's who posts messages, and it's who the bot token (below) authenticates as.
+
+## Install To One Workspace
+
+For an app that only ever needs to run in your own workspace, installation is a single click, not a redirect flow -- see [Installing Without An OAuth Redirect](./tokens-scopes-oauth.mdx#installing-without-an-oauth-redirect) for why. On the app's **OAuth & Permissions** page, click **Install to Workspace**, review the requested scopes, and approve. Slack issues the token immediately and displays it on that same page.
+
+## Collect Your Credentials
+
+Two secrets come out of setup, and both are Worker secrets -- never client-side values. See [Worker Backend: Secrets & Config](../worker-backend/secrets-and-config.mdx) for how to store them as Wrangler secrets.
+
+| Credential | Format | Where to find it |
+|---|---|---|
+| Bot token | `xoxb-...` | **OAuth & Permissions** page, after installing |
+| Signing secret | hex string | **Basic Information** page, under **App Credentials** |
+
+:::danger
+Treat both as production secrets. Never commit them, never log them, and never send them to a browser -- request verification and every Slack API call happen inside the Worker.
+:::
+
+If you also enabled Socket Mode, a third credential -- the app-level token (`xapp-...`) -- appears under **Basic Information > App-Level Tokens** once you generate one with the `connections:write` scope. This site's Worker-backend patterns use HTTP-based Events API delivery rather than Socket Mode, so most setups won't need it; see [Tokens, Scopes & OAuth](./tokens-scopes-oauth.mdx) for the full token taxonomy.
+
+## App Settings That Matter Early
+
+- **OAuth & Permissions > Scopes** -- add every bot scope the app needs before installing; adding one later means reinstalling, which rotates the bot token (see [Reinstalling After A Scope Change](./tokens-scopes-oauth.mdx#reinstalling-after-a-scope-change))
+- **Event Subscriptions** -- where you point Slack at the Worker's HTTP endpoint for the Events API; covered in the Events section, not here
+- **App Home** -- controls whether the bot user shows a Messages tab and can be DMed directly
+
+Sources verified against: [docs.slack.dev/quickstart](https://docs.slack.dev/quickstart), [docs.slack.dev/app-manifests](https://docs.slack.dev/app-manifests), [docs.slack.dev/authentication/verifying-requests-from-slack](https://docs.slack.dev/authentication/verifying-requests-from-slack).

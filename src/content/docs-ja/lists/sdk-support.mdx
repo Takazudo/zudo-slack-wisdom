@@ -1,0 +1,38 @@
+---
+title: SDK サポート
+description: どの SDK バージョンがリストをバインドしているか、古いピン留め向けの汎用呼び出しという逃げ道、そしてノーコード側の欠落
+sidebar_position: 4
+---
+
+## 公式 SDK
+
+以下はドキュメントだけでなく、公開済みの npm / PyPI 成果物を展開してバージョンを二分探索することで確定した。
+
+| SDK | リスト対応バージョン | 現在の状況 |
+|---|---|---|
+| `@slack/web-api`（Node） | **7.13.0**（2025-11-25） — 7.12.0 にはバインディングが皆無 | 12 メソッドすべてが `client.slackLists.*` にバインドされ、型付きの Arguments / Response のペアを持つ。8.0.0（2026-07-14）でも引き続き存在。 |
+| `slack_sdk`（Python） | **3.39.0**（2025-11-20） — 3.38.0 には皆無 | 12 メソッドすべてが `WebClient`、`AsyncWebClient`、`LegacyWebClient` 上に `slackLists_*` として存在。3.43.0（2026-06-30）でも引き続き存在。 |
+| `java-slack-sdk` | **1.48.0**（2025-12-11 マージ） | バインド済み。 |
+| Bolt（JS / Python） | 推移的依存 | `@slack/bolt` 5.0.0 → `@slack/web-api` ^8.0.0（常にリスト対応）。`slack_bolt` 1.30.0 が要求するのは `slack_sdk` >=3.38.0 だけで、これは **下限** であって保証ではない：ピン留めのないインストールなら通常は条件を満たす最新リリース（リスト対応）に解決されるが、ロックされた環境や制約のある環境ではちょうど 3.38.0 に着地することがあり、それにはリストのバインディングが一切ない。リストに依存するなら `slack_sdk` >=3.39.0 を明示的にピン留めすること。 |
+| `deno-slack-api` | **未提供** | [slackapi/deno-slack-api#129](https://github.com/slackapi/deno-slack-api/issues/129) は現在もオープン。 |
+
+出典：[node-slack-sdk#2421](https://github.com/slackapi/node-slack-sdk/pull/2421)（Node のバインディング PR）。
+
+## 古いピン留め：汎用呼び出しという逃げ道
+
+上記より下のバージョンにピン留めされたプロジェクト（`@slack/web-api` ≤7.12.0、`slack_sdk` ≤3.38.0）には、型付きの `slackLists.*` バインディングが存在しない。Slack のドキュメントは、各 SDK の汎用の生呼び出しメソッドにフォールバックし、型付きヘルパーの代わりにメソッド名と引数を素のデータとして渡すことを明示的に認めている。呼び出しの形は SDK ごとに異なり、共通の名前があるわけではない：
+
+- Node（`@slack/web-api`）：`client.apiCall(methodName, options)`
+- Python（`slack_sdk`）：`client.api_call(api_method, params=...)`（スネークケース — Python クライアントに `apiCall` は存在しない）
+
+これはどの SDK バージョンでも、どのリストメソッドに対しても動く — ただ型が付かないだけだ。
+
+## ノーコードプラットフォーム：不在を確認済み
+
+2026-08-06 時点で、Zapier・Make・n8n のいずれにも Slack リストのネイティブなトリガー・アクション・モジュールは存在しない：
+
+- **Zapier** の Slack アプリはトリガー／アクションの全一覧を掲載しており、Canvas の作成・編集はあるのにリストの項目は 1 つもない。リストのメソッドに届くのは汎用の「API Request (Beta)」による生呼び出しだけだ。
+- **Make** の Slack モジュールリファレンス（2026-08-05 確認）には `slackLists` の出現が 0 件。汎用の「Make an API Call」モジュールしか使えない。
+- **n8n** の Slack ノードのリソースは Channel / File / Message / Reaction / Star / User / UserGroup で止まっており、n8n-io の GitHub org 全体で `slackLists` のヒットは 0 件。
+
+これら 3 つのプラットフォーム上に cron や自動化を組むなら、ネイティブノードではなく `slack.com/api/slackLists.*` への生の HTTP 呼び出しが必要になる。

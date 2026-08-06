@@ -1,0 +1,97 @@
+---
+title: Interactivity Payloads
+description: block_actions payload anatomy, response_url vs chat.update, and action_id/block_id design
+sidebar_position: 4
+---
+
+## Where Interactivity Comes From
+
+Block Kit components (buttons, select menus, and the rest) don't fire
+through the Events API -- clicking one POSTs to your app's separate
+**Interactivity Request URL**, configured in the same app settings area as
+Event Subscriptions. The payload arrives as a single URL-encoded `payload`
+form field containing JSON, not a raw JSON body
+([source](https://docs.slack.dev/interactivity/handling-user-interaction)).
+
+:::warning[Verify the signature first]
+The interactivity POST is signed the same way an event is --
+`X-Slack-Signature` / `X-Slack-Request-Timestamp`, `v0=<hex hmac>` -- verify
+it before decoding the `payload` field. See
+[Verifying Requests](../worker-backend/verifying-requests.mdx)
+([source](https://docs.slack.dev/authentication/verifying-requests-from-slack)).
+:::
+
+## `block_actions` Payload Anatomy
+
+A `block_actions` payload's top-level fields
+([reference](https://docs.slack.dev/reference/interaction-payloads/block_actions-payload)):
+
+| Field | Purpose |
+|---|---|
+| `type` | `"block_actions"` for this payload shape |
+| `user` | who triggered the action |
+| `team` / `enterprise` | the workspace (and Enterprise Grid org, if any) |
+| `api_app_id` | your app's ID |
+| `container` | where the interaction happened (message, view, ...) |
+| `channel` | present when the action happened in a channel message |
+| `message` | the message containing the block, when applicable |
+| `view` | the view containing the block, for modals and Home tabs |
+| `state` | current values of every stateful block element on the surface |
+| `actions` | array with one entry per action in this payload (in practice, one) |
+| `response_url` | short-lived webhook for posting a reply, when applicable |
+| `trigger_id` | short-lived ID for opening a modal in response |
+
+Each entry in `actions[]` carries `action_id`, `block_id`, `action_ts`, and
+`type` (the component type -- `button`, `static_select`, and so on), plus a
+component-specific value: `value` for a button, `selected_option` for a
+select menu, and similar per-component fields for the rest.
+
+## Responding: `response_url` vs. `chat.update`
+
+Two ways to answer an interaction, solving different problems:
+
+- **`response_url`** -- POST a message payload to the URL from the
+  interaction. It's scoped to that one interaction and can be used **up to
+  5 times within 30 minutes** of receiving it
+  ([source](https://docs.slack.dev/interactivity/handling-user-interaction)).
+  No extra scope or channel ID needed, so this is the default choice for
+  "acknowledge the click, update the message" flows.
+- **`chat.update`** (or `chat.postMessage` / `chat.delete`) -- a normal Web
+  API call using the bot token, addressed by `channel` + `ts`. Reach for
+  this once the 30-minute window has passed, when the update needs to
+  happen from a background job rather than inline with the click, or when
+  you're updating a message the interaction didn't originate from.
+
+Either way, the 3-second ack rule from the Events API applies here too:
+return 2xx to the interactivity POST itself within 3 seconds
+([source](https://docs.slack.dev/interactivity/handling-user-interaction)),
+then send the actual reply content via `response_url` or `chat.update`
+afterward -- from `ctx.waitUntil()` if it needs more time, per
+[The 3-Second Ack](../worker-backend/three-second-ack.mdx).
+
+## Designing `action_id` and `block_id`
+
+Neither field is free-form storage, but both are yours to name, so treat
+them as a small routing scheme rather than an incidental label:
+
+- **`action_id`** identifies which handler should run. A stable, namespaced
+  string (`"approve_request"`, `"cancel_request"`) lets your dispatcher
+  branch on it directly instead of pattern-matching block content.
+- **`block_id`** identifies which block the action lives in -- useful when
+  the same `action_id` appears in a list of otherwise-identical rows (one
+  row per item, one `block_id` per row) and you need to know which row was
+  clicked.
+- Put the data a handler needs in the component's **`value`** field, not by
+  encoding it into `action_id`. Keep `action_id` stable across redeploys so
+  old, still-visible messages keep routing correctly; `value` is where
+  per-instance state (a record ID, a status) belongs.
+
+:::caution[Set block_id explicitly for anything you depend on]
+If you don't specify `block_id`, Slack generates one for you
+([source](https://docs.slack.dev/reference/block-kit/blocks/section-block)).
+That's fine for a block you never need to identify later, but it should be
+unique per message, and a new one is expected each time you re-send an
+updated version of that message -- so don't rely on an auto-generated
+`block_id` staying the same across a `chat.update` call. Set it explicitly
+whenever your handler needs its value to stay predictable.
+:::

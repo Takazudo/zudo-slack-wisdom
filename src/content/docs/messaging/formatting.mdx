@@ -1,0 +1,85 @@
+---
+title: Formatting
+description: mrkdwn vs Block Kit rich_text, escaping, mentions, links, date tokens, and when plain mrkdwn beats blocks
+sidebar_position: 4
+---
+
+## `mrkdwn`: Markdown-Adjacent, Not Markdown
+
+Slack's `mrkdwn` is the formatting syntax used inside `text` objects (message `text`, `section`
+text, `context` elements): `*bold*`, `_italic_`, `~strikethrough~`, `` `code` ``, and `>` for a
+blockquote. It looks like Markdown but isn't a Markdown dialect — there's no `#` heading syntax,
+no `[text](url)` link syntax, and single-asterisk `*bold*` (not `**bold**`) is bold. Treat it as
+its own small format, not "Slack's Markdown."
+
+## Escaping `&`, `<`, `>`
+
+Slack uses `&`, `<`, and `>` as control characters for special parsing inside `text` objects — a
+literal `<` in message content that isn't opening a link/mention token will otherwise be
+misparsed. Convert all three to HTML entities before sending user-supplied or otherwise
+unpredictable text through a `text` object:
+
+| Character | Entity |
+|---|---|
+| `&` | `&amp;` |
+| `<` | `&lt;` |
+| `>` | `&gt;` |
+
+This applies to `mrkdwn` `text` objects specifically — content is not automatically escaped by the
+API, so a bot that interpolates external strings (a filename, a user comment, a database value)
+into a message must escape it itself.
+
+## Mentions, Links, and Channel/User References
+
+All of these use the same `<token|optional display text>` bracket syntax:
+
+| What | Syntax | Renders as |
+|---|---|---|
+| User mention | `<@U012AB3CD>` | @-mention, resolved to display name client-side |
+| Channel reference | `<#C0123456789>` | `#channel-name`, resolved client-side |
+| User group mention | `<!subteam^SAZ94GDB8>` | @-mention for the group |
+| `@here` | `<!here>` | Notifies active members of the channel |
+| `@channel` | `<!channel>` | Notifies all members, active or not |
+| `@everyone` | `<!everyone>` | Notifies every member of `#general` |
+| Link | `<https://example.com>` | Auto-linked URL |
+| Link with custom text | `<https://example.com\|Link text>` | `Link text` as the clickable label |
+| `mailto:` link | `<mailto:user@example.com\|Email User>` | `Email User` as the clickable label |
+
+A bare URL in message text is auto-linked without brackets, but wrapping it explicitly is more
+reliable and is required as soon as custom link text is needed.
+
+## Date Formatting Tokens
+
+`<!date^timestamp^token_string^optional_link|fallback_text>` renders a Unix timestamp
+client-side, in each reader's own locale and timezone — the one built-in way to avoid "is that UTC
+or my time?" ambiguity in a bot message. `token_string` composes one or more of:
+
+| Token | Example output |
+|---|---|
+| `{date_num}` | `2014-02-18` |
+| `{date}` | `February 18th, 2014` |
+| `{date_short}` | `Feb 18, 2014` |
+| `{date_long}` | `Tuesday, February 18th, 2014` |
+| `{time}` | `6:39 AM` (or `06:39` for 24-hour-locale clients) |
+| `{time_secs}` | `6:39:45 AM` |
+| `{ago}` | `3 minutes ago` |
+
+Example: `<!date^1392734382^{date} at {time}|February 18th, 2014 at 6:39 AM PST>` — the piped
+fallback text is what renders on clients that don't support the token (some notification surfaces,
+for example), so keep it a reasonable static approximation of the token output rather than leaving
+it blank.
+
+## `mrkdwn` vs. Block Kit `rich_text`
+
+`mrkdwn` `text` objects are the right choice for a short line of formatted prose — a Section
+block's body, a Context line, a plain-text notification. Block Kit `rich_text` blocks exist for
+structured content `mrkdwn` can't express cleanly: nested bullet/numbered lists, code blocks with
+their own visual container, and — relevant to the Lists section — the only accepted format for
+Slack List `text` column writes, which reject plain strings outright (see
+[Creating Lists](../lists/creating-lists.mdx)). Default to plain `mrkdwn` for anything that's
+just formatted text; reach for `rich_text` when the content has real structure (lists, mixed
+inline styles within one paragraph) or when the surface being written to requires it.
+
+Layout blocks that include a `text` object can set that object's `verbatim` field to `false` to
+enable automatic parsing of mentions and links in content that wasn't hand-authored with the
+bracket syntax above — useful when relaying externally sourced text into a block.

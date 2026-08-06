@@ -1,0 +1,39 @@
+---
+title: Worker バックエンド
+description: Slack API の呼び出しは Cloudflare Worker の内側に閉じ込める。bot トークンと signing secret はフロントエンドへ渡さない。
+sidebar_position: 1
+---
+
+## 基本の立場
+
+このサイトで扱う Slack 連携は、ブラウザではなくすべて Cloudflare Worker を経由する。bot トークンを保持し、届いたリクエストが本当に Slack から来たものかを検証し、`slack.com/api/*` を呼ぶ。その一切を担う唯一の場所が Worker である。Slack 由来のものはクライアントへ一切渡さない。ページからの `fetch` にトークンを載せることも、バンドルされた JS に signing secret を混ぜることも、ブラウザから Slack へ直接リクエストすることもない。
+
+これはスタイルの好みではなく、bot トークンと signing secret を秘密のまま保つ唯一の形だ。ブラウザに届いた時点でシークレットは公開されたも同然で、devtools を開いてネットワークタブなりバンドルなりを読めば誰でも使えてしまう。一方 Worker はサーバーサイドの実行環境であり、`wrangler secret put` で設定した値は暗号化され、ダッシュボードにも Wrangler CLI にも二度と表示されない（[シークレットと設定](./secrets-and-config.mdx)を参照）。Slack への呼び出しをすべてこの境界の内側に置くことこそが、そもそもトークンを持てるようにしている前提である。
+
+## どこに何を置くか
+
+| 関心事 | Worker | クライアント（ブラウザ / フロントエンド） |
+|---|---|---|
+| `SLACK_BOT_TOKEN`、`SLACK_SIGNING_SECRET` | Yes -- Worker のシークレット | 置かない |
+| 受信リクエストの `X-Slack-Signature` 検証 | Yes | 該当なし -- クライアントが Slack のリクエストを受け取ることはない |
+| `slack.com/api/*` の呼び出し（`chat.postMessage`、`slackLists.*` など） | Yes | 行わない |
+| 3 秒以内に Slack へ ack し、実処理を後回しにする | Yes（`ctx.waitUntil()`） | 該当なし |
+| 結果ページ、ステータスダッシュボード、管理 UI の描画 | 任意 -- Worker 自身の API から読める | Yes -- クライアントが担う Slack 隣接の処理はこれだけ |
+
+bot トークンが要る処理は Worker のなかで行う。ページが単に、Worker が（D1 なり KV なりへ）すでに書き込んだ内容を*表示*したいだけなら、クライアントは Worker 自身の `/api/*` ルートから取得すればよい。Slack から直接取りにいくことはない。
+
+## セクションの地図
+
+このセクションのページを、新しく連携を組むときに必要になる順で並べると次のようになる。
+
+<CategoryNav category="worker-backend" />
+
+- **シークレットと設定** -- bot トークンと signing secret の置き場所、そして何もコミットせずにローカル開発へ渡す方法。
+- **リクエストの検証** -- 受け取ったリクエストに反応する前に、それが本当に Slack からのものだと確かめる。
+- **3 秒 ack** -- Slack の応答時間の予算と、`ctx.waitUntil()` でそれを満たす方法。
+- **fetch による Web API 呼び出し** -- Worker から Slack を呼ぶ側の話。認証、エンコーディング、レート制限。
+- **Cron による定期投稿** -- 同じ Worker を webhook ではなく時計で駆動し、スケジュールに沿って投稿する。
+
+:::note[Slack のサーフェスと Lists 固有の話は別セクション]
+このセクションが扱うのは*トランスポート*、つまり Worker が安全に Slack と会話する方法である。何を投稿するか（メッセージか、Lists か、Canvas か）と Lists API 固有の契約については、Messaging・Events・Lists の各セクションで扱う。
+:::

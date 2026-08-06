@@ -1,0 +1,83 @@
+---
+title: Access and Scopes
+description: Scopes, the invite-only default, and the access.set/access.delete contract
+sidebar_position: 3
+---
+
+## Scopes
+
+Exactly two scopes cover the whole API: `lists:read` and `lists:write`. Both support **bot
+(`xoxb`) and user tokens**, with no restricted, sensitive, or admin-approval marker on either
+scope page. Adding either scope to an existing app forces an OAuth **reinstall**.
+
+Source: [`lists:write` scope](https://docs.slack.dev/reference/scopes/lists.write/).
+
+## Scopes Are Necessary but Not Sufficient
+
+Lists default to invite-only — "Only invited people can access." A bot token that holds the
+correct scopes still gets `list_not_found` until the list is explicitly shared with the bot's
+user ID or with a channel it belongs to, via `slackLists.access.set`.
+
+An admin toggle can disable Lists workspace- or org-wide independent of the plan gate (see
+[the index page](./index.mdx#the-paid-plan-gate)); a second toggle can restrict list sharing to
+owners only, which would block a bot from ever calling `access.set` on a list it does not own.
+
+:::warning[Unverified]
+How a bot gets write access to a list it did **not** create is genuinely undocumented.
+`slackLists.access.set` accepts only `user_ids` or `channel_ids` — no `app_ids` or other bot
+argument is documented anywhere. Passing the bot's own user ID in `user_ids` *should* work but
+Slack never states it; sharing into a channel the bot belongs to is the fallback, and one
+community report shows `list_not_found` despite a channel share (workflow-token context, not
+conclusive for `xoxb`). The bot-creates-the-list pattern in
+[Creating Lists](./creating-lists.mdx) sidesteps this hole entirely — a list's creator implicitly
+has access, making bot-creates-list the only documented-clean path.
+:::
+
+## The `access.set` / `access.delete` Contract
+
+`slackLists.access.set` grants access; `slackLists.access.delete` fully revokes it.
+
+| Argument | Values | Notes |
+|---|---|---|
+| `access_level` | `read` \| `write` \| `owner` | **Required, no default.** Omitting it fails the call. |
+| `user_ids` | array of user IDs | Mutually exclusive with `channel_ids`; at least one of the two is required. |
+| `channel_ids` | array of channel IDs | Mutually exclusive with `user_ids`; at least one of the two is required. |
+
+- `read` — "grants read access to the List"
+- `write` — "grants read and write access to the List"
+- `owner` — makes the specified user in `user_ids` the owner
+
+**Owner is user-only.** `access_level: "owner"` combined with `channel_ids` returns
+`invalid_arguments` — only a user can be an owner, never a channel.
+
+Slack ships a canned sample for exactly the read-only-dashboard case:
+
+```json
+{ "list_id": "F1234567", "access_level": "read", "channel_ids": ["C7654321"] }
+```
+
+`slackLists.access.delete` takes no `access_level` argument — it is a full revoke, not a
+downgrade. To move an entity from `write` down to `read`, re-call `access.set` with `read`.
+
+:::warning[Unverified]
+Whether re-calling `access.set` with a lower `access_level` actually downgrades an existing grant
+(rather than being a no-op, since the method is named "set") is never stated outright in Slack's
+docs. It is the only documented demotion path short of a full `access.delete` + re-grant.
+:::
+
+**Write-only grants — no audit read-back.** There is no `access.list`, `access.get`, or
+`slackLists.info`. Grants are write-only: you cannot programmatically enumerate who currently
+holds read vs. write on a list. The only audit path is the UI Share pane.
+
+Scope: `lists:write` (bot and user tokens). Rate limit: Tier 3 (50+/min). Requires a paid plan —
+see [the paid-plan gate](./index.mdx#the-paid-plan-gate).
+
+Source: [`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/).
+
+## The `xwfp` Token Bug
+
+An open bug reports `items.create` / `items.update` failing with Workflow Builder `xwfp` tokens.
+This is specific to `xwfp` — it does not affect standard bot (`xoxb`) tokens.
+
+Source: [slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)
+(still open as of 2026-08).

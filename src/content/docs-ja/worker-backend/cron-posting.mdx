@@ -1,0 +1,133 @@
+---
+title: Cron による定期投稿
+description: 外部データを Slack へミラーするスケジュール実行の Worker -- 多重実行の防止、鮮度スタンプ、レートティアを踏まえたバッチ化。
+sidebar_position: 6
+---
+
+## 概要
+
+受信 webhook を捌いているのと同じ Worker を、時計で動かすこともできる。[Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/) は、`wrangler.toml` で定義したスケジュールに従って `scheduled()` ハンドラーを起動する。HTTP リクエストとは無関係に動く経路だ。
+
+```toml
+[triggers]
+crons = ["*/5 * * * *"]
+```
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return await handleRequest(request, env, ctx);
+  },
+
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(syncToSlack(env));
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+よくある形は、外部データベースの行を Slack チャンネルへステータスボードとしてミラーするというものだ。その既定のサーフェスはメッセージ 1 通で、一度投稿したらあとはその場で編集し続ける。初回は `chat.postMessage`、以降のティックはすべて `chat.update` になる。その場で編集する方式は、読み取り専用性のために設定を一切必要としない唯一の Slack サーフェスでもある。「更新できるのは認証したユーザーが投稿したメッセージだけ」なので、設定を間違えうる共有ダイアログも ACL も存在せず、しかも編集はチャンネルに通知を出さない。
+
+```typescript
+async function syncToSlack(env: Env): Promise<void> {
+  const rows = await fetchExternalData(env);
+  const blocks = buildStatusBlocks(rows);
+
+  const messageTs = await env.KV.get("status-board:message-ts");
+  if (!messageTs) {
+    const res = await callSlackApi<{ ts: string }>(
+      "chat.postMessage",
+      { channel: env.STATUS_CHANNEL_ID, blocks },
+      env.SLACK_BOT_TOKEN,
+    );
+    await env.KV.put("status-board:message-ts", res.ts);
+  } else {
+    await callSlackApi(
+      "chat.update",
+      { channel: env.STATUS_CHANNEL_ID, ts: messageTs, blocks },
+      env.SLACK_BOT_TOKEN,
+    );
+  }
+}
+```
+
+webhook ハンドラーの場合と同じく、ここでも `ctx.waitUntil()` が効いてくる。Workers ランタイムは関数が返った時点で `scheduled()` の呼び出しは終わったとみなすため、実際の Slack 呼び出しを `waitUntil()` で登録しておかないと、完了する前にアイソレートが破棄されかねない。
+
+## 多重実行の防止: 実行ロック
+
+Cron Trigger は排他制御を保証しない。1 ティック分の処理が起動間隔より長くかかることがときどきあると（上流 API が遅い、バッチが大きいなど）、2 つの呼び出しが同時に走りうる。メッセージ 1 通を投稿するミラージョブなら、2 つの実行が同じ `ts` に対して `chat.update` を競っても何かが壊れるわけではないが、Web API の呼び出しを 1 回無駄にするし、2 つの実行がソースデータの別々のスナップショットを読んでいれば、作りかけのボードを投稿してしまうこともある。実行を直列化するには、KV に短い TTL のリースを置けば足りる。
+
+```typescript
+const LOCK_KEY = "status-board:sync-lock";
+const LOCK_TTL_SECONDS = 60; // Longer than a single tick should ever take.
+
+async function withRunLock(env: Env, fn: () => Promise<void>): Promise<void> {
+  const existing = await env.KV.get(LOCK_KEY);
+  if (existing) {
+    console.log("[cron] previous run still holds the lock, skipping this tick");
+    return;
+  }
+
+  await env.KV.put(LOCK_KEY, String(Date.now()), { expirationTtl: LOCK_TTL_SECONDS });
+  try {
+    await fn();
+  } finally {
+    await env.KV.delete(LOCK_KEY);
+  }
+}
+```
+
+:::warning[KV によるロックはベストエフォートであって厳密ではない]
+KV は結果整合性なので、このリースで高い並行性のもとでの完全な排他を保証することはできない。毎分かそれより低い頻度で動くジョブで、最悪ケースが「1 ティック飛ばす」で済むなら、これで十分すぎるほどだ。厳密なシングルフライトの保証がどうしても必要な実行なら、代わりに [Durable Object](https://developers.cloudflare.com/durable-objects/) を使う。
+:::
+
+## 鮮度スタンプ
+
+黙って古びていくステータスボードは、遅れているのが目に見えるボードより性質が悪い。メッセージがたまたま描画された時刻ではなく、データを実際に取得した時刻を毎回の投稿に刻んでおく。
+
+```typescript
+function buildStatusBlocks(rows: StatusRow[]): unknown[] {
+  const syncedAt = new Date().toISOString();
+  return [
+    // ... table/section blocks built from rows ...
+    {
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `Last synced: ${syncedAt}` }],
+    },
+  ];
+}
+```
+
+こうしておけば、ティックが途中で失敗しても（実行ロックがタイムアウトした、上流の取得がエラーになった）、前回のメッセージは古いタイムスタンプを保ったままになり、黙って最新のように見えることがない。ボードが古くなったことに気づく必要があるほど重要なら、「鮮度スタンプが N ティック分動いていない」というアラートと組み合わせるとよい。
+
+## レートティアを踏まえたバッチ化
+
+多数の行に触れるティックを、1 行につき 1 回の Web API 呼び出しに変えてはいけない。`slackLists.items.update` の `cells` 引数は複数の行と列を 1 回の呼び出しにまとめられる。これは最適化ではなく仕組みそのものだ。`items.update` は Tier 3（およそ毎分 50 回以上）で動くため、数百行の変更に対して素朴に 1 行ずつループすると 1 ティックで予算を使い切り、`429` を踏み始める。代わりに、変更されたセルを（ドキュメント化された `cells` の上限まで）1 回の呼び出しにまとめる。
+
+```typescript
+// Batch every changed cell from this tick into as few calls as the
+// documented per-call cap allows, rather than one call per row.
+const CELLS_PER_CALL = 100;
+
+async function syncListChanges(
+  env: Env,
+  changedCells: Array<{ row_id: string; column_id: string; select: string[] }>,
+): Promise<void> {
+  for (let i = 0; i < changedCells.length; i += CELLS_PER_CALL) {
+    const batch = changedCells.slice(i, i + CELLS_PER_CALL);
+    await callSlackApiWithRetry(
+      "slackLists.items.update",
+      { list_id: env.STATUS_LIST_ID, cells: batch },
+      env.SLACK_BOT_TOKEN,
+    );
+  }
+}
+```
+
+`429` に対して `Retry-After` を尊重する話は、cron の文脈でもその外側とまったく同じように当てはまる。[fetch による Web API 呼び出し](./web-api-with-fetch.mdx)を参照。
+
+## つまずきどころ
+
+- **`ctx.waitUntil()` なしで返る `scheduled()` ハンドラーは、同期の途中で殺されうる。** [3 秒 ack](./three-second-ack.mdx) と同じルールで、違いは駆動する HTTP レスポンスがないことだけだ。実処理はきちんとラップすること。
+- **実行ロックの TTL は、平均ではなく現実的に最も遅いティックより長くすること。** 遅い実行が正当に進行している最中にロックが期限切れになると、2 つ目の実行が並行して始まり、ロックを置いた意味がなくなる。
+- **cron ジョブにはエラーを報告する相手がいない。** webhook ハンドラーと違い、失敗を持ち帰らせる HTTP レスポンスがない。`scheduled()` ハンドラーの内側で大きな声でログを出す（ボードが重要ならアラートも出す）こと。静かな失敗は、鮮度スタンプが動かなくなるという形でしか現れない。
+- **`* * * * *`（毎分）が Cron Trigger の最小粒度。** ティックが日常的に長引くなら、毎分より細かくスケジュールしようとするのではなく、バッチか 1 回あたりのタイムアウトを小さくすること。

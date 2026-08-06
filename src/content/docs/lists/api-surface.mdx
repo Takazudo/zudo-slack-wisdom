@@ -1,0 +1,66 @@
+---
+title: API Surface
+description: The 12 slackLists.* methods, rate tiers, and what the API verifiably does not have
+sidebar_position: 2
+---
+
+## GA Since 2025-09-02
+
+The Lists Web API went publicly available on 2025-09-02 — Slack's own changelog states "The
+following API methods are now publicly available for interacting with Lists in Slack!" There is
+no beta, waitlist, experimental, or partner-allowlist marker on any method or scope page.
+
+Source: [Introducing the Lists API](https://docs.slack.dev/changelog/2025/09/02/list-api/).
+
+## The 12 Methods
+
+| Method | R/W | Rate tier | Notes |
+|---|---|---|---|
+| [`slackLists.create`](https://docs.slack.dev/reference/methods/slackLists.create/) | write | not stated | Creates a list with a full column `schema`. Returns `list_id` + `list_metadata` — capture every `column_id` here (see [Creating Lists](./creating-lists.mdx)). |
+| `slackLists.update` | write | not stated | Updates list metadata only (`id`, `name`, `description_blocks`, `todo_mode`) — not a general schema editor. |
+| [`slackLists.items.create`](https://docs.slack.dev/reference/methods/slackLists.items.create/) | write | conflicting — see below | Adds a row. `initial_fields` is an array of `{column_id, <typed value>}`; `parent_item_id` makes a subtask. |
+| `slackLists.items.update` | write | Tier 3 (50+/min) | Updates cells via `cells: [{row_id, column_id, …typed value}]` — `row_id` lives inside each cell, not top-level. |
+| `slackLists.items.list` | read | Tier 2 (20+/min) | All rows, cursor-paginated (`limit` / `cursor` / `archived`). The only change-detection mechanism there is — see "No change events" below. |
+| `slackLists.items.info` | read | not stated | One row plus the full list metadata, schema, views, and limits — the only schema-read path besides `create`'s own response, and it requires an existing row id. |
+| `slackLists.items.delete` | write | not stated | Deletes one row. |
+| `slackLists.items.deleteMultiple` | write | Tier 2 (20+/min) | Deletes many rows. |
+| `slackLists.download.start` | read | not stated | Starts an async bulk export (CSV or JSON) — better than paginating for a full dump. |
+| `slackLists.download.get` | read | not stated | Fetches the export started above. |
+| [`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/) | write | Tier 3 (50+/min) | Grants read/write/owner access. See [Access and Scopes](./access-and-scopes.mdx). |
+| `slackLists.access.delete` | write | not stated | Revokes access. |
+
+Scope↔method mapping: `lists:read` covers the four read methods (`items.list`, `items.info`,
+`download.start`, `download.get`); `lists:write` covers the other eight.
+
+:::caution[Rate-tier conflict on `items.create`]
+The `slackLists.items.create` method page states Tier 2 (20+/min); the Java SDK's
+machine-readable [`rate_limit_tiers.json`](https://github.com/slackapi/java-slack-sdk/blob/main/metadata/web-api/rate_limit_tiers.json)
+states Tier 3 (50+/min). Both are official Slack sources and they disagree. When sizing a bulk
+backfill, assume the stricter figure (Tier 2).
+:::
+
+## Verified Absences
+
+Each of these was checked against the live API dispatcher, not merely absent from the docs — an
+unauthenticated POST to a real method returns `not_authed` / `invalid_auth`, while a nonexistent
+method returns `unknown_method`, so Slack's own dispatcher distinguishes "exists" from "doesn't."
+
+- **No list enumeration.** `slackLists.list` does not exist (`unknown_method`). You cannot ask
+  Slack for a workspace's lists — persist every `list_id` yourself.
+- **No standalone list-info/schema read.** `slackLists.info` does not exist (`unknown_method`,
+  confirmed further by a soft-404 byte-size control on its would-be docs page). Schema is only
+  available from `slackLists.create`'s response or from `slackLists.items.info`, which needs an
+  existing row id.
+- **No delete-a-whole-list method.** Absent from the 12-method surface.
+- **No upsert / no external-ID key.** Nothing in the documented surface accepts a caller-supplied
+  external key for idempotent writes. The closest thing, `items.update`'s `row_id_to_create`,
+  still requires the caller to track row ids. (This is an absence from the documented method
+  surface; unlike the three items above it was not separately live-probed.)
+- **No Events API event for list changes.** The full event catalog at
+  [docs.slack.dev/reference/events](https://docs.slack.dev/reference/events/) contains no
+  `list_item_created` / `list_item_updated` or any list event, and Socket Mode adds nothing.
+  Polling `slackLists.items.list` is the only reliable inbound path — a human dragging a card
+  emits nothing you can subscribe to.
+
+Related write-side constraint worth knowing up front: plain text is rejected — text columns must
+be written as Block Kit `rich_text` blocks, not plain strings.

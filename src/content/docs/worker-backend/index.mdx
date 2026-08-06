@@ -1,0 +1,61 @@
+---
+title: Worker Backend
+description: Slack API calls live behind a Cloudflare Worker; bot tokens and signing secrets never reach a frontend.
+sidebar_position: 1
+---
+
+## The stance
+
+Every Slack integration on this site runs through a Cloudflare Worker, not a
+browser. The Worker is the one place that holds a bot token, verifies that an
+inbound request really came from Slack, and calls `slack.com/api/*`. Nothing
+Slack-shaped ships to the client: no token in a `fetch` call from the page, no
+signing secret in a bundled JS file, no direct browser-to-Slack request.
+
+This is not a style preference — it is the only shape that keeps a bot token
+and a signing secret confidential. A secret that reaches a browser is public:
+anyone can open devtools, read the network tab or the bundle, and use it. A
+Worker is a server-side execution environment; values set with
+`wrangler secret put` are encrypted and never rendered back in the dashboard
+or the Wrangler CLI (see
+[Secrets and Config](./secrets-and-config.mdx)). Keeping every Slack call
+behind that boundary is what makes the token safe to hold at all.
+
+## What lives where
+
+| Concern | Worker | Client (browser / frontend) |
+|---|---|---|
+| `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` | Yes — Worker secret | Never |
+| Verifying `X-Slack-Signature` on inbound requests | Yes | N/A — client never receives Slack requests |
+| Calling `slack.com/api/*` (`chat.postMessage`, `slackLists.*`, …) | Yes | Never |
+| Acknowledging Slack within 3 seconds, deferring real work | Yes (`ctx.waitUntil()`) | N/A |
+| Rendering a result page, a status dashboard, an admin UI | Optional — can read from the Worker's own API | Yes — this is the only Slack-adjacent thing the client does |
+
+If a task needs a bot token, it happens in the Worker. If a page just needs to
+*display* something a Worker already wrote (to D1, KV, wherever), the client
+can fetch that from the Worker's own `/api/*` routes — never from Slack
+directly.
+
+## Section map
+
+The pages in this section, in the order a new integration typically needs
+them:
+
+<CategoryNav category="worker-backend" />
+
+- **Secrets and Config** — where the bot token and signing secret live, and
+  how local dev gets them without committing anything.
+- **Verifying Requests** — proving an inbound request is really from Slack
+  before you act on it.
+- **Three-Second Ack** — Slack's response-time budget and how
+  `ctx.waitUntil()` meets it.
+- **Web API with fetch** — calling out to Slack from the Worker: auth,
+  encoding, and rate limits.
+- **Cron Posting** — the same Worker, driven by a clock instead of a webhook,
+  posting on a schedule.
+
+:::note[Slack surfaces and Lists specifics live elsewhere]
+This section is about the *transport* — how a Worker talks to Slack safely.
+What to post (messages vs. Lists vs. Canvas) and the Lists API's specific
+contract are covered in the Messaging, Events, and Lists sections.
+:::

@@ -1,0 +1,18 @@
+{
+  "exclude": [
+    "node_modules/**",
+    "dist/**",
+    ".zfb/**",
+    ".zfb-build/**",
+    "worktrees/**",
+    "src/content/docs/claude/**",
+    "src/content/docs/claude-md/**",
+    "src/content/docs/claude-skills/**"
+  ],
+  "addEmptyLinesInBlockJsx": {
+    "blockComponents": ["Note", "Tip", "Info", "Warning", "Danger", "Details", "Tabs", "HtmlPreview"]
+  },
+  "formatMultiLineJsx": {
+    "ignoreComponents": ["HtmlPreview"]
+  }
+}

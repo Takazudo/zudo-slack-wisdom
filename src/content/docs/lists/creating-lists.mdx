@@ -1,0 +1,108 @@
+---
+title: Creating Lists
+description: slackLists.create schema design, and what to persist before the response is gone
+sidebar_position: 5
+---
+
+## `slackLists.create` Arguments
+
+`slackLists.create` takes `name`, `description_blocks`, `schema`, `copy_from_list_id`,
+`include_copied_list_records`, and `todo_mode`. `copy_from_list_id` and `schema` are mutually
+exclusive — passing both returns `invalid_copy_and_schema_args`. Copying a list is the sanctioned
+way to grow a schema later (see "Schema Is Effectively Immutable" below).
+
+Source: [`slackLists.create`](https://docs.slack.dev/reference/methods/slackLists.create/).
+
+## Column Types
+
+Slack's primary docs enumerate: `text`, `message`, `number`, `select`, `date`, `user`,
+`attachment`, `checkbox`, `email`, `phone`, `channel`, `rating`, `created_by`, `last_edited_by`,
+`created_time`, `last_edited_time`, `vote`, `canvas`, `reference`, `link`. Multi-select is not a
+separate type — it is expressed as `options.format: "multi_select"` on a `select` column.
+
+:::caution[Docs/SDK type list disagree]
+The Node SDK's request types additionally list `multi_select`, `rich_text`, `assignee`,
+`due_date`, and `todo_*` as column types, none of which appear in the prose docs. Trust the docs
+for what you send to `create` — there is no official OpenAPI spec for Lists, so the SDK types are
+hand-curated from the same prose, not independent corroboration.
+:::
+
+The four columns `created_by`, `last_edited_by`, `created_time`, `last_edited_time` are
+**computed** — writes to them fail with `uneditable_column`.
+
+## Select Columns: `{value, label, color}`
+
+Every `select`/`multi_select` option is exactly `{value, label, color}` in every surface checked
+(the `create` request and response, `items.info`'s schema, and all three official SDK types) —
+there is no `id` key, despite the docs' prose calling select values "encoded option IDs." **The
+`value` is the option ID.** Writes always address `value` (the machine slug), never `label` (the
+chip text a human sees) — writing a label returns `invalid_option_id` unless the column happens
+to have been defined with `value === label`.
+
+Limits from `slackLists.create`:
+
+- **100 options per select column**
+- **Max 50 selected per cell**
+- **30 columns per list**
+- Allowed chip colors: `indigo`, `blue`, `cyan`, `pink`, `yellow`, `green`, `gray`, `red`,
+  `purple`, `orange`, `brown`
+
+**Choose your own ASCII slugs at creation time.** Having the bot create the list itself (rather
+than a human) means you pick ordinary values like `todo` / `doing` / `done` under any display
+label — the label↔ID lookup problem disappears entirely, because the values are compile-time
+constants you already know. If a human created the list instead, the option values are opaque
+(`OptXXXXXXXX`-style) and must be read once via `items.info` and stored.
+
+:::warning[Unverified]
+`slackLists.create` schema columns accept an `is_primary_column` flag that marks which column
+displays as an item's title in list and board views. This field is outside the scope of the
+research digests behind this page — no digest verified its exact behavior against the live API or
+cited a docs.slack.dev page for it. Confirm against the current method docs before depending on
+it.
+:::
+
+## `todo_mode`
+
+`todo_mode: true` adds three task-tracking columns: Completed (`todo_completed`), Assignee
+(`todo_assignee`), and Due date (`todo_due_date`). This is documented in prose as something the
+flag causes on creation. Notably, it is also the one documented way to mutate an **existing**
+list's schema after creation — `slackLists.update` with `todo_mode: true` adds those same columns
+to a list that didn't have them. Set `todo_mode: false` at creation if you don't need them; it is
+safe to rely on.
+
+## Persist `list_id` and Every `column_id`
+
+`slackLists.create`'s response carries `list_id` and `list_metadata` (which includes every
+column's `column_id`). **Capture and persist both in the same step as the create call.** There is
+no runtime re-discovery path: no `slackLists.list` to enumerate lists, no `slackLists.info` to
+read a schema by ID. The only read path is `slackLists.items.info`, which needs an existing row
+id — but that row does not have to be one of your own. `initial_fields` on `items.create` is
+optional, so with write access you can create a single throwaway row against the `list_id` and
+immediately call `items.info` on the returned row id to recover the full `list_metadata.schema[]`
+— no pre-existing row required. Without write access, recovery falls back to reconstructing the
+mapping by hand from the UI.
+
+## Schema Is Effectively Immutable
+
+Beyond `todo_mode`, no documented API edits an existing select column's choices — no add, rename,
+recolor, reorder, or remove — and `slackLists.update` accepts only `id`, `name`,
+`description_blocks`, and `todo_mode`. None of the 12 `slackLists.*` methods touches column
+definitions otherwise.
+
+:::warning[Unverified]
+`column_id_to_create` appears only inside the `column_id_not_provided` error string ("The
+`column_id` or `column_id_to_create` field must be provided") — a possible column-creating
+alternative the endpoint's validator seems to recognize. It has no argument definition, no
+sample, no SDK type, and no found real-world usage. Treat it as an unproven crack, not a feature.
+:::
+
+Because the schema is otherwise fixed, **over-provision select options at creation time** — bake
+in spare slugs you might need later. The sanctioned workaround for "I need one more option" is a
+new list: `slackLists.create` with `copy_from_list_id` + `include_copied_list_records`, which
+mints a new `list_id` and new `column_id`s that must be re-persisted per the section above.
+
+Humans can still edit the schema by hand in the Slack UI at any time — add options, delete
+options, rename labels. A cached value→label map can go stale mid-life: a deleted option starts
+returning `invalid_option_id` on writes that used to work. Label renames are safe, since writes
+address `value`, not `label`. On `invalid_option_id`, re-read `list_metadata.schema` via
+`items.info` rather than trusting hardcoded constants.

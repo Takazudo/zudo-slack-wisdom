@@ -1,0 +1,36 @@
+---
+title: トークン・スコープ・OAuth
+description: トークンの分類、最小スコープの原則、そしてこのサイトが OAuth リダイレクトフローを採らない理由
+sidebar_position: 3
+---
+
+## トークンの分類
+
+| トークン | プレフィックス | 表すもの | 主な用途 |
+|---|---|---|---|
+| bot トークン | `xoxb-` | アプリ自身の bot ユーザー | ほぼすべての用途。特定のメンバーに紐づかない安定したアイデンティティ |
+| user トークン | `xoxp-` | ワークスペースの特定メンバー | その人が実行したものとして見せる必要がある操作 |
+| app-level トークン | `xapp-` | インストール先のワークスペース横断でのアプリ自身 | Socket Mode（`connections:write`）などアプリ全体にまたがる操作 |
+| workflow トークン | `xwfp-` | Workflow Builder の 1 ステップ（ごく短時間） | そのステップ内でのデータ読み取り専用。発行から 15 分後、またはステップ終了時のいずれか早いほうで失効する |
+
+分類は [Tokens](https://docs.slack.dev/authentication/tokens/) に準拠している。このサイトのパターンは既定で bot トークンを使う。4 つのうち、個人にもワークフローの実行にも Socket Mode にも縛られないのはこれだけだからだ。
+
+:::warning[workflow トークンと Lists API]
+`xwfp` トークンは、ワークフローの起動者からは見えるが bot ユーザーが参加していないチャンネルに対して「借り物の可視性」を持ち込む。Workflow Builder の内側では便利な性質だが、workflow トークンで `slackLists.access.set` を呼ぶと `list_not_found` が返り、同じ呼び出しが bot トークンなら通るというコミュニティ報告が少なくとも 1 件ある（[slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)）。これは Slack がドキュメント化した挙動ではなく現場からの報告にすぎないが、リストへの書き込みは workflow トークンではなく bot トークンに寄せておく理由としては十分だ。リスト固有のアクセスモデルについては [Lists: アクセスとスコープ](../lists/access-and-scopes.mdx)を参照。
+:::
+
+## 最小スコープ
+
+bot スコープは、実際に機能が使うものだけを要求する。最初から全部盛りにせず、必要になった時点で足していけばよい。スコープは再インストール時に加算される（後述）ので後から増やすコストはなく、逆に使っていないスコープは、ワークスペース管理者がインストール済みアプリを監査したときに説明を求められる権限として残り続ける（[Installing with OAuth](https://docs.slack.dev/authentication/installing-with-oauth/)）。
+
+## OAuth リダイレクトなしでインストールする
+
+Slack の OAuth v2 フローは、*任意の*ワークスペースが*あなたの*アプリをインストールできるようにするための仕組みだ。ユーザーが Slack にリダイレクトされ、要求されたスコープを承認すると、Slack は一時コードを添えて自前サーバーの URL へ返し、サーバーがそのコードをトークンと交換する。しかし、自分のために作ったワークスペース 1 つでしか動かさないアプリには、この一連の手続きはどれも当てはまらない。アプリ自身の **OAuth & Permissions** ページで **Install to Workspace** をクリックすること、それ自体がインストールである。Slack はその場でトークンを発行して同じページに表示するので、リダイレクト URL もコード交換もサーバー側のコールバック実装も一切要らない（[App distribution](https://docs.slack.dev/distribution)）。
+
+## OAuth が必要になるとき
+
+リダイレクトフローが効いてくるのは、アプリが自分のワークスペースの外へ出ていく段階だ。**public distribution**（共有リンクから任意のワークスペースがインストールできる）と **org-wide internal distribution**（Enterprise Grid 組織内の全ワークスペースにインストールできる）は、どちらもリダイレクトエンドポイントの実装を要求する。自分が動いていないワークスペースのトークンをサーバーへ渡す手段が、Slack にはほかにないからだ。複数ワークスペースへの配布は今回のリリースの対象外で、ここに書いてあることはすべて、既知のワークスペース 1 つを前提としている。
+
+## スコープ変更後の再インストール
+
+スコープは加算方式である。新しいスコープを要求してワークスペースにインストールをやり直すと、既存の許可を置き換えるのではなく、そこに追加される。逆に、より小さいマニフェストで入れ直す以外に、トークンのスコープを削る方法はない（[Installing with OAuth](https://docs.slack.dev/authentication/installing-with-oauth/)）。実際の手順としては、マニフェストか **OAuth & Permissions** のスコープ一覧を編集し、**Reinstall to Workspace** をクリックする。再インストールでは新しい bot トークンが発行され、古いトークンは動かなくなるので、Worker に保存しているシークレットの更新も同じ変更のなかで済ませておく（[Worker Backend: シークレットと設定](../worker-backend/secrets-and-config.mdx)）。

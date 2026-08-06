@@ -1,0 +1,129 @@
+---
+title: Three-Second Ack
+description: "Slack's 3-second ack rule, ctx.waitUntil() for the real work, and handling X-Slack-Retry-Num retries."
+sidebar_position: 4
+---
+
+## Overview
+
+Slack expects an HTTP `2xx` response to an Events API request **within
+three seconds**. Per
+[Slack's Events API docs](https://docs.slack.dev/apis/events-api/), missing
+that window triggers Slack's retry mechanism — the same event gets resent,
+potentially several times, while your original handler may still be running.
+Slash commands and interactivity payloads follow the same shape: acknowledge
+fast, do the real work after.
+
+A Cloudflare Worker's `fetch` handler is a natural fit for this, as long as
+the "real work" — calling an LLM, writing to a database, posting a follow-up
+message — happens *after* the response is returned, not before.
+
+## Ack first, work in `ctx.waitUntil()`
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const rawBody = await request.text();
+    if (!(await verifySlackSignature(request, rawBody, env))) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    const payload = JSON.parse(rawBody);
+
+    // Slack's URL verification handshake -- must be answered synchronously.
+    if (payload.type === "url_verification") {
+      return Response.json({ challenge: payload.challenge });
+    }
+
+    // Hand the real work to ctx.waitUntil() and return immediately.
+    // payload.event_id is the envelope's dedup key (see Deduplication below).
+    ctx.waitUntil(handleEvent(payload.event, env, payload.event_id));
+    return new Response(null, { status: 200 });
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+`ctx.waitUntil()` tells the Workers runtime to keep the isolate alive for a
+given promise even after the response has been sent. Without it, the runtime
+is free to tear the Worker down as soon as `fetch()` returns, and an
+in-flight `handleEvent()` call can be cut off mid-way. Cloudflare documents
+a roughly 30-second budget for work registered this way (shared across all
+`waitUntil()` calls in the same request) — plenty for a Slack event handler,
+but not a substitute for a real queue if the work routinely runs longer than
+that. See
+[Cloudflare's `ctx.waitUntil()` docs](https://developers.cloudflare.com/workers/runtime-apis/context/)
+for the full behavior, including what happens if the promise never settles.
+
+:::danger[Never `await` the real work before responding]
+`await handleEvent(...)` before `return` blows the 3-second budget the
+moment the handler does anything nontrivial — an LLM call, a Slack Web API
+round-trip, a database write. `ctx.waitUntil()` is not an optimization here;
+without it the ack and the work are coupled, and Slack starts retrying
+almost immediately.
+:::
+
+## Retry semantics
+
+Slack retries a failed acknowledgment up to **3 times**: nearly
+immediately, then after about 1 minute, then after about 5 minutes. Each
+retry carries two headers:
+
+- `X-Slack-Retry-Num` — attempt number, `1`, `2`, or `3`
+- `X-Slack-Retry-Reason` — why Slack is retrying (`http_timeout`,
+  `connection_failed`, `http_error`, and similar)
+
+```typescript
+const retryNum = request.headers.get("x-slack-retry-num");
+if (retryNum) {
+  // This is a Slack-initiated retry, not a first delivery.
+  console.log(`Slack retry #${retryNum}: ${request.headers.get("x-slack-retry-reason")}`);
+}
+```
+
+A retry means Slack believes the *first* attempt failed — which includes
+cases where your Worker actually processed the event but the 200 response
+didn't make it back in time. That is the deduplication problem: the retry
+is a new HTTP request, but it may describe work you already did.
+
+## Deduplication with `event_id`
+
+Every event payload carries a globally-unique `event_id`. Slack's docs
+don't prescribe a specific dedup mechanism, but `event_id` is the field
+built for this: record it (KV with a short TTL is enough — the retry window
+tops out around 5 minutes) and skip processing if you've already seen it.
+
+```typescript
+async function handleEvent(event: SlackEvent, env: Env, eventId: string): Promise<void> {
+  const dedupeKey = `slack-event:${eventId}`;
+  if (await env.KV.get(dedupeKey)) {
+    return; // Already processed -- this is a retry.
+  }
+  await env.KV.put(dedupeKey, "1", { expirationTtl: 600 });
+
+  // ... do the real work
+}
+```
+
+:::tip[Ack fast even when you're going to dedupe-and-skip]
+Return `200` immediately whether or not this turns out to be a duplicate.
+The ack and the dedupe check are separate concerns — don't let a KV read
+before responding eat into the 3-second budget.
+:::
+
+## Gotchas
+
+- **`ctx.waitUntil()` failures are silent to the caller.** Slack already
+  got its `200`; if the backgrounded promise throws, that has to be caught
+  and logged inside the promise itself, not surfaced as an HTTP error.
+- **A retry is not necessarily a duplicate signal of user intent.** If the
+  underlying event genuinely needs to run again (e.g. your dedupe store
+  itself failed), don't assume every retry is safe to drop — dedupe by
+  `event_id`, not by "this is attempt 2 or 3."
+- **The 3-second budget includes your own signature verification and JSON
+  parsing**, not just the "real work." Keep everything before the `return`
+  cheap and synchronous-feeling.
+- **Slash commands and interactivity share the ack pattern but not the
+  event shape.** The 3-second rule and `ctx.waitUntil()` approach carry
+  over; the payload structure and `X-Slack-Retry-*` headers are
+  Events-API-specific — check the relevant Slack docs for the surface
+  you're handling.
