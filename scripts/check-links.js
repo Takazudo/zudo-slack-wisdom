@@ -132,14 +132,26 @@ export async function resolveLinkDetail(href, distDir, basePath = "/", fileDir =
   const clean = href.split("#")[0].split("?")[0];
   if (!clean) return "root";
 
-  let absolute = clean;
-
-  // Resolve relative links against the file's directory within dist
-  if (!clean.startsWith("/")) {
-    // Relative link — resolve against the file's containing directory
-    const dirInDist = fileDir ? relative(distDir, fileDir) : "";
-    absolute = "/" + join(dirInDist, clean);
-  }
+  // Resolve relative links against the file's directory within dist, then
+  // run browser-style dot-segment removal (RFC 3986 §5.2.4) over the whole
+  // path: a `..` beyond the root is dropped rather than escaping past `/`,
+  // same as an actual browser resolving the href. This both matches real
+  // navigation (`../../../x` from a 2-deep page clamps to `/x`, it isn't
+  // invalid) and, as a side effect, guarantees the resolved path can never
+  // point outside distDir — `join(distDir, relPath)` below can't be tricked
+  // into probing a repo file that sits above dist/.
+  const dirInDist = !clean.startsWith("/") && fileDir ? relative(distDir, fileDir) : "";
+  const combined = dirInDist ? `${dirInDist}/${clean}` : clean;
+  const segments = combined.split("/").reduce((out, seg) => {
+    if (seg === "" || seg === ".") return out;
+    if (seg === "..") {
+      out.pop();
+      return out;
+    }
+    out.push(seg);
+    return out;
+  }, []);
+  const absolute = "/" + segments.join("/");
 
   // Strip base path prefix from the href to get the path relative to dist/
   let stripped = absolute;
@@ -380,9 +392,13 @@ export function formatReport(brokenLinks, mdxWarnings, trailingSlashWarnings = [
 // --- Allowlist ---
 
 /**
- * Read the allowlist file (one entry per line; `#` comments stripped).
- * Each non-blank line is a literal `<file>:<line>:<href>` exact match.
- * Returns a Set for O(1) lookup against `entryKey()` output below.
+ * Read the allowlist file (one entry per line; a line is a comment only
+ * when `#` is its first non-whitespace character — an entry's href can
+ * itself contain `#` (a fragment, e.g. `../page#section`), so `#` is never
+ * stripped mid-line).
+ * Each non-blank, non-comment line is a literal `<file>:<line>:<href>`
+ * exact match. Returns a Set for O(1) lookup against `entryKey()` output
+ * below.
  */
 export async function readAllowlist(allowlistPath) {
   if (!allowlistPath) return new Set();
@@ -390,8 +406,8 @@ export async function readAllowlist(allowlistPath) {
   const text = await readFile(allowlistPath, "utf-8");
   const lines = text
     .split("\n")
-    .map((l) => l.replace(/#.*$/, "").trim())
-    .filter((l) => l.length > 0);
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith("#"));
   return new Set(lines);
 }
 
