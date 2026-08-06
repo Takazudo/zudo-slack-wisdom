@@ -13,9 +13,7 @@ sidebar_position: 3
 | App-level token | `xapp-` | The app itself, across every workspace it's installed in | Socket Mode (`connections:write`) and other app-wide operations |
 | Workflow token | `xwfp-` | A single Workflow Builder step, briefly | Reading data inside that step only -- expires 15 minutes after issuance or when the step finishes, whichever comes first |
 
-([Tokens](https://docs.slack.dev/authentication/tokens/))
-
-This site's patterns default to the bot token. It's the only one of the four that isn't tied to a person, a workflow run, or Socket Mode.
+Taxonomy per [Tokens](https://docs.slack.dev/authentication/tokens/). This site's patterns default to the bot token -- it's the only one of the four that isn't tied to a person, a workflow run, or Socket Mode.
 
 :::warning[Workflow tokens and the Lists API]
 `xwfp` tokens carry "borrowed visibility" into channels the workflow's initiator can see but the bot user isn't a member of -- useful inside Workflow Builder, but at least one community report shows a workflow-token call against `slackLists.access.set` returning `list_not_found` where the same call on a bot token would work ([slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)). That's not documented Slack behavior, just a field report -- treat it as a reason to keep list writes on the bot token rather than a workflow token. See [Lists: Access & Scopes](../lists/access-and-scopes.mdx) for the list-specific access model.
