@@ -45,6 +45,13 @@ const ZFB_PACKAGES = [
   "@takazudo/zfb-adapter-cloudflare",
 ];
 
+// A bare semver only — no `^`/`~`/`>=`/other range operators. The zfb group's
+// whole point is an EXACT pin (see zfb's wrangler-version gate in
+// check-wrangler-pin.mjs, which assumes a single resolved version); a range
+// would let `pnpm install` silently resolve the four packages to different
+// versions even though their package.json specifiers still compare equal.
+const EXACT_VERSION_RE = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
+
 function main() {
   const rootPkg = JSON.parse(readFileSync(ROOT_PKG_PATH, "utf-8"));
   const mismatches = [];
@@ -77,6 +84,14 @@ function main() {
           pkg,
           reason: `Version mismatch within zfb group`,
           expected: firstZfb.version,
+          actual: version,
+        });
+      } else if (!EXACT_VERSION_RE.test(version)) {
+        mismatches.push({
+          group: "zfb",
+          pkg,
+          reason: `Not an exact pin (has a range operator like ^ or ~) — the zfb group requires exact versions`,
+          expected: "an exact semver, e.g. 2.2.0",
           actual: version,
         });
       }

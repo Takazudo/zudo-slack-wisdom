@@ -93,12 +93,16 @@ export async function collectFiles(dir, extensions) {
 
 export function extractHtmlLinks(html) {
   const links = [];
-  const regex = /<a\s[^>]*?href=(?:"([^"]*)"|'([^']*)')[^>]*>/gi;
+  // zfb's build output renders internal anchors with unquoted attribute values
+  // (e.g. `href=/docs/getting-started`), not just `href="..."` / `href='...'`,
+  // so the third alternative matches an HTML5 unquoted attribute value
+  // (any run of chars excluding whitespace, quotes, `=`, `<`, `>`, backtick).
+  const regex = /<a\s[^>]*?href=(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))[^>]*>/gi;
   let match;
   let lastIndex = 0;
   let currentLine = 1;
   while ((match = regex.exec(html)) !== null) {
-    const href = match[1] || match[2];
+    const href = match[1] ?? match[2] ?? match[3];
     if (/^https?:\/\//i.test(href)) continue;
     if (/^#/.test(href)) continue;
     if (/^mailto:/i.test(href)) continue;

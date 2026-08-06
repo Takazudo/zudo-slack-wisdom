@@ -20,19 +20,25 @@ ALLOWLIST="$ROOT_DIR/.template-drift-allowlist"
 # Resolve the matching release from the registry instead and cache it under
 # node_modules/.cache (already gitignored via the blanket `node_modules`
 # rule), so only the first run needs network access. The expected
-# create-zudo-doc version is derived from the `@takazudo/zudo-doc` dependency
-# pin rather than hardcoded — the two packages ship in lockstep (same release
-# train), so this stays correct across future zudo-doc version bumps with no
+# create-zudo-doc version is derived from the INSTALLED `@takazudo/zudo-doc`
+# version (node_modules, i.e. what the lockfile actually resolved) rather
+# than the package.json range specifier — package.json pins zudo-doc with a
+# caret (`^5.2.0`), so reading the specifier would silently pin the templates
+# to the range's minimum forever, even after a `pnpm up` resolves a newer
+# compatible zudo-doc release. The two packages ship in lockstep (same
+# release train), so this stays correct across future zudo-doc bumps with no
 # edits to this script.
-ZUDO_DOC_PIN=$(node -e "
-  const pkg = require('$ROOT_DIR/package.json');
-  process.stdout.write(pkg.dependencies?.['@takazudo/zudo-doc'] ?? '');
-")
-CREATE_ZUDO_DOC_VERSION="${ZUDO_DOC_PIN#^}"
-CREATE_ZUDO_DOC_VERSION="${CREATE_ZUDO_DOC_VERSION#~}"
+CREATE_ZUDO_DOC_VERSION=$(node -e "
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const pkgPath = path.join('$ROOT_DIR', 'node_modules/@takazudo/zudo-doc/package.json');
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+  process.stdout.write(pkg.version ?? '');
+" 2>/dev/null)
 
 if [[ -z "$CREATE_ZUDO_DOC_VERSION" ]]; then
-  echo "Error: could not read dependencies[\"@takazudo/zudo-doc\"] from package.json." >&2
+  echo "Error: could not read the installed @takazudo/zudo-doc version from node_modules." >&2
+  echo "  Run 'pnpm install' first." >&2
   exit 1
 fi
 
