@@ -1,0 +1,92 @@
+---
+title: インタラクティビティのペイロード
+description: block_actions ペイロードの構造、response_url と chat.update、action_id/block_id の設計
+sidebar_position: 4
+---
+
+## インタラクティビティはどこから来るか
+
+Block Kit のコンポーネント（ボタン、セレクトメニューなど）は Events API を通じて発火しない
+-- クリックされると、アプリの別枠である **Interactivity Request URL** に POST される。設定
+場所は Event Subscriptions と同じアプリ設定の画面だ。ペイロードは生の JSON ボディではなく、
+JSON を格納した単一の URL エンコード済みフォームフィールド `payload` として届く
+([出典](https://docs.slack.dev/interactivity/handling-user-interaction))。
+
+:::warning[先に署名を検証する]
+インタラクティビティの POST も、イベントとまったく同じ方式で署名されている --
+`X-Slack-Signature` / `X-Slack-Request-Timestamp`、`v0=<hex hmac>` -- ので、`payload`
+フィールドをデコードする前に検証すること。
+[リクエストの検証](../worker-backend/verifying-requests.mdx)を参照
+([出典](https://docs.slack.dev/authentication/verifying-requests-from-slack))。
+:::
+
+## `block_actions` ペイロードの構造
+
+`block_actions` ペイロードのトップレベルのフィールドは以下のとおり
+([リファレンス](https://docs.slack.dev/reference/interaction-payloads/block_actions-payload))。
+
+| フィールド | 用途 |
+|---|---|
+| `type` | このペイロード形式では `"block_actions"` |
+| `user` | アクションを起こした人 |
+| `team` / `enterprise` | ワークスペース（および Enterprise Grid の組織があればそれ） |
+| `api_app_id` | 自分のアプリの ID |
+| `container` | 操作が起きた場所（メッセージ、ビューなど） |
+| `channel` | チャンネル内のメッセージで操作が起きた場合に含まれる |
+| `message` | 該当する場合、そのブロックを含むメッセージ |
+| `view` | モーダルや App Home の場合、そのブロックを含むビュー |
+| `state` | その面にある状態を持つブロック要素すべての現在値 |
+| `actions` | このペイロード内のアクションごとに 1 要素の配列（実際には 1 つ） |
+| `response_url` | 該当する場合、返信を投稿するための短命な webhook |
+| `trigger_id` | 応答としてモーダルを開くための短命な ID |
+
+`actions[]` の各要素は `action_id`、`block_id`、`action_ts`、`type`（`button` や
+`static_select` などのコンポーネント種別）に加えて、コンポーネント固有の値を持つ。ボタンなら
+`value`、セレクトメニューなら `selected_option`、その他も同様にコンポーネントごとの
+フィールドが入る。
+
+## 応答方法: `response_url` と `chat.update`
+
+インタラクションに応答する方法は 2 つあり、それぞれ解決する問題が違う。
+
+- **`response_url`** -- インタラクションで受け取った URL にメッセージペイロードを POST する。
+  そのインタラクション 1 回に紐づくもので、受け取ってから **30 分以内に最大 5 回**まで使える
+  ([出典](https://docs.slack.dev/interactivity/handling-user-interaction))。追加のスコープも
+  チャンネル ID も要らないので、「クリックを受け止めてメッセージを更新する」流れではこれが
+  既定の選択肢になる。
+- **`chat.update`**（あるいは `chat.postMessage` / `chat.delete`）-- bot トークンを使い
+  `channel` + `ts` で対象を指定する通常の Web API 呼び出し。30 分の枠を過ぎた場合、更新を
+  クリックとインラインではなくバックグラウンドジョブから行う必要がある場合、あるいは
+  インタラクションの発生元ではないメッセージを更新する場合に、こちらへ手を伸ばす。
+
+どちらの方法をとるにせよ、Events API の 3 秒 ack のルールはここでも適用される。まず
+インタラクティビティの POST 自体に 3 秒以内で 2xx を返し
+([出典](https://docs.slack.dev/interactivity/handling-user-interaction))、実際の返信内容は
+そのあとで `response_url` か `chat.update` を通じて送る。時間がかかるなら
+[3 秒以内の ack](../worker-backend/three-second-ack.mdx)のとおり `ctx.waitUntil()` から
+実行する。
+
+## `action_id` と `block_id` の設計
+
+どちらのフィールドも自由に使えるデータ置き場ではないが、名前を決めるのは自分たちだ。付随的な
+ラベルではなく、小さなルーティングの仕組みとして扱うこと。
+
+- **`action_id`** はどのハンドラーを走らせるかを示す。安定した名前空間付きの文字列
+  （`"approve_request"`、`"cancel_request"`）にしておけば、ブロックの中身をパターンマッチ
+  するのではなく、ディスパッチャーがこの値で直接分岐できる。
+- **`block_id`** はアクションがどのブロックに属するかを示す。同じ `action_id` が、それ以外は
+  同一の行の並びに現れるとき（1 アイテム 1 行、1 行 1 `block_id`）に、どの行がクリックされた
+  かを知るのに役立つ。
+- ハンドラーが必要とするデータは、`action_id` に埋め込むのではなくコンポーネントの
+  **`value`** フィールドに入れる。`action_id` は再デプロイをまたいでも変えないこと。まだ
+  見えている古いメッセージも正しくルーティングされ続ける。インスタンスごとの状態
+  （レコード ID、ステータス）の置き場は `value` だ。
+
+:::caution[依存するものには block_id を明示的に指定する]
+`block_id` を指定しない場合、Slack が代わりに生成する
+([出典](https://docs.slack.dev/reference/block-kit/blocks/section-block))。後から識別する必要が
+まったくないブロックならそれでよいが、この値はメッセージ内で一意であるべきものであり、更新版の
+メッセージを送り直すたびに新しい値になることが前提とされている -- つまり自動生成された
+`block_id` が `chat.update` をまたいで同じままであることに依存してはいけない。ハンドラーが
+その値の予測可能性に依存するなら、必ず明示的に設定すること。
+:::
