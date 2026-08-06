@@ -65,12 +65,23 @@ up front. This resolves two problems at once:
    undocumented: [`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/)
    accepts only `channel_ids` and `user_ids` — there is no `app_ids`/bot argument anywhere.
    Yet `items.update` clearly enforces access (`access_denied`, `no_permission`,
-   `permission_denied`). The creator implicitly has access, making bot-creates-the-list the
-   only documented-clean path. There is a real community report
+   `permission_denied`). Creating the list is the only documented-clean path around this gap:
+   Slack's docs describe a new list as "owned by the acting user," and the acting user for a
+   bot-token `slackLists.create` call is the bot itself. There is a real community report
    ([slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)) of
    `list_not_found` from `items.update` despite the list being shared into the bot's channel
    (pre-GA, workflow-token context). Do not plan around a human creating the list and sharing
    it with the bot until that path is proven with a throwaway call.
+
+:::warning[Unverified]
+That the creator automatically retains write access — i.e., that a bot's own `xoxb` token is
+treated as the list's owner after it calls `slackLists.create` — is inferred, not confirmed.
+Slack's docs say a new list is "owned by the acting user" but never say "bot user" explicitly
+for a bot-token call, and the verification spike that would have settled this against a live
+workspace was skipped (no test token available). Confirm ownership empirically — for example,
+by having the bot attempt an owner-only action such as `access.set` with
+`access_level: "owner"` — before depending on it in a design.
+:::
 
 If a human already made the list, there is no `slackLists.info` and no `slackLists.list` to
 discover it by. Discovery is `slackLists.items.info` (needs `lists:read`), which returns the

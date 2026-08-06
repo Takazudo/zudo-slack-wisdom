@@ -99,7 +99,8 @@ third-party code, since Slack has already announced its removal.
 
 A successful call returns exactly `{"ok": true}` — no echo of the updated row, no revision
 token, no `list_metadata`. Confirming a write landed requires a follow-up read via
-[`items.info`](./errors-reference.mdx) or `items.list`.
+[`items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/) or
+`items.list`.
 
 Use `application/json` as the content type. Form-encoding is nominally accepted, but `cells`
 is an array of objects that themselves contain arrays; a form-encoded body for that shape
