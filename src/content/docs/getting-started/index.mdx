@@ -1,6 +1,20 @@
 ---
 title: Getting Started
+description: What this knowledge base covers and how the sections fit together
 sidebar_position: 1
 ---
 
-Placeholder — getting-started content lands in a later sub-issue.
+This site documents building Slack apps with a Cloudflare Worker as the backend: the bot token and signing secret live in the Worker's own secret store, every Slack API call happens server-to-server, and nothing Slack-credentialed ever reaches a browser. That stance shapes every section below -- start here, then move to [Worker Backend](../worker-backend/index.mdx) to see how secrets, request verification, and handlers map onto Worker bindings.
+
+## What This Covers
+
+- **Getting Started** (this section) -- creating a Slack app, obtaining the bot token and signing secret, and the token/scope model
+- **[Worker Backend](../worker-backend/index.mdx)** -- secrets and config, verifying requests from Slack, and Worker-specific handler patterns
+- **[Messaging](../messaging/index.mdx)** -- posting and updating messages through the Slack Web API
+- **[Events](../events/index.mdx)** -- subscribing to and handling the Events API
+- **[Lists](../lists/index.mdx)** -- the Slack Lists API in depth, including write semantics and access control, research-backed with unverified claims flagged explicitly
+- **[Data Surfaces](../data-surfaces/index.mdx)** -- patterns for exposing synced data back into Slack
+
+## In This Section
+
+<CategoryNav category="getting-started" />
