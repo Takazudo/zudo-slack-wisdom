@@ -1,0 +1,56 @@
+---
+title: Flue
+description: Cloudflare 上の Slack エージェント設計における Flue 2.x の境界、検証済み情報源、アーキテクチャ
+sidebar_position: 1
+---
+
+## Flue が担う範囲
+
+このアーキテクチャにおいて、Flue は会話単位のエージェント実行レイヤーである。会話は安定したインスタンス ID を持ち、アプリケーションコードからメッセージを受け取り、エージェント自身の履歴を永続化する。チャンネルパッケージは、アプリケーションコードが明示的にマウントする、検証済みのプロバイダー ingress を提供する。これらのフレームワーク責務は、Flue のタグ付きの[耐久性ガイド](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/guide/durability.md)と[チャンネルガイド](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/guide/channels.md)に記録されている。
+
+このサイトでは、Flue は Slack の delivery を受け取り、テナントを考慮した会話を選び、限定されたツールだけを持つエージェントを実行する境界として適している。Slack リクエストの検証、acknowledgement、transport の仕組みについては、既存の [Worker Backend](../worker-backend/index.mdx) と [Events](../events/index.mdx) を引き続き情報源とする。
+
+:::info[アーキテクチャ上の境界]
+Flue は、業務レコード、Slack OAuth installation、Slack リストの ownership の正規ストアでは**ない**。また、任意の永続ファイルシステム、sandbox/file の永続性保証、汎用 workflow database でもない。これらはアプリケーション所有のストアやサービスに置き、エージェントには限定され認可されたツールだけを公開する。
+:::
+
+Slack のメッセージやリストは操作・projection の surface であり、自動的に source of truth になるわけではない。Lists API の契約は [Lists](../lists/index.mdx)、Slack 上に何を表示するかの選択は [Data Surfaces](../data-surfaces/index.mdx) を参照する。
+
+## 記述のラベル
+
+このセクションでは、根拠のある事実と設計上の助言を分ける。以下のラベルを記述上の契約として扱う。
+
+:::note[検証済みの事実]
+[情報源マップとバージョニング](./source-map-and-versioning.mdx)に定めた、バージョンを一致させた一次情報源の優先順位に従って確認した事実。検証済みでも、明記されたバージョンと検証日の範囲に属する。
+:::
+
+:::info[推論]
+検証済みの挙動から導いた結論だが、引用元が直接保証しているわけではない。強い保証として依存する前に、前提を再確認する。
+:::
+
+:::tip[提案する契約]
+このサイトが推奨するアプリケーションインターフェースまたはアーキテクチャ。設計案であり、既存の Flue、Slack、Cloudflare API ではない。
+:::
+
+:::warning[未検証の挙動]
+一次ドキュメントやリポジトリ調査では確定できなかった主張。焦点を絞ったテストと記録された根拠なしに、事実へ格上げしない。
+:::
+
+## 8 ページのセクションマップ
+
+完成時のセクションは以下の順序で構成される。下のカテゴリナビゲーションには、各ページが追加されるたびにリンクが現れる。
+
+| ページ | 役割 | 記述の基本姿勢 |
+|---|---|---|
+| **Flue**（このページ） | 適用範囲、境界、根拠ラベル | 検証済みのフレームワーク範囲に基づくアーキテクチャ上の境界 |
+| **[情報源マップとバージョニング](./source-map-and-versioning.mdx)** | バージョン基準、情報源の優先順位、既知の食い違い | 検証済みの事実と記録された不一致 |
+| **コアコンセプトと API** | エージェント関数、会話、dispatch、state、tool | バージョンを検証したフレームワーク挙動 |
+| **Cloudflare で始める** | Vite 統合、生成される Durable Object、binding、migration、secret | バージョンを検証したセットアップとプラットフォーム境界 |
+| **Slack リクエストの処理** | 認証済み channel ingress、routing、重複排除、認可、outbound tool | 検証済みのプロバイダー契約とアプリケーションポリシー |
+| **テストと運用** | 決定的テスト、schedule、retry、プライバシーを守る observability、upgrade | 検証済みの挙動と運用上の推奨事項 |
+| **問い合わせとリストの workflow** | 会話、正規の業務 state、Slack projection state の分離 | 制約を明記したアプリケーションアーキテクチャ案 |
+| **外部テキスト・カレンダーツール** | リモートテキストとカレンダーアクセスのための限定された将来の tool contract | 提案する契約であり、既存 API とは決して表現しない |
+
+## このセクションのページ
+
+<CategoryNav category="flue" />
