@@ -1,0 +1,217 @@
+---
+title: Test と運用
+description: 決定的な Slack channel test、scheduled Flue dispatch、privacy-safe な observability、Flue 2.0.3 upgrade check
+sidebar_position: 6
+---
+
+## Default は synthetic・network-free
+
+Slack 境界の failure の多くは通常の決定的な bug である。1 byte の変更で signature が無効になる、
+retry が 2 回 admit される、actor が policy を迂回する、tool が誤った channel に送る、といった問題だ。
+Slack credential、deployed endpoint、model なしで test する。Synthetic payload を生成し、test 専用
+signing key で正確な byte を署名し、clock を固定し、mount 済み router を process 内で呼び出し、
+outbound Fetch を fake に置き換える。
+
+Cloudflare の
+[Workers Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/)
+では `workerd` runtime で code を実行できる。純粋な policy、schema、key derivation、tool contract
+function には通常の unit runner も適している。Default test は Slack や他 provider に接続しない。
+
+Fixture はすべて架空にする。実在しない workspace、enterprise、channel、user、event id と中立な
+message content、専用 test signing key を使う。Production payload を fixture にコピーしない。
+Interaction/command parsing を test するときも transient callback capability は削除または省略する。
+
+## Signed ingress contract suite
+
+Original body byte、timestamp、route、content type、test signing key を受け取り Slack の `v0` HMAC
+を計算する helper を 1 つ作る。Parse 後に再 serialize した値へ署名してはならない。同じ body byte
+から `Request` を構築し、test clock を明示する。
+
+Suite では次のすべての境界を証明する。
+
+- 正しく署名された現在時刻の Events JSON body、URL-encoded interaction body、URL-encoded command
+  body は設定済み callback だけに届く。1 byte の body 変更、誤った signing key、欠落・不正 header、
+  誤った content type は拒否される。
+- Accepted window の直前の timestamp は成功し、古すぎる/未来すぎる timestamp は失敗する。他は
+  valid でも古い request の replay は timestamp check を迂回できない。
+- 不正 UTF-8、invalid JSON、必須 field を生成しない form body、必須 discriminant の欠落、重複
+  interaction payload field、oversized body、誤解させる content length は application code を呼ばずに
+  失敗する。
+- `events` だけを設定した場合、interaction/command path は存在しない。Deploy する各 route combination
+  で繰り返す。
+- Unauthorized な workspace/enterprise、app id、actor、channel から正しい signature が届いても、
+  文書化した application policy に従って acknowledge または reject されるだけで dispatch はされない。
+- 同じ `event_id` の 2 delivery は 1 Flue admission に収束する。Content が同じでも event id が異なれば
+  両方 admit される。新しい event と古い event を順不同で届け、business state が arrival order ではなく
+  独自の ordering/version rule を使うことを確認する。
+- Bot-authored event、`user` が app の bot user である event、unsupported message subtype はすべて
+  無視される。意図的に許可した subtype にはそれぞれ positive case を追加する。
+
+[リクエストを検証する](../worker-backend/verifying-requests.mdx)、
+[3 秒以内の ack](../worker-backend/three-second-ack.mdx)、
+[Workers 上の Events API](../events/events-api-on-workers.mdx)が、これらの test が守る transport behavior
+を定義する。Channel test では controllable な未完了 dispatch promise より前に acknowledgement が
+生成されることを確認し、その後 execution context を drain して deferred result を確認する。
+
+## Dedupe と external effect は別の test
+
+2 delivery が 1 dispatch receipt を返すことだけを証明しても Events API test は不十分である。独立した
+2 layer を test する。
+
+1. **Admission convergence:** 同じ `event_id` は同じ agent instance に対して 1 Flue submission を作る。
+2. **Effect idempotency:** agent/tool execution の再実行や recovery が起きても、application effect key
+   ごとに durable business transition と意図した Slack effect は最大 1 回になる。
+
+曖昧な failure case を強制する。Fake Slack call は成功したが ledger write が失敗する、ledger claim
+成功後 call 前に Worker が停止する、timeout で remote result が不明になる、最初の attempt が pending
+の間に retry が始まる場合である。Flue admission が解決すると仮定せず、選んだ recovery policy を
+assert する。
+
+Interaction と command には Events envelope の `event_id` がないため、独自 case が必要になる。
+Interaction では synthetic business-operation id を繰り返し、conditional state transition が 1 回だけ
+適用されることを証明する。Command では product contract が durable operation id を与えない限り、
+同一の 2 invocation が別扱いになることを証明する。Dispatched message、saved record、tool state、log、
+trace を scan し、transient callback capability が入っていないことも確認する。
+
+## Slack Web API 境界を fake にする
+
+Fetch を inject するか、fake transport で `@slack/web-api` を構成し、response をすべて local で script
+する。Generic client だけでなく application が使う outbound method ごとに実行する。
+
+- `ok: true` の `200` は narrow result contract だけを返す。`ok: false` の `200` は application failure
+  であり success ではない。
+- `429` は `Retry-After` を読み、それより早く retry せず、正しい workspace/method bucket に limit を
+  適用する。長い待機は Worker lifetime を超えて sleep せず durable retry state に渡す。
+- Network timeout/connection failure は bounded retry/recovery path に到達する。Write method では
+  unknown-outcome branch を test する。
+- Rate limit 以外の `4xx` は fail closed とし、無条件に retry しない。Token revocation/missing scope は
+  token を表示せず installation を disable/flag して operator action を促す。
+- `5xx` は jitter 付き bounded backoff または durable queue/job record を使い、retry exhausted を最終的
+  に通知する。Fake clock で policy を決定的にする。
+
+Native response contract は [fetch で Web API を呼ぶ](../worker-backend/web-api-with-fetch.mdx)と
+[レート制限](../messaging/rate-limits.mdx)を参照する。Fake response body は test 内に置く。記録した
+production traffic には private channel content が含まれ得る。
+
+## Tool contract test
+
+Model なしで各 tool の `run` function を直接呼ぶ。Input の最小/最大長、Unicode/empty-content behavior、
+output schema、provider error mapping、idempotency ledger を検証する。重要な authorization assertion
+は構造的である。
+
+- Tool input から token、tenant、channel、thread、Web API method、URL を選べない。
+- Destination は検証済み creation data と現在の authorized installation record から得る。
+- Dispatch から tool execution の間に actor、installation、channel が revoke された場合 fail closed する。
+- 別 channel id を含む prompt-like text は routing data ではなく content として扱う。
+- Tool output には agent が必要な field だけを含め、credential、provider response 全体、private content、
+  transient callback capability を返さない。
+
+許可する destination/operation ごとに別の contract case を設ける。広範な `call_slack_api` tool は
+friendly な input を数件 test しても安全にならないため、narrow tool に置き換える。
+
+## Cloudflare 上の scheduled dispatch
+
+Cloudflare Cron Trigger は UTC を使う。Daylight-saving change を含め、local business schedule を変換
+するときの product contract として扱う。
+[Cron Trigger documentation](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
+では handler に scheduled fire time も提供される。
+
+Scheduled turn の overlap 可否に応じて conversation identity を選ぶ。
+
+- すべての fire が history を共有し、Flue が 1 conversation 内で work を serialize すべき場合は
+  `schedule:daily-summary` のような 1 つの stable id を使う。遅い fire が次を遅らせるため workload
+  を bounded にする。
+- Fire が独立し parallel 実行できる場合は scheduled fire time を id に含める。遅れた run が別 run
+  を block しない代わりに、意図的に history は分かれる。
+
+Application idempotency key には handler 開始時の wall clock ではなく scheduled fire time を使う。
+これにより別の fire をまとめず、同じ fire の repeated delivery を収束できる。
+
+```typescript
+import { dispatch } from "@flue/runtime";
+import { ScheduledAssistant } from "./agents/scheduled-assistant.ts";
+
+export default {
+  async scheduled(
+    controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<void> {
+    const fire = new Date(controller.scheduledTime).toISOString();
+    const conversationId = env.SCHEDULE_PARALLEL
+      ? `schedule:daily-summary:${fire}`
+      : "schedule:daily-summary";
+
+    ctx.waitUntil(
+      dispatch(ScheduledAssistant, {
+        id: conversationId,
+        idempotencyKey: `daily-summary:${fire}`,
+        message: {
+          kind: "signal",
+          type: "schedule.daily_summary",
+          attributes: { scheduledFor: fire },
+        },
+      }),
+    );
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+`scheduled()` handler は thin に保つ。Fire identity を導出・検証し、enqueue/dispatch して return する。
+複雑な reminder には recurrence rule、time zone、cancellation、recipient authorization、effect status、
+retry attempt を扱う application-owned durable job state が必要である。Flue conversation history は job
+scheduler や canonical reminder database ではない。Overlap と Slack post の mechanics は既存の
+[Cron posting](../worker-backend/cron-posting.mdx)で扱っている。
+
+固定 UTC `scheduledTime` で handler を呼んで schedule を test する。Boundary date、repeated fire、遅い
+prior fire、serialized/parallel id、authorization change、external-effect ledger を扱う。Test で実際の
+Cron Trigger を待たない。
+
+## Privacy-safe な observability
+
+Structured operational metadata を出力する。生成した request id、authenticated tenant key、route
+surface、存在する場合の Slack `event_id`、Flue submission id、agent instance hash などの非 content
+reference、outcome、latency、retry class、tool name、application effect key である。Message text を
+コピーせずに ingress、dispatch、tool execution、outbound response を結び付ける。
+
+Authorization header、signing material、OAuth token、cookie、raw body、Slack message content、private
+channel name、PII、model prompt/completion、tool input/output 全体、transient callback capability は redact
+する。Log、trace、exception report、eval artifact が Worker の外へ出る前に redaction を適用する。
+Secret や短命 capability を hash しても適切な telemetry にはならない。
+
+Log/trace の retention と access control を設定し、opaque id を application record に join できる担当者
+を文書化する。High-volume success event は sample してよいが、authorization failure、effect-ledger
+conflict、retry exhausted、invalid-signature trend は sample で失わない。継続的な callback failure、
+Slack `429`/`5xx` rate、deferred-work rejection、schedule lateness、停止した durable job を alert する。
+
+## 決定的な test と selective eval
+
+Schema、policy、raw-body verification、route omission、dedupe、state transition、tool、fake network
+response、schedule identity には deterministic な unit/contract/integration test を使う。高速・offline で、
+通常 CI の必須 check にする。
+
+Flue eval は完全な agent を live model に対して実行するため nondeterministic、cost-bearing、低速、
+credential 使用となる。タグ付き
+[Flue eval guide](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/guide/evals.md)
+は別 suite と behavioral assertion を推奨する。正しい narrow tool を選ぶ、unauthorized request を拒否
+する、destination を捏造しない、といった model 固有 behavior を確認する少数の reviewed set を明示的
+または管理した cadence で実行する。Live Slack traffic を eval fixture にせず、report を upload する前に
+prompt/output retention を確認する。
+
+## Upgrade と source-date checklist
+
+この guidance は **Flue 2.0.3** と **2026-08-08** 時点の provider source に対して review した。Upgrade
+または定期 security review の前に次を行う。
+
+1. [Source Map と versioning](./source-map-and-versioning.mdx)、target の tagged changelog、runtime の
+   dispatch/admission type、`@flue/slack` route implementation、対応する Slack example を読む。
+2. Disposable な synthetic project で `flue add channel slack` を再実行し、現在の blueprint と
+   application-owned channel code を比較する。Local authorization/privacy policy は意図的に維持する。
+3. 既知の blueprint 省略を再確認する。New version が別 contract を文書化しない限り、Events dispatch
+   は `event_id` を `idempotencyKey` として渡す必要がある。
+4. Slack request signing、retry/ack、payload、OAuth/scope、token lifecycle、Web API rate-limit docs を
+   review する。Cloudflare Cron の UTC semantics、execution-context lifetime、testing guidance も再確認する。
+5. Offline boundary suite 全体、target version が必要とする migration/type/build check を実行し、承認
+   された場合だけ別の selective live-model eval suite を実行する。
+6. 正確な package version、lockfile result、source URL、review date、未解決 discrepancy、operator の
+   rollout/rollback decision を記録する。
