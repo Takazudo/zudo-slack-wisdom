@@ -52,8 +52,10 @@ The suite should prove all of these boundaries:
 [Verifying Requests](../worker-backend/verifying-requests.mdx),
 [Three-Second Ack](../worker-backend/three-second-ack.mdx), and
 [Events API on Workers](../events/events-api-on-workers.mdx) define the transport behavior these tests
-protect. The channel test should assert that acknowledgement is produced before a controllable,
-unsettled dispatch promise completes, then drain the execution context and assert the deferred result.
+protect. The channel test should hold a controllable `dispatch()` admission promise unsettled and
+assert that acknowledgement has not yet been returned. Resolve durable admission and expect the
+prompt `200`; a separate unsettled model/effect promise must not delay it. If admission rejects, the
+route must not return a success that suppresses Slack's retry.
 
 ## Dedupe and External Effects Are Separate Tests
 
@@ -132,7 +134,11 @@ Choose conversation identity according to whether scheduled turns may overlap:
 Use the scheduled fire time, not the handler's wall-clock start, in the application idempotency key.
 That lets a repeated delivery of one fire converge without collapsing different fires.
 
-```typescript
+Flue's Cloudflare target merges the default export from `src/cloudflare.ts` into the generated Worker.
+Put the handler there, and configure the Cron Trigger explicitly in application-owned Wrangler
+configuration; neither the filename nor the schedule is inferred from this guide's function alone.
+
+```typescript title="src/cloudflare.ts"
 import { dispatch } from "@flue/runtime";
 import { ScheduledAssistant } from "./agents/scheduled-assistant.ts";
 
@@ -154,6 +160,7 @@ export default {
         message: {
           kind: "signal",
           type: "schedule.daily_summary",
+          body: "Generate the authorized daily summary.",
           attributes: { scheduledFor: fire },
         },
       }),
@@ -161,6 +168,17 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 ```
+
+```jsonc title="wrangler.jsonc"
+{
+  "triggers": {
+    "crons": ["0 9 * * *"]
+  }
+}
+```
+
+Cron expressions are UTC. Treat the example schedule as an application choice, review it for the
+target environment, and test deployment configuration separately from invoking the handler.
 
 Keep the `scheduled()` handler thin: derive and validate the fire identity, enqueue or dispatch, and
 return. Complex reminders need application-owned durable job state for recurrence rules, time zones,

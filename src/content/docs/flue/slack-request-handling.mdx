@@ -6,7 +6,11 @@ sidebar_position: 5
 
 ## The Channel Boundary
 
-Run `flue add channel slack` to add editable channel code and the required packages. In Flue 2.0.3,
+`flue add channel slack` fetches a live-registry Markdown blueprint for a coding agent; it is not a
+package installer. Use `--print` or the documented agent-piping workflow, review the fetched guide,
+and apply its code and package changes through normal project tooling. Because the registry can move,
+reconcile that guide with the tagged [2.0.3 `flue add` contract](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/cli/add.md)
+and channel sources before adopting version-sensitive snippets. In Flue 2.0.3,
 [`@flue/slack`](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/README.md)
 owns authenticated inbound HTTP: it verifies Slack requests, parses the provider-native payload, and
 routes Events API, interaction, and slash-command deliveries to configured callbacks. It is
@@ -60,11 +64,13 @@ The protocol details and standalone Worker implementation live in
 ordering even if the channel package is later replaced or wrapped.
 
 Slack expects a prompt acknowledgement; model calls and other substantial work must not delay the
-response. On Cloudflare, register the dispatch or application job with the execution context and let
-the callback return an empty `200`. See [Three-Second Ack](../worker-backend/three-second-ack.mdx)
-for the response window and deferred-work pattern, and
-[Events API on Workers](../events/events-api-on-workers.mdx) for Slack retry mechanics. Catch and
-observe failures inside deferred work because Slack has already received the acknowledgement.
+response. Await `dispatch()` only until Flue durably admits the input, then let the callback return an
+empty `200`; admission does not wait for model execution. If admission fails, surface the callback
+failure so Slack can retry the same `event_id`. If admission cannot reliably finish inside Slack's
+window, durably enqueue the delivery in application storage before acknowledging and dispatch it from
+that recovery path. Do not place the only admission attempt in `waitUntil()` after returning `200`.
+See [Three-Second Ack](../worker-backend/three-second-ack.mdx) for the response window and
+[Events API on Workers](../events/events-api-on-workers.mdx) for retry mechanics.
 
 ## Events: Authorize, Filter, Identify, Dispatch
 
@@ -103,7 +109,7 @@ function tenantKey(enterpriseId: string | null, workspaceId: string): string {
 export const channel = createSlackChannel({
   signingSecret: process.env.SLACK_SIGNING_SECRET!,
 
-  async events({ c, payload }) {
+  async events({ payload }) {
     if (payload.type !== "event_callback") return;
     const enterpriseId = payload.context_enterprise_id ?? payload.enterprise_id ?? null;
     const workspaceId = payload.context_team_id ?? payload.team_id;
@@ -117,7 +123,8 @@ export const channel = createSlackChannel({
     if (shouldIgnoreMessage(payload.event, installation.botUserId)) return;
 
     const event = payload.event;
-    if (!isAllowedActor(installation, event.user)) return;
+    const actor = resolveAuthorizedActor(installation, event.user);
+    if (!actor) return;
     if (!isAllowedChannel(installation, event.channel)) return;
 
     const rootThreadTs = event.thread_ts ?? event.ts;
@@ -127,8 +134,8 @@ export const channel = createSlackChannel({
       threadTs: rootThreadTs,
     };
 
-    c.executionCtx.waitUntil(
-      dispatch(Assistant, {
+    try {
+      await dispatch(Assistant, {
         id: channel.instanceId(thread),
         idempotencyKey: payload.event_id,
         initialData: {
@@ -136,17 +143,23 @@ export const channel = createSlackChannel({
           workspaceId,
           channelId: event.channel,
           rootThreadTs,
-          startedBy: event.user,
+          startedBy: actor.principalId,
           startedAt: new Date(Number(event.ts) * 1000).toISOString(),
         },
         message: {
           kind: "signal",
           type: "slack.app_mention",
           body: event.text,
-          attributes: { eventId: payload.event_id },
+          attributes: {
+            eventId: payload.event_id,
+            actorPrincipalId: actor.principalId,
+          },
         },
-      }).catch((error: unknown) => recordDispatchFailure(error, payload.event_id)),
-    );
+      });
+    } catch (error: unknown) {
+      recordDispatchFailure(error, payload.event_id);
+      throw error;
+    }
   },
 });
 ```
@@ -166,8 +179,11 @@ Grid organization. An instance id selects a conversation; it never grants access
 `initialData` contains immutable creation facts. Define the agent's static `initialData` schema so
 Flue validates these fields when the instance is created, and read the parsed value with
 `useInitialData()`. Repeated dispatches may pass the same creation facts, but Flue ignores them after
-creation. Delivery-specific, non-secret facts belong in signal `attributes`; `eventId` is useful for
-correlation. Do not treat either location as an authorization store.
+creation. `startedBy` therefore records only the conversation creator. Every server-authored signal
+also carries the current verified `actorPrincipalId`; read it from `useDelivery()` and reauthorize that
+principal for the requested operation. `eventId` remains correlation metadata. Neither location is an
+authorization store, and a directly mounted client route must not be allowed to forge trusted
+attributes.
 
 ## Three Different Dedupe Boundaries
 
@@ -205,11 +221,13 @@ the remote call succeeded but recording its result failed.
 
 ## Destination-Bound Outbound Tools
 
-Construct tools from validated `initialData` and an authorized installation record. The model may
-supply narrow content such as reply text, but not a token, workspace, channel, thread timestamp, Web
-API method name, or arbitrary URL. The tool closure binds those values and rechecks authorization at
-execution time. Validate output size and shape, return only the minimum provider identifiers, and
-apply an application idempotency key before calling Slack.
+Construct tools from validated `initialData`, the current server-authored delivery attributes, and an
+authorized installation record. Resolve the delivery's `actorPrincipalId` to a current application
+principal and recheck that actor's operation and destination authorization inside `run`; never fall
+back to immutable `startedBy` for later thread participants. The model may supply narrow content such
+as reply text, but not a token, workspace, actor, channel, thread timestamp, Web API method name, or
+arbitrary URL. The tool closure binds those values. Validate output size and shape, return only the
+minimum provider identifiers, and apply an application idempotency key before calling Slack.
 
 Native Web API behavior, `429` responses, and `Retry-After` handling are covered by
 [Web API with fetch](../worker-backend/web-api-with-fetch.mdx) and

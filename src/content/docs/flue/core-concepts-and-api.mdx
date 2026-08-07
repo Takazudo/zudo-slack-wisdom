@@ -81,12 +81,12 @@ await dispatch(SupportTriage, {
 |---|---|---|
 | Conversation/instance ID | Caller-selected stable address | Tenant-scoped case or channel thread |
 | `initialData` | Validated at creation, recorded once, immutable | Tenant and case identity |
-| Signal attributes | Data on one delivery | Verified event ID and authorized tenant |
+| Signal attributes | Per-delivery metadata; trust depends on ingress | Verified event ID and current actor on server-authored dispatch |
 | Persistent state | Durable named state for one conversation | Small agent-owned progress or gates |
 | Canonical records | Application-owned database or service | Business truth, ownership, OAuth, audit |
 | Files/sandboxes | Depend on the selected implementation | Artifacts only when its contract is durable |
 
-`initialData` is not mutable metadata: later values on an existing conversation are ignored. Read it with `useInitialData()`; read the current delivery with `useDelivery()`. Attributes are already-verified context, not model authorization.
+`initialData` is not mutable metadata: later values on an existing conversation are ignored. Read it with `useInitialData()`; read the current delivery with `useDelivery()`. Server-authored dispatch attributes can carry context the application already verified. Attributes submitted through a directly mounted client route are caller input: validate and authorize them, and never mistake Flue's shape validation for authenticity. Neither form is model authorization.
 
 Conversation history and persistent agent state are framework state, not the canonical application database. Persist business facts through narrow application tools and stable idempotency keys. Do not infer a durable filesystem from a conversation or Durable Object: on Cloudflare, Durable Object storage can persist while ordinary JavaScript instance fields disappear at eviction, and sandbox files have a separate contract.
 

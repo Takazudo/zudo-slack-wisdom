@@ -14,9 +14,9 @@ sidebar_position: 2
 
 Flue の情報源が食い違う場合は、以下の順序を使う。1 つの判断に用いるすべての情報源を、文書化するパッケージバージョンと一致させる。
 
-1. **インストール済みの `flue docs`。** CLI はインストール済みバージョンに同梱されたドキュメントをネットワークアクセスなしで読む。公式の [`flue docs` リファレンス](https://flueframework.com/docs/cli/docs/)を参照する。
-2. **一致するタグの changelog と runtime contract。** 破壊的変更の記録と実行される型・validation により、バージョン依存の API を判断する。[v2.0.3 changelog](https://github.com/withastro/flue/blob/v2.0.3/CHANGELOG.md) とタグ付きの [`dispatch` contract](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/src/runtime/dispatch.ts)から始める。
-3. **タグ付きの実行可能な example。** 同じタグの example で contract の組み合わせ方を確認する。特に [Cloudflare example](https://github.com/withastro/flue/tree/v2.0.3/examples/cloudflare) と [Slack channel example](https://github.com/withastro/flue/tree/v2.0.3/examples/slack-channel)を参照する。
+1. **一致するタグの changelog と runtime contract。** 破壊的変更の記録と実行される型・validation により、バージョン依存の API を判断する。[v2.0.3 changelog](https://github.com/withastro/flue/blob/v2.0.3/CHANGELOG.md) とタグ付きの [`dispatch` contract](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/src/runtime/dispatch.ts)から始める。
+2. **タグ付きの実行可能な example。** 同じタグの example で contract の組み合わせ方を確認する。特に [Cloudflare example](https://github.com/withastro/flue/tree/v2.0.3/examples/cloudflare) と [Slack channel example](https://github.com/withastro/flue/tree/v2.0.3/examples/slack-channel)を参照する。
+3. **インストール済みの `flue docs`。** CLI はバージョンの一致する同梱 prose をネットワークアクセスなしで読む。公式の [`flue docs` リファレンス](https://flueframework.com/docs/cli/docs/)を参照する。発見には利用できるが、同梱された 2.0.3 prose にも後述する Cloudflare の食い違いがあるため、実行可能な snippet は必ず照合する。
 4. **ライブの解説文書。** Web サイトは発見には便利だが、リリースより先へ進んだり、同一リリース内で食い違ったりする可能性がある。バージョン固定されていない snippet を、一致するタグの contract より優先しない。
 
 :::note[照合ルール]

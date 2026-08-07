@@ -105,9 +105,11 @@ valid resource, and do not treat a path as an authorization credential.
 ### Bounded listing and change cursors
 
 A proposed `GET /automation/v1/documents?prefix=...&limit=...&after=...` or `list_documents` performs
-a bounded prefix listing. Clamp the prefix length and page size. Use a server-issued opaque keyset
-cursor over a deterministic immutable sort tuple such as canonical path plus `documentId`; never use
-an offset or model-visible list index as identity.
+a bounded prefix listing. Clamp the prefix length and page size. Prefer a server-issued opaque keyset
+cursor over an immutable ordering key such as `documentId`. If product requirements demand path
+ordering, freeze canonical path plus `documentId` inside a stable snapshot and reconcile later moves
+from its change anchor; a live mutable path is not a safe checkpoint. Never use an offset or
+model-visible list index as identity.
 
 Define snapshot behavior explicitly. A bootstrap either reads from a stable snapshot, or returns a
 snapshot/change anchor that lets the client reconcile inserts made while pages were read. Every page
@@ -170,12 +172,14 @@ Use distinct tagged timing shapes rather than guessing from strings:
   calendar's IANA zone; it remains a date span rather than midnight instants;
 - a timed occurrence has absolute `startDateTime` and `endDateTime` instants plus its IANA zone; and
 - an unscheduled item has no event interval and appears only when the explicit unscheduled filter is
-  enabled.
+  enabled. Return unscheduled items in a separate page stream, or define a leading scheduled/unscheduled
+  bucket plus a fixed null ordering so interval-less rows never rely on undefined start/end values.
 
-Order deterministically by effective start, effective end, stable `eventId`, and stable
-`instanceId`. Apply the same ordering tuple to keyset pagination. Require explicit `includeDone`,
-`includeArchived`, and `includeUnscheduled` filters; safe defaults are all `false`. Bind cursors to
-the interval, zone, filters, tenant, and collection.
+Within the scheduled bucket, order deterministically by effective start, effective end, stable
+`eventId`, and stable `instanceId`. In a combined stream, put the explicit bucket discriminator first
+and give the unscheduled bucket its own stable id ordering. Apply the documented tuple to keyset
+pagination. Require explicit `includeDone`, `includeArchived`, and `includeUnscheduled` filters; safe
+defaults are all `false`. Bind cursors to the interval, zone, filters, tenant, and collection.
 
 ### Privacy-minimal event projection
 
@@ -231,7 +235,7 @@ bounded query values, or content needed for one operation. Re-authorize inside `
 adapter with server-bound tenant, collection, token, and base URL, and return the privacy-minimal
 typed result.
 
-Flue's idempotent dispatch converges one admitted delivery; it does not deduplicate the later
+Flue's idempotency-keyed dispatch converges one admitted delivery; it does not deduplicate the later
 external effect. Derive a stable app-level key from the authorized business operation and use it at
 the text adapter, even when the Slack event and Flue admission already have keys. For the distinction
 between admission and effects, see [Core Concepts and API](./core-concepts-and-api.mdx) and

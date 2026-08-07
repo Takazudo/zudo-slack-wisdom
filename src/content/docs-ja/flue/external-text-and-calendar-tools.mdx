@@ -104,8 +104,10 @@ authorized root 外へ出る form は拒否する。Normalization で invalid pa
 
 提案段階の `GET /automation/v1/documents?prefix=...&limit=...&after=...` または
 `list_documents` は bounded prefix listing を行う。Prefix length と page size を clamp する。
-Canonical path と `documentId` など immutable で deterministic な sort tuple に対する server-issued
-opaque keyset cursor を使う。Offset や model-visible list index を identity に使わない。
+`documentId` のような immutable ordering key に対する server-issued opaque keyset cursor を優先する。
+Product requirement が path ordering を必要とする場合は、stable snapshot 内で canonical path +
+`documentId` を freeze し、その change anchor から後続の move を reconcile する。Live で mutable な path
+は安全な checkpoint ではない。Offset や model-visible list index を identity に使わない。
 
 Snapshot behavior を明示的に定義する。Bootstrap は stable snapshot から read するか、page の read
 中に insert された item を client が reconcile できる snapshot/change anchor を返す。各 page に
@@ -166,11 +168,14 @@ String から推測せず、別々の tagged timing shape を使う。
   IANA zone を持ち、midnight instant ではなく date span のまま扱う。
 - Timed occurrence は absolute な `startDateTime` / `endDateTime` instant と IANA zone を持つ。
 - Unscheduled item は event interval を持たず、明示的な unscheduled filter が有効な場合だけ現れる。
+  別の page stream で返すか、先頭に scheduled/unscheduled bucket と固定 null ordering を定義し、interval
+  のない row が未定義の start/end に依存しないようにする。
 
-Effective start、effective end、stable `eventId`、stable `instanceId` の順で deterministic に sort
-する。同じ ordering tuple を keyset pagination に適用する。`includeDone`、`includeArchived`、
-`includeUnscheduled` filter を明示的に要求し、安全な default はすべて `false` にする。Cursor を
-interval、zone、filter、tenant、collection に bind する。
+Scheduled bucket 内では effective start、effective end、stable `eventId`、stable `instanceId` の順で
+deterministic に sort する。Combined stream では明示的な bucket discriminator を先頭に置き、unscheduled
+bucket には独自の stable id ordering を与える。文書化した tuple を keyset pagination に適用する。
+`includeDone`、`includeArchived`、`includeUnscheduled` filter を明示的に要求し、安全な default はすべて
+`false` にする。Cursor を interval、zone、filter、tenant、collection に bind する。
 
 ### Privacy-minimal event projection
 
@@ -225,7 +230,7 @@ current authorization record から narrow tool を構築し、1 operation に�
 query value、content だけを受け取らせる。`run` 内で再認可し、server-bound の tenant、collection、
 token、base URL で adapter を call し、privacy-minimal な typed result を返す。
 
-Flue の idempotent dispatch は 1 つの admitted delivery を収束させるが、その後の external effect を
+Flue の idempotency-keyed dispatch は 1 つの admitted delivery を収束させるが、その後の external effect を
 deduplicate しない。Slack event と Flue admission がすでに key を持つ場合でも、authorized business
 operation から stable app-level key を導出し、text adapter で使用する。Admission と effect の違いは
 [Core Concepts と API](./core-concepts-and-api.mdx)と

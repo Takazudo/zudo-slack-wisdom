@@ -39,6 +39,7 @@ platform setting、application 所有 binding、生成 class の順序付き mig
   "name": "support-agent",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  "ai": { "binding": "AI" },
   "migrations": [
     {
       "tag": "v1",
@@ -50,6 +51,8 @@ platform setting、application 所有 binding、生成 class の順序付き mig
   }
 }
 ```
+
+Agent example で選んだ `cloudflare/...` model には、この Workers AI binding が必要である。Flue の generated configuration は application の provider binding まで作成しない。この binding を宣言するか、別の review 済み model provider と server-side credential を設定する。
 
 migration history は順序付きで append-only である。デプロイ済みの生成 class を追加、rename、remove するときは migration を追加し、必要に応じて Wrangler の `new_sqlite_classes`、`renamed_classes`、`deleted_classes` を使う。`app.ts` の route path 変更は storage migration ではない。
 

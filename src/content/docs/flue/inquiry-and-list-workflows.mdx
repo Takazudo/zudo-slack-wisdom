@@ -170,11 +170,13 @@ resolved opaque column/option ids with a schema fingerprint, and fail closed whe
 schema health, explicit activation state, sync health, and a destination-wide rate-limit cooldown as
 separate state: a healthy schema does not clear a cooldown or authorize an inactive projection.
 
-For creates, store a versioned opaque ownership marker in a dedicated remote field as well as the
-local mapping. That identity lets reconciliation recover an accepted create whose response or local
-write was lost; delete only rows positively identified as owned. When approved humans may edit a
-projection, compare normalized remote cells with the desired state instead of relying on a hash of
-the last local write.
+For creates, store a versioned ownership marker in a dedicated remote field as well as the local
+mapping. Bind an authenticated marker to tenant, List, and inquiry identity, or cross-check it against
+canonical server-side evidence before adoption or deletion; an editable remote cell by itself is not
+proof of ownership. That identity lets reconciliation recover an accepted create whose response or
+local write was lost. Quarantine copied, forged, or invalid-version markers, and delete only rows
+positively verified as owned. When approved humans may edit a projection, compare normalized remote
+cells with the desired state instead of relying on a hash of the last local write.
 
 Reconcile active and archived inventories separately. Model `active`, `archived`, `missing_once`,
 `confirmed_missing`, `duplicate`, `foreign`, and `owned_unmapped` as distinct outcomes; prefer an

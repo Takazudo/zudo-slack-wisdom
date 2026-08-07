@@ -6,8 +6,13 @@ sidebar_position: 5
 
 ## Channel の境界
 
-`flue add channel slack` を実行し、編集可能な channel code と必要な package を追加する。Flue
-2.0.3 では、[`@flue/slack`](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/README.md)
+`flue add channel slack` は coding agent 向けの Markdown blueprint を live registry から取得する
+command であり、package installer ではない。`--print` または文書化された agent への pipe workflow
+を使い、取得した guide を review してから通常の project tooling で code と package の変更を適用する。
+Registry は変化しうるため、バージョン依存の snippet はタグ付きの
+[2.0.3 `flue add` contract](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/cli/add.md)
+および channel source と照合する。Flue 2.0.3 では、
+[`@flue/slack`](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/README.md)
 が認証済み inbound HTTP を担当する。Slack request の検証、provider-native payload の parse、
 Events API・interaction・slash command delivery の設定済み callback への route が責務である。
 これは stateless で、Slack への message 送信は行わない。Outbound call は公式
@@ -60,11 +65,14 @@ Protocol の詳細と単独 Worker での実装は
 wrap する場合も、raw byte を parse より前に検証する順序を維持する。
 
 Slack には即座に acknowledgement を返す必要があり、model call などの重い処理で response を
-遅らせてはならない。Cloudflare では dispatch や application job を execution context に登録し、
-callback から空の `200` を返す。[3 秒以内の ack](../worker-backend/three-second-ack.mdx)で response
-window と deferred-work pattern を、[Workers 上の Events API](../events/events-api-on-workers.mdx)
-で Slack の retry mechanics を確認する。Slack には acknowledgement 済みなので、deferred work
-内で failure を捕捉して観測する。
+遅らせてはならない。Flue が input を durable に admit するまでの `dispatch()` だけを await し、その後
+callback から空の `200` を返す。Admission は model execution の完了を待たない。Admission が失敗した
+場合は callback failure を表面化し、Slack が同じ `event_id` を retry できるようにする。Admission が
+Slack の window 内に確実に終わらない場合は、acknowledgement より前に application storage へ delivery
+を durable enqueue し、その recovery path から dispatch する。`200` を返した後の `waitUntil()` だけに
+唯一の admission attempt を置いてはならない。[3 秒以内の ack](../worker-backend/three-second-ack.mdx)
+で response window を、[Workers 上の Events API](../events/events-api-on-workers.mdx)で retry mechanics
+を確認する。
 
 ## Events: 認可、filter、identity、dispatch
 
@@ -102,7 +110,7 @@ function tenantKey(enterpriseId: string | null, workspaceId: string): string {
 export const channel = createSlackChannel({
   signingSecret: process.env.SLACK_SIGNING_SECRET!,
 
-  async events({ c, payload }) {
+  async events({ payload }) {
     if (payload.type !== "event_callback") return;
     const enterpriseId = payload.context_enterprise_id ?? payload.enterprise_id ?? null;
     const workspaceId = payload.context_team_id ?? payload.team_id;
@@ -116,7 +124,8 @@ export const channel = createSlackChannel({
     if (shouldIgnoreMessage(payload.event, installation.botUserId)) return;
 
     const event = payload.event;
-    if (!isAllowedActor(installation, event.user)) return;
+    const actor = resolveAuthorizedActor(installation, event.user);
+    if (!actor) return;
     if (!isAllowedChannel(installation, event.channel)) return;
 
     const rootThreadTs = event.thread_ts ?? event.ts;
@@ -126,8 +135,8 @@ export const channel = createSlackChannel({
       threadTs: rootThreadTs,
     };
 
-    c.executionCtx.waitUntil(
-      dispatch(Assistant, {
+    try {
+      await dispatch(Assistant, {
         id: channel.instanceId(thread),
         idempotencyKey: payload.event_id,
         initialData: {
@@ -135,17 +144,23 @@ export const channel = createSlackChannel({
           workspaceId,
           channelId: event.channel,
           rootThreadTs,
-          startedBy: event.user,
+          startedBy: actor.principalId,
           startedAt: new Date(Number(event.ts) * 1000).toISOString(),
         },
         message: {
           kind: "signal",
           type: "slack.app_mention",
           body: event.text,
-          attributes: { eventId: payload.event_id },
+          attributes: {
+            eventId: payload.event_id,
+            actorPrincipalId: actor.principalId,
+          },
         },
-      }).catch((error: unknown) => recordDispatchFailure(error, payload.event_id)),
-    );
+      });
+    } catch (error: unknown) {
+      recordDispatchFailure(error, payload.event_id);
+      throw error;
+    }
   },
 });
 ```
@@ -163,9 +178,11 @@ workspace identity を入れ、その後に channel と root thread timestamp �
 
 `initialData` は immutable な creation facts を持つ。Agent の static `initialData` schema を定義し、
 instance 作成時に Flue がこれらの field を検証するようにして、`useInitialData()` から parse 済み値を
-読む。繰り返しの dispatch で同じ creation facts を渡してもよいが、作成後は Flue が無視する。
-Delivery ごとの非 secret facts は signal の `attributes` に置き、`eventId` は correlation に利用できる。
-どちらも authorization store として扱わない。
+読む。繰り返しの dispatch で同じ creation facts を渡してもよいが、作成後は Flue が無視する。そのため
+`startedBy` が記録するのは conversation creator だけである。Server-authored signal ごとに、現在の検証済み
+`actorPrincipalId` も渡す。`useDelivery()` から読み、要求された operation についてその principal を再認可
+する。`eventId` は correlation metadata である。どちらも authorization store として扱わず、直接 mount
+した client route に trusted attribute を forge させてはならない。
 
 ## 3 つの異なる dedupe 境界
 
@@ -201,11 +218,13 @@ call は成功したが結果の記録に失敗した、という曖昧な場合
 
 ## 宛先を固定した outbound tool
 
-検証済み `initialData` と認可済み installation record から tool を組み立てる。Model が与えられるのは
-reply text のような狭い content だけで、token、workspace、channel、thread timestamp、Web API method
-名、任意 URL は入力させない。Tool closure がそれらを固定し、実行時にも authorization を再確認する。
-Output の size と shape を検証し、必要最小限の provider identifier だけを返し、Slack call の前に
-application idempotency key を適用する。
+検証済み `initialData`、現在の server-authored delivery attribute、認可済み installation record から
+tool を組み立てる。Delivery の `actorPrincipalId` を現在の application principal に解決し、`run` 内で
+その actor の operation と destination authorization を再確認する。後から thread に参加した user に
+immutable な `startedBy` を使ってはならない。Model が与えられるのは reply text のような狭い content
+だけで、token、workspace、actor、channel、thread timestamp、Web API method 名、任意 URL は入力させない。
+Tool closure がそれらを固定する。Output の size と shape を検証し、必要最小限の provider identifier
+だけを返し、Slack call の前に application idempotency key を適用する。
 
 Native Web API behavior、`429` response、`Retry-After` は
 [fetch で Web API を呼ぶ](../worker-backend/web-api-with-fetch.mdx)と

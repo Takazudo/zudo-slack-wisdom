@@ -20,15 +20,17 @@ review the changelog before upgrading any `@flue/*` package.
 When Flue sources disagree, use this order. Every source in one decision must match the package
 version being documented.
 
-1. **Installed `flue docs`.** The CLI reads documentation bundled with the installed version and
-   makes no network request; see the official [`flue docs` reference](https://flueframework.com/docs/cli/docs/).
-2. **Matching tagged changelog and runtime contracts.** Breaking-change records and executable
+1. **Matching tagged changelog and runtime contracts.** Breaking-change records and executable
    types/validation resolve version-sensitive API questions. Start with the
    [v2.0.3 changelog](https://github.com/withastro/flue/blob/v2.0.3/CHANGELOG.md) and tagged
    [`dispatch` contract](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/src/runtime/dispatch.ts).
-3. **Tagged runnable examples.** Use the example at the same tag to confirm how the contracts fit
+2. **Tagged runnable examples.** Use the example at the same tag to confirm how the contracts fit
    together, especially the [Cloudflare example](https://github.com/withastro/flue/tree/v2.0.3/examples/cloudflare)
    and [Slack channel example](https://github.com/withastro/flue/tree/v2.0.3/examples/slack-channel).
+3. **Installed `flue docs`.** The CLI reads version-matched bundled prose without a network request;
+   see the official [`flue docs` reference](https://flueframework.com/docs/cli/docs/). Use it for
+   discovery, but still reconcile executable snippets because bundled 2.0.3 prose contains the
+   Cloudflare discrepancy recorded below.
 4. **Live prose.** The website is useful for discovery, but it may move ahead of or drift within a
    release. Never let an unversioned snippet overrule a matching tagged contract.
 

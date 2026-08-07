@@ -50,8 +50,10 @@ Suite では次のすべての境界を証明する。
 [リクエストを検証する](../worker-backend/verifying-requests.mdx)、
 [3 秒以内の ack](../worker-backend/three-second-ack.mdx)、
 [Workers 上の Events API](../events/events-api-on-workers.mdx)が、これらの test が守る transport behavior
-を定義する。Channel test では controllable な未完了 dispatch promise より前に acknowledgement が
-生成されることを確認し、その後 execution context を drain して deferred result を確認する。
+を定義する。Channel test では controllable な `dispatch()` admission promise を未解決のまま保持し、
+acknowledgement がまだ返らないことを確認する。Durable admission を resolve すると prompt な `200`
+が返り、別の未解決な model/effect promise はそれを遅らせないことを確認する。Admission が reject された
+場合は、Slack の retry を抑止する success を route が返してはならない。
 
 ## Dedupe と external effect は別の test
 
@@ -127,7 +129,11 @@ Scheduled turn の overlap 可否に応じて conversation identity を選ぶ。
 Application idempotency key には handler 開始時の wall clock ではなく scheduled fire time を使う。
 これにより別の fire をまとめず、同じ fire の repeated delivery を収束できる。
 
-```typescript
+Flue の Cloudflare target は `src/cloudflare.ts` の default export を generated Worker に merge する。
+Handler はそこに置き、Cron Trigger は application-owned Wrangler configuration へ明示的に設定する。
+この guide の function だけから filename や schedule が推論されることはない。
+
+```typescript title="src/cloudflare.ts"
 import { dispatch } from "@flue/runtime";
 import { ScheduledAssistant } from "./agents/scheduled-assistant.ts";
 
@@ -149,6 +155,7 @@ export default {
         message: {
           kind: "signal",
           type: "schedule.daily_summary",
+          body: "Generate the authorized daily summary.",
           attributes: { scheduledFor: fire },
         },
       }),
@@ -156,6 +163,17 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 ```
+
+```jsonc title="wrangler.jsonc"
+{
+  "triggers": {
+    "crons": ["0 9 * * *"]
+  }
+}
+```
+
+Cron expression は UTC である。Example schedule は application の選択として扱い、target environment
+向けに review し、handler invocation とは別に deployment configuration を test する。
 
 `scheduled()` handler は thin に保つ。Fire identity を導出・検証し、enqueue/dispatch して return する。
 複雑な reminder には recurrence rule、time zone、cancellation、recipient authorization、effect status、

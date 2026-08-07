@@ -81,12 +81,12 @@ await dispatch(SupportTriage, {
 |---|---|---|
 | Conversation/instance ID | caller が選ぶ安定した address | tenant 単位の case、channel thread |
 | `initialData` | 作成時に validation され一度記録される immutable な値 | tenant と case の identity |
-| Signal attributes | 1 delivery 上の data | 検証済み event ID と認可済み tenant |
+| Signal attributes | delivery ごとの metadata。trust は ingress に依存 | server-authored dispatch 上の検証済み event ID と現在の actor |
 | Persistent state | 1 conversation の durable で名前を持つ state | 小さな agent 所有の進捗や gate |
 | Canonical record | application 所有の database または service | 業務上の truth、ownership、OAuth、audit |
 | File/sandbox | 選択した実装に依存 | contract が durable な場合だけ artifact |
 
-`initialData` は mutable metadata ではない。既存の conversation に渡す後続の値は無視される。`useInitialData()` で読み、現在の delivery は `useDelivery()` で読む。attributes は検証済み context であり、model による authorization ではない。
+`initialData` は mutable metadata ではない。既存の conversation に渡す後続の値は無視される。`useInitialData()` で読み、現在の delivery は `useDelivery()` で読む。Server-authored dispatch の attributes には application が検証済みの context を入れられる。一方、直接 mount した client route から届く attributes は caller input であるため、validation と authorization を行い、Flue の shape validation を真正性と取り違えてはならない。どちらも model による authorization ではない。
 
 conversation history と persistent agent state は framework state であり、canonical application database ではない。業務 fact は narrow な application tool と stable idempotency key を通じて保存する。conversation や Durable Object から durable filesystem を推論してはいけない。Cloudflare では Durable Object storage は残っても、通常の JavaScript instance field は eviction で消える。sandbox file には別の contract がある。
 

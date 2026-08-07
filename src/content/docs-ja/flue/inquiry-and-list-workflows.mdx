@@ -20,7 +20,7 @@ source になるわけではない。schema、authorization policy、運用 runb
 
 この分離により、case を削除せず conversation を trim でき、business truth を変えず Slack message や List を
 再作成でき、Slack outage を intake 消失ではなく partial failure として報告できる。Flue の基本 boundary は
-[コアコンセプトと API](./core-concepts-and-api.mdx#data-boundaries)、verified ingress、迅速な acknowledge、
+[コアコンセプトと API](./core-concepts-and-api.mdx#data-の境界)、verified ingress、迅速な acknowledge、
 destination-bound tool は [Slack リクエストの処理](./slack-request-handling.mdx)を参照する。
 
 ## Canonical Inquiry Contract
@@ -162,10 +162,12 @@ schema fingerprint を保存し、いずれかが drift したら fail closed �
 sync health、destination 全体の rate-limit cooldown は別々の state にする。schema が healthy でも cooldown を消したり
 inactive な projection を authorize したりしてはならない。
 
-create では local mapping に加え、専用 remote field に versioned で opaque な ownership marker を保存する。この
-identity により、response または local write を失った accepted create を reconciliation で回復できる。削除するのは
-positively owned と確認できた row だけである。承認済みの人間が projection を edit できる場合は、last local write の
-hash に頼らず、normalized した remote cell と desired state を比較する。
+create では local mapping に加え、専用 remote field に versioned ownership marker を保存する。Authenticated marker
+を tenant、List、inquiry identity に bind するか、adoption / deletion の前に canonical server-side evidence と照合する。
+編集可能な remote cell だけでは ownership の証明にならない。この identity により、response または local write を
+失った accepted create を reconciliation で回復できる。コピー、forge、invalid-version の marker は quarantine し、
+削除するのは positively owned と検証できた row だけにする。承認済みの人間が projection を edit できる場合は、last
+local write の hash に頼らず、normalized した remote cell と desired state を比較する。
 
 active と archived の inventory は別々に reconcile する。`active`、`archived`、`missing_once`、
 `confirmed_missing`、`duplicate`、`foreign`、`owned_unmapped` を別の outcome として model 化する。active な desired

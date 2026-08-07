@@ -39,6 +39,7 @@ Declare platform settings, application-owned bindings, and the ordered migration
   "name": "support-agent",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  "ai": { "binding": "AI" },
   "migrations": [
     {
       "tag": "v1",
@@ -50,6 +51,10 @@ Declare platform settings, application-owned bindings, and the ordered migration
   }
 }
 ```
+
+The `cloudflare/...` model selected in the agent example requires that Workers AI binding. Flue's
+generated configuration does not create application provider bindings for you; declare the binding
+or configure another reviewed model provider and its server-side credential.
 
 Migration history is ordered and append-only. Add a migration when adding, renaming, or removing a deployed generated class; use Wrangler's `new_sqlite_classes`, `renamed_classes`, or `deleted_classes` as appropriate. Changing an `app.ts` route path is not a storage migration.
 
