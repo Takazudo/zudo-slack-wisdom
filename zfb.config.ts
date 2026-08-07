@@ -75,6 +75,11 @@ export default defineConfig(
         categoryMatch: "worker-backend",
       },
       {
+        label: "Flue",
+        path: "/docs/flue",
+        categoryMatch: "flue",
+      },
+      {
         label: "Messaging",
         path: "/docs/messaging",
         categoryMatch: "messaging",
