@@ -1,0 +1,113 @@
+---
+title: Source Map and Versioning
+description: The Flue 2.0.3 evidence hierarchy, package checks, breaking changes, and known source drift
+sidebar_position: 2
+---
+
+## Verified Baseline
+
+**Verified 2026-08-08.** This section targets **Flue 2.0.3** and **Node.js `>=22.19.0`**.
+The release is recorded in the tagged [2.0.3 changelog](https://github.com/withastro/flue/blob/v2.0.3/CHANGELOG.md#203---2026-08-04),
+and the Node.js floor appears in each tagged package manifest, including
+[`@flue/runtime`](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/package.json)
+and [`@flue/cli`](https://github.com/withastro/flue/blob/v2.0.3/packages/cli/package.json).
+
+This is a versioned snapshot, not a claim about every future `latest`. Re-run the checks below and
+review the changelog before upgrading any `@flue/*` package.
+
+## Authority Order
+
+When Flue sources disagree, use this order. Every source in one decision must match the package
+version being documented.
+
+1. **Matching tagged changelog and runtime contracts.** Breaking-change records and executable
+   types/validation resolve version-sensitive API questions. Start with the
+   [v2.0.3 changelog](https://github.com/withastro/flue/blob/v2.0.3/CHANGELOG.md) and tagged
+   [`dispatch` contract](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/src/runtime/dispatch.ts).
+2. **Tagged runnable examples.** Use the example at the same tag to confirm how the contracts fit
+   together, especially the [Cloudflare example](https://github.com/withastro/flue/tree/v2.0.3/examples/cloudflare)
+   and [Slack channel example](https://github.com/withastro/flue/tree/v2.0.3/examples/slack-channel).
+3. **Installed `flue docs`.** The CLI reads version-matched bundled prose without a network request;
+   see the official [`flue docs` reference](https://flueframework.com/docs/cli/docs/). Use it for
+   discovery, but still reconcile executable snippets because bundled 2.0.3 prose contains the
+   Cloudflare discrepancy recorded below.
+4. **Live prose.** The website is useful for discovery, but it may move ahead of or drift within a
+   release. Never let an unversioned snippet overrule a matching tagged contract.
+
+:::note[Reconciliation rule]
+Do not copy a version-sensitive snippet from one page. Reconcile it against the matching tagged
+changelog, runtime types or validation, and runnable tagged example; record any unresolved mismatch
+as unverified behavior.
+:::
+
+## Package and Engine Checks
+
+Run the installed CLI first, then query the exact registry versions rather than an unqualified
+`latest` tag:
+
+```sh
+flue --version
+flue docs search "Cloudflare Vite"
+flue docs read reference/configuration
+npm view @flue/runtime@2.0.3 version engines --json
+npm view @flue/cli@2.0.3 version engines --json
+npm view @flue/vite@2.0.3 version engines --json
+npm view @flue/slack@2.0.3 version engines --json
+```
+
+The registry checks returned the following on 2026-08-08:
+
+| Package | Exact version | Node.js engine | Primary metadata |
+|---|---|---|---|
+| `@flue/runtime` | `2.0.3` | `>=22.19.0` | [registry](https://registry.npmjs.org/@flue%2Fruntime/2.0.3), [tagged manifest](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/package.json) |
+| `@flue/cli` | `2.0.3` | `>=22.19.0` | [registry](https://registry.npmjs.org/@flue%2Fcli/2.0.3), [tagged manifest](https://github.com/withastro/flue/blob/v2.0.3/packages/cli/package.json) |
+| `@flue/vite` | `2.0.3` | `>=22.19.0` | [registry](https://registry.npmjs.org/@flue%2Fvite/2.0.3), [tagged manifest](https://github.com/withastro/flue/blob/v2.0.3/packages/vite/package.json) |
+| `@flue/slack` | `2.0.3` | `>=22.19.0` | [registry](https://registry.npmjs.org/@flue%2Fslack/2.0.3), [tagged manifest](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/package.json) |
+
+Keep these packages on one reviewed Flue release unless the changelog explicitly documents a safe
+mixed-version arrangement. Package metadata proves what was published; it does not prove that an
+application's lockfile installed the same versions, so inspect the lockfile too.
+
+## Flue 2 Contract Changes
+
+Flue 2 is a Vite-based application model. The 2.0.0 changelog makes these breaking changes explicit:
+
+- `flue()` from `@flue/vite` participates in Vite; removed `flue dev` and `flue build` commands are
+  replaced by Vite's commands.
+- `app.ts` is the explicit route map. File location no longer creates HTTP routes automatically.
+- A module beginning with `'use agent'` registers its **capitalized exported agent functions**;
+  `defineAgent` is removed.
+- The older built-in workflow abstraction, including `defineWorkflow`, is removed. Conversations
+  remain the durable framework unit; orchestration outside that unit belongs in application code or
+  an external workflow engine.
+
+All four claims come from the tagged
+[Flue 2.0.0 breaking changes](https://github.com/withastro/flue/blob/v2.0.3/CHANGELOG.md#200---2026-07-31).
+Do not present beta-era APIs or automatic routing as current behavior.
+
+## Known v2.0.3 Source Drift
+
+:::warning[Cloudflare Vite snippet]
+The [tagged Cloudflare deployment prose](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/ecosystem/deploy/cloudflare.md#L28-L39)
+shows `plugins: [flue(), cloudflare()]` and omits `flueWorkerConfig()`. That form conflicts with the same release's
+[configuration contract](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/reference/configuration.md#flueworkerconfig),
+[2.0.0 changelog](https://github.com/withastro/flue/blob/v2.0.3/CHANGELOG.md#200---2026-07-31),
+and [runnable Cloudflare example](https://github.com/withastro/flue/blob/v2.0.3/examples/cloudflare/vite.config.ts),
+which require `flue()` first and `cloudflare({ config: flueWorkerConfig() })` second. Use the latter
+form for 2.0.3.
+:::
+
+:::warning[Slack delivery dedupe]
+The tagged Slack blueprint's
+[`dispatch(...)` example](https://github.com/withastro/flue/blob/v2.0.3/blueprints/channel--slack.md)
+records `payload.event_id` as a signal attribute but omits `idempotencyKey`. The tagged
+[runtime admission contract](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/src/runtime/agent-submissions.ts)
+supports a caller-chosen `idempotencyKey`, and the tagged
+[`@flue/slack` contract](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/README.md)
+recommends `idempotencyKey: payload.event_id` so an Events API redelivery converges on the original
+admission. Follow the runtime/channel contract; do not silently copy the blueprint omission.
+:::
+
+These discrepancies are verified source differences, not evidence that either behavior was tested
+against a deployed application here. The later technical guides must preserve that distinction and
+link back to this baseline when showing version-sensitive code.

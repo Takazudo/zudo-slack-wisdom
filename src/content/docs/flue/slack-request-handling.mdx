@@ -1,0 +1,249 @@
+---
+title: Slack Request Handling
+description: Secure Flue 2.0.3 Slack ingress, tenant-aware thread identity, retry convergence, and destination-bound tools
+sidebar_position: 5
+---
+
+## The Channel Boundary
+
+`flue add channel slack` fetches a live-registry Markdown blueprint for a coding agent; it is not a
+package installer. Use `--print` or the documented agent-piping workflow, review the fetched guide,
+and apply its code and package changes through normal project tooling. Because the registry can move,
+reconcile that guide with the tagged [2.0.3 `flue add` contract](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/cli/add.md)
+and channel sources before adopting version-sensitive snippets. In Flue 2.0.3,
+[`@flue/slack`](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/README.md)
+owns authenticated inbound HTTP: it verifies Slack requests, parses the provider-native payload, and
+routes Events API, interaction, and slash-command deliveries to configured callbacks. It is
+stateless and does not send messages to Slack. The application owns outbound calls through Slack's
+official `@slack/web-api` client, including token selection, authorization, rate-limit handling, and
+the design of any model tool.
+
+This split does not make a verified request authorized to use the agent. Before dispatch, application
+code must allow the Slack app id, enterprise or workspace installation, actor, channel, event or
+action type, and requested business operation. Before every outbound effect, it must authorize the
+same installation and bind the permitted destination server-side.
+
+## Mount Only the Surfaces You Use
+
+Flue 2 uses `app.ts` as an explicit route map. A channel serves no HTTP traffic until its router is
+mounted. Within that router, Events API, interaction, and command routes exist only when the matching
+callback is configured; `createSlackChannel()` requires at least one callback. This behavior is part
+of the tagged
+[`createSlackChannel` contract](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/src/index.ts).
+
+```typescript
+// app.ts
+import { Hono } from "hono";
+import { channel as slack } from "./channels/slack.ts";
+
+const app = new Hono();
+app.route("/channels/slack", slack.route());
+
+export default app;
+```
+
+With that mount, configure Slack with only the callback URLs the application needs:
+
+- `POST /channels/slack/events` exists when `events` is configured.
+- `POST /channels/slack/interactions` exists when `interactions` is configured.
+- `POST /channels/slack/commands` exists when `commands` is configured.
+
+Omitting a surface is preferable to mounting a callback that accepts and ignores it. Test omitted
+routes as `404`, and keep Slack's app configuration aligned with the deployed route set.
+
+## Verification and Acknowledgement
+
+`@flue/slack` reads the exact request bytes, enforces its body limit, validates
+`X-Slack-Request-Timestamp` within five minutes, and verifies `X-Slack-Signature` before it parses
+JSON or form data. URL verification is also handled internally after authentication. Do not place a
+body parser, normalization middleware, or a second handler in front of the mounted router that
+consumes or rewrites the body.
+
+The protocol details and standalone Worker implementation live in
+[Verifying Requests](../worker-backend/verifying-requests.mdx). Keep that raw-byte-before-parse
+ordering even if the channel package is later replaced or wrapped.
+
+Slack expects a prompt acknowledgement; model calls and other substantial work must not delay the
+response. Await `dispatch()` only until Flue durably admits the input, then let the callback return an
+empty `200`; admission does not wait for model execution. If admission fails, surface the callback
+failure so Slack can retry the same `event_id`. If admission cannot reliably finish inside Slack's
+window, durably enqueue the delivery in application storage before acknowledging and dispatch it from
+that recovery path. Do not place the only admission attempt in `waitUntil()` after returning `200`.
+See [Three-Second Ack](../worker-backend/three-second-ack.mdx) for the response window and
+[Events API on Workers](../events/events-api-on-workers.mdx) for retry mechanics.
+
+## Events: Authorize, Filter, Identify, Dispatch
+
+The following is an application pattern, not a drop-in authorization policy. It corrects the known
+blueprint/runtime discrepancy recorded in
+[Source Map and Versioning](./source-map-and-versioning.mdx): every Events API dispatch supplies
+`payload.event_id` as `idempotencyKey`.
+
+```typescript
+import { dispatch } from "@flue/runtime";
+import { createSlackChannel, type SlackEvent } from "@flue/slack";
+import { Assistant } from "../agents/assistant.ts";
+
+const allowedMessageSubtypes = new Set([undefined, "thread_broadcast"]);
+
+function shouldIgnoreMessage(event: SlackEvent, botUserId: string): boolean {
+  if (event.type !== "message" && event.type !== "app_mention") return false;
+  const message = event as SlackEvent & {
+    bot_id?: string;
+    subtype?: string;
+    user?: string;
+  };
+  return (
+    message.bot_id !== undefined ||
+    message.user === botUserId ||
+    !allowedMessageSubtypes.has(message.subtype)
+  );
+}
+
+function tenantKey(enterpriseId: string | null, workspaceId: string): string {
+  return enterpriseId
+    ? `enterprise:${enterpriseId}:workspace:${workspaceId}`
+    : `workspace:${workspaceId}`;
+}
+
+export const channel = createSlackChannel({
+  signingSecret: process.env.SLACK_SIGNING_SECRET!,
+
+  async events({ payload }) {
+    if (payload.type !== "event_callback") return;
+    const enterpriseId = payload.context_enterprise_id ?? payload.enterprise_id ?? null;
+    const workspaceId = payload.context_team_id ?? payload.team_id;
+    const installation = authorizeInstallation({
+      appId: payload.api_app_id,
+      enterpriseId,
+      workspaceId,
+    });
+    if (!installation) return;
+    if (payload.event.type !== "app_mention") return;
+    if (shouldIgnoreMessage(payload.event, installation.botUserId)) return;
+
+    const event = payload.event;
+    const actor = resolveAuthorizedActor(installation, event.user);
+    if (!actor) return;
+    if (!isAllowedChannel(installation, event.channel)) return;
+
+    const rootThreadTs = event.thread_ts ?? event.ts;
+    const thread = {
+      teamId: tenantKey(enterpriseId, workspaceId),
+      channelId: event.channel,
+      threadTs: rootThreadTs,
+    };
+
+    try {
+      await dispatch(Assistant, {
+        id: channel.instanceId(thread),
+        idempotencyKey: payload.event_id,
+        initialData: {
+          enterpriseId,
+          workspaceId,
+          channelId: event.channel,
+          rootThreadTs,
+          startedBy: actor.principalId,
+          startedAt: new Date(Number(event.ts) * 1000).toISOString(),
+        },
+        message: {
+          kind: "signal",
+          type: "slack.app_mention",
+          body: event.text,
+          attributes: {
+            eventId: payload.event_id,
+            actorPrincipalId: actor.principalId,
+          },
+        },
+      });
+    } catch (error: unknown) {
+      recordDispatchFailure(error, payload.event_id);
+      throw error;
+    }
+  },
+});
+```
+
+For a `message` subscription, choose allowed subtypes deliberately. `bot_message`,
+`message_changed`, `message_deleted`, channel join/leave notices, and other subtype-specific events
+must not fall through as ordinary user prompts unless the product explicitly handles them. Also
+reject `bot_id` and the app's own bot user id. These checks prevent the agent's reply from returning
+through Events API and starting a feedback loop.
+
+The instance id includes a namespaced enterprise-plus-workspace identity when an enterprise is
+present, otherwise the workspace identity, followed by channel and root thread timestamp. The
+`teamId` property name is imposed by the v2.0.3 helper; the value above is an application tenant key.
+Including both enterprise and workspace avoids merging distinct workspace installations inside one
+Grid organization. An instance id selects a conversation; it never grants access to it.
+
+`initialData` contains immutable creation facts. Define the agent's static `initialData` schema so
+Flue validates these fields when the instance is created, and read the parsed value with
+`useInitialData()`. Repeated dispatches may pass the same creation facts, but Flue ignores them after
+creation. `startedBy` therefore records only the conversation creator. Every server-authored signal
+also carries the current verified `actorPrincipalId`; read it from `useDelivery()` and reauthorize that
+principal for the requested operation. `eventId` remains correlation metadata. Neither location is an
+authorization store, and a directly mounted client route must not be allowed to forge trusted
+attributes.
+
+## Three Different Dedupe Boundaries
+
+Events API envelopes provide `event_id`. In Flue 2.0.3, an idempotency-keyed dispatch derives the
+same submission identity for the same agent, instance, and caller key, so Slack redelivery converges
+on the original admission. The tagged Slack blueprint records `event_id` only as an attribute and
+omits the key; follow the runtime and package contract shown above.
+
+Interactions do not have the Events envelope's globally unique `event_id`. For a consequential
+button or modal action, put an application business-operation id in the component `value`, authorize
+the tenant and actor, and make the durable state transition conditional (for example, pending to
+approved exactly once). A scoped `action_ts` can help correlate diagnostics, but Slack does not
+document it as a universal idempotency key across every interaction family.
+
+Slash commands also lack `event_id`, and two identical commands from the same actor may be two
+intentional invocations. Do not collapse them by hashing command text. When a command requests a
+repeat-sensitive effect, require or resolve a durable application operation id and enforce uniqueness
+at the business-state boundary. If there is no stable operation identity, treat the handler as
+at-least-once and make each external effect safely retryable.
+
+:::danger[Short-lived capabilities are not identity]
+Interaction and command payloads can contain the short-lived `trigger_id` and `response_url`
+capabilities. Use them only in immediate, trusted request handling. Never use them as an instance id
+or dedupe key, and never place them in dispatched messages, model input, durable history, logs,
+traces, fixtures, or long-lived tool state. The same rule applies to entries in a view's
+`response_urls` array.
+:::
+
+Flue admission convergence is only the first boundary. It prevents a repeated Events delivery from
+starting a second submission; it does not make a tool call, database mutation, Slack post, or retry
+inside the admitted turn idempotent. Give each external effect an application key such as
+`event_id + effect_name + destination`, claim it atomically in durable storage, and record the
+provider result before treating the effect as complete. Design recovery for the ambiguous case where
+the remote call succeeded but recording its result failed.
+
+## Destination-Bound Outbound Tools
+
+Construct tools from validated `initialData`, the current server-authored delivery attributes, and an
+authorized installation record. Resolve the delivery's `actorPrincipalId` to a current application
+principal and recheck that actor's operation and destination authorization inside `run`; never fall
+back to immutable `startedBy` for later thread participants. The model may supply narrow content such
+as reply text, but not a token, workspace, actor, channel, thread timestamp, Web API method name, or
+arbitrary URL. The tool closure binds those values. Validate output size and shape, return only the
+minimum provider identifiers, and apply an application idempotency key before calling Slack.
+
+Native Web API behavior, `429` responses, and `Retry-After` handling are covered by
+[Web API with fetch](../worker-backend/web-api-with-fetch.mdx) and
+[Rate Limits](../messaging/rate-limits.mdx). Those rules still apply when the official
+`@slack/web-api` client performs the request.
+
+## Application Security Responsibilities
+
+- Request only the event and Web API scopes the implemented paths require. Re-review scopes whenever
+  a tool is added; see [Tokens, Scopes & OAuth](../getting-started/tokens-scopes-oauth.mdx).
+- Keep installation records and token rotation/revocation lifecycle in application-owned storage.
+  Select a token only after resolving the authorized enterprise/workspace installation.
+- Decide explicitly whether private-channel content or personally identifiable information may enter
+  agent history or model input. Default to denial, minimize retained content, and honor deletion and
+  retention policy.
+- Authorize the human or bot actor for the requested operation. Slack signature verification proves
+  delivery authenticity, not that an actor may approve, disclose, or mutate a business record.
+- Use [Interactivity Payloads](../events/interactivity-payloads.mdx) for payload and acknowledgement
+  mechanics, while keeping its transient callback fields outside the durable agent boundary.

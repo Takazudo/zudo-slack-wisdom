@@ -1,0 +1,312 @@
+---
+title: Proposed Text and Calendar Tools
+description: Future, least-privilege contracts for remote text and calendar automation from Flue agents
+sidebar_position: 8
+---
+
+:::danger[Proposal only: no such Flue API exists]
+Every endpoint, field, error code, and tool name on this page is an **illustrative contract for future
+application work**. Flue 2.0.3 does not provide a remote-text or calendar automation service, and
+none of the names below are callable until an application implements and reviews them.
+:::
+
+## Keep Replication and Automation Separate
+
+An encrypted synchronization transport can replicate opaque blobs without understanding a title,
+document, event, recurrence, or reminder. That surface must stay low-level. A Slack app or Flue
+agent cannot safely query calendar meaning through it, and must never receive a general vault or
+decryption key.
+
+A future automation surface requires separate, explicit consent and one of two designs:
+
+- a least-privilege authenticated plaintext API that returns only fields required for the approved
+  operation; or
+- a separately consented, privacy-filtered projection or index built for automation.
+
+This is a second security boundary, not a convenient view over the sync transport. Record which
+collections may enter the projection, minimize retention, propagate revocation and deletion, and
+make projection lag visible. A projection must not silently broaden access when a user adds a new
+vault, document tree, or calendar.
+
+## Authorize the Application, Then Constrain the Tool
+
+Bind each automation token to one tenant or Slack workspace and an allowlisted resource collection.
+Grant granular scopes such as `documents:read`, `documents:write`, or `calendar:read`; make
+read-only installation the default and omit unused scopes. Tokens are non-delegating: they cannot
+mint, exchange, or select sibling tokens. Resolve the credential from verified application context,
+rotate and revoke it in application-owned storage, and never place it in model input or tool state.
+
+The external adapter must independently authorize every call. Model intent, a verified Slack
+request, a conversation id, or possession of a stable resource id is not authorization. Recheck the
+tenant, installation, actor, operation, scope, collection, and current resource policy at execution
+time. Return the same non-enumerating denial for an absent resource and a resource outside the
+authorized collection.
+
+Tool inputs contain only stable domain ids and operation-specific values. They do not accept a
+token, tenant, collection, mutable title, list position, provider method, hostname, or arbitrary
+destination URL. The adapter binds the destination and credential server-side. This follows the
+same destination-bound rule as [Slack Request Handling](./slack-request-handling.mdx): a model-callable
+tool is a capability offered by the application, not an authorization boundary.
+
+## Shared Reliability Envelope
+
+All future text and calendar operations should return a small typed envelope. A success contains a
+generated `requestId`, the stable resource id, the authoritative version or ETag when the resource
+has one, and server timestamps. A mutation acknowledgement is success only after the canonical
+content, version, and change-log entry are durably committed atomically. Admission to a local queue
+or outbox is not a successful remote mutation.
+
+A failure contains a stable `code`, `requestId`, human-safe summary, `retryable` boolean, and
+`retryAfter` when applicable. Define at least authorization denial, validation failure, not found,
+version conflict, idempotency conflict, cursor expired or invalid, rate limited, upstream timeout,
+uncertain storage, and unavailable. Do not expose secrets or private content in error details.
+
+- Validation and ordinary authorization failures are non-retryable `4xx` outcomes.
+- A stale expected version is a typed conflict containing only current safe metadata and the current
+  version; it never silently applies last-write-wins.
+- `429` carries a bounded server-provided retry delay. Retryable `5xx`, network timeouts, and
+  uncertain storage use bounded exponential backoff with jitter.
+- A timeout after an external write may have an unknown outcome. Recover through the idempotency
+  record or a status lookup; do not immediately invent a new key and repeat the effect.
+- A multi-resource operation reports per-item outcomes and an overall `partial` status. It never
+  reports blanket success when some items failed.
+
+If an optional durable outbox is used, persist the command and its application-level idempotency key
+before network access, survive process restarts, and retain an attempt history. Do not coalesce
+commands merely because they target the same document or event: two edits or an edit followed by a
+delete are semantically distinct.
+
+## Illustrative Future Text Contract
+
+:::warning[Proposed names, not implemented endpoints]
+Names such as `GET /automation/v1/documents/{documentId}`, `list_documents`, and
+`commit_document_change` below are design examples only. They are not Flue routes, SDK methods, or
+evidence of a deployed service.
+:::
+
+### Identity, paths, and reads
+
+Assign every document an immutable, opaque `documentId` independent of its title and path. Rename or
+move operations preserve that id. References between tools and persisted operations use the id, not
+a search result position or mutable title.
+
+A proposed `GET /automation/v1/documents/{documentId}` or `read_document` returns the authorized
+projection plus `documentId`, canonical path when permitted, version or ETag, `createdAt`,
+`updatedAt`, and deletion state. It returns only the content or excerpt needed by the operation, with
+an explicit size cap; reading a document must not disclose an entire collection.
+
+When an API accepts a path or prefix, the server computes one documented canonical form before
+authorization and lookup. Require a rooted, length-bounded path in the collection's defined Unicode
+normalization, normalize separators consistently, and reject NUL/control characters, backslashes
+when `/` is canonical, empty interior segments, `.` or `..`, encoded traversal, and any decoded form
+that escapes the authorized root. Do not use normalization to turn an invalid path into a different
+valid resource, and do not treat a path as an authorization credential.
+
+### Bounded listing and change cursors
+
+A proposed `GET /automation/v1/documents?prefix=...&limit=...&after=...` or `list_documents` performs
+a bounded prefix listing. Clamp the prefix length and page size. Prefer a server-issued opaque keyset
+cursor over an immutable ordering key such as `documentId`. If product requirements demand path
+ordering, freeze canonical path plus `documentId` inside a stable snapshot and reconcile later moves
+from its change anchor; a live mutable path is not a safe checkpoint. Never use an offset or
+model-visible list index as identity.
+
+Define snapshot behavior explicitly. A bootstrap either reads from a stable snapshot, or returns a
+snapshot/change anchor that lets the client reconcile inserts made while pages were read. Every page
+has a maximum size and a terminal marker. Cursors are tenant-, collection-, filter-, and query-bound,
+authenticated, and short-lived enough for policy. Reusing one with different filters fails closed.
+
+An optional proposed `GET /automation/v1/document-changes?cursor=...` returns bounded ordered
+upserts and tombstones. An expired or invalid cursor produces typed `CURSOR_EXPIRED` or
+`CURSOR_INVALID`, never an empty page that looks current. Recovery is a documented bounded bootstrap
+followed by changes from its new anchor; clients discard neither known state nor tombstones until
+that bootstrap completes.
+
+### Create, update, and delete
+
+Text writes require `documents:write`, a stable application operation id, preview, and explicit
+human confirmation for the exact authorized tenant, document, base version, and summarized change.
+Broad edits and deletion require a stronger confirmation policy. Confirmation expires and cannot be
+replayed for a different body, version, resource, or destination.
+
+Illustrative future operations are:
+
+- `POST /automation/v1/documents` creates a document under an authorized collection and returns its
+  stable id, canonical path, version or ETag, and authoritative timestamps.
+- `PATCH /automation/v1/documents/{documentId}` updates a stable id and requires `If-Match` or an
+  equivalent `expectedVersion`. It must not create a missing document implicitly.
+- `DELETE /automation/v1/documents/{documentId}` also requires the expected version and records a
+  versioned tombstone. Purge, if supported at all, is a separate highly privileged lifecycle action.
+
+Every mutation requires an `Idempotency-Key` whose uniqueness is scoped to the tenant, collection,
+operation class, and caller. Persist the key atomically with a canonical request fingerprint and the
+authoritative result. Repeating the same key and fingerprint returns that result, including its
+original ids and timestamps; the same key with a different method, target, expected version, or body
+returns typed `IDEMPOTENCY_CONFLICT`. Retain records for at least the documented retry and recovery
+window.
+
+The tool layer can expose proposed steps such as `preview_document_change` and
+`commit_document_change`, but the commit tool accepts the stable preview/operation id rather than
+free-form routing data. It rechecks authorization, fingerprint, expected version, and confirmation
+immediately before the adapter writes.
+
+## Illustrative Future Calendar Contract
+
+:::warning[Read-only proposal; no calendar service is supplied]
+Names such as `GET /automation/v1/calendar-occurrences` and `list_calendar_changes` are
+illustrative future application contracts. Calendar access defaults to `calendar:read`. This page
+does not define or imply an existing Flue calendar API or a calendar mutation tool.
+:::
+
+### Query interval and event kinds
+
+A bounded occurrence query requires `from`, `to`, and an IANA time-zone name. `from` is inclusive;
+`to` is exclusive. Enforce `from < to`, cap the query span and page size, and reject fixed-offset
+abbreviations such as `PST` where an IANA zone is required. Interpret overlap as
+`eventStart < to && eventEnd > from`; for a zero-duration instant, include it when
+`from <= eventStart && eventStart < to`.
+
+Use distinct tagged timing shapes rather than guessing from strings:
+
+- an all-day occurrence has an inclusive local `startDate`, an exclusive local `endDate`, and the
+  calendar's IANA zone; it remains a date span rather than midnight instants;
+- a timed occurrence has absolute `startDateTime` and `endDateTime` instants plus its IANA zone; and
+- an unscheduled item has no event interval and appears only when the explicit unscheduled filter is
+  enabled. Return unscheduled items in a separate page stream, or define a leading scheduled/unscheduled
+  bucket plus a fixed null ordering so interval-less rows never rely on undefined start/end values.
+
+Within the scheduled bucket, order deterministically by effective start, effective end, stable
+`eventId`, and stable `instanceId`. In a combined stream, put the explicit bucket discriminator first
+and give the unscheduled bucket its own stable id ordering. Apply the documented tuple to keyset
+pagination. Require explicit `includeDone`, `includeArchived`, and `includeUnscheduled` filters; safe
+defaults are all `false`. Bind cursors to the interval, zone, filters, tenant, and collection.
+
+### Privacy-minimal event projection
+
+Return only fields the bot needs: stable `eventId`, stable recurrence `instanceId` when applicable,
+a minimal display label or privacy-preserving busy label, the tagged timing shape, normalized
+status, version, and source/schedule provenance. Location, description, document body, attendees,
+organizer details, conferencing links, and reminder recipients are omitted unless a separately
+approved operation requires a specific field.
+
+Event timing and reminder or notification timing are different facts. Represent reminders in a
+separate optional array with their own stable ids, trigger instants or offsets, status, and
+provenance. A derived reminder time never replaces the event's primary start or end. Source and
+schedule provenance identifies whether a time came from the source event, a recurrence rule, an
+override, a reminder policy, or a notification delivery record.
+
+### Recurrence, daylight saving, and removal
+
+A recurring series retains one stable `eventId`. Each expanded occurrence has a stable
+`instanceId` based on the series and its original scheduled occurrence identity, not its current
+title, list position, or moved start time. An exception that moves an occurrence therefore keeps its
+instance identity while exposing original and effective timing. Never infer identity by array index.
+
+Bound recurrence expansion by query span, maximum generated occurrences, computation budget, and
+page size. If the bound is reached, return a typed truncation/error contract with a continuation,
+not silent omission. Preserve the source calendar's declared semantics for local wall-clock versus
+absolute recurrence. Resolve daylight-saving gaps and folds with the source rule and IANA zone,
+return the chosen absolute instant and offset, and keep all-day values as dates. Do not manufacture a
+fixed 24-hour duration for an all-day or wall-clock occurrence across a transition.
+
+Represent a cancelled recurrence instance as a tombstone/status tied to its stable `instanceId`.
+Represent a deleted standalone event or series with a versioned tombstone tied to `eventId`; series
+deletion also invalidates or tombstones its instances according to a documented rule. Do not silently
+drop cancellation or deletion from a change feed, because a consumer would retain stale state.
+
+### Calendar changes and recovery
+
+A proposed `GET /automation/v1/calendar-changes?cursor=...` or `list_calendar_changes` returns
+bounded, ordered projection upserts, cancellations, and tombstones. Its opaque cursor is bound to the
+tenant, calendar collection, projection version, and filters. `CURSOR_EXPIRED` or `CURSOR_INVALID`
+requires a fresh bounded occurrence bootstrap and a new change anchor. It must not be translated to
+an empty success response.
+
+Calendar bootstrap has the same concurrent-insert requirement as text listing: provide a consistent
+snapshot or a change anchor from which additions, moves, cancellations, and deletions during paging
+can be reconciled. A projection-schema change can deliberately expire old cursors rather than
+mixing incompatible event shapes.
+
+## Flue Integration Pattern
+
+These proposed adapters are ordinary application code. Construct a narrow tool from validated
+immutable creation context and current authorization records, and let it accept only stable ids,
+bounded query values, or content needed for one operation. Re-authorize inside `run`, call the
+adapter with server-bound tenant, collection, token, and base URL, and return the privacy-minimal
+typed result.
+
+Flue's idempotency-keyed dispatch converges one admitted delivery; it does not deduplicate the later
+external effect. Derive a stable app-level key from the authorized business operation and use it at
+the text adapter, even when the Slack event and Flue admission already have keys. For the distinction
+between admission and effects, see [Core Concepts and API](./core-concepts-and-api.mdx) and
+[Testing and Operations](./testing-and-operations.mdx).
+
+For a mutation, the model may request a preview but may not self-confirm it. Application code sends
+the preview to an authorized human through an approved destination, records a scoped confirmation,
+and dispatches a separate commit operation. A new version, changed authorization, expired preview,
+or request-fingerprint mismatch sends the flow back to preview.
+
+## Network-Free Contract Test Matrix
+
+All tests use fictional tenants, resources, timestamps, and in-memory or disposable local adapters.
+Call tool `run` functions directly with no model, credentials, live calendar, remote text store, or
+external mutation.
+
+### Authorization and validation
+
+- Cover valid, expired, revoked, malformed, and wrong-audience tokens; every scope combination;
+  tenant/workspace and collection mismatch; non-delegation; authorization revoked between preview
+  and execution; and indistinguishable absent versus unauthorized lookup.
+- Prove tool schemas cannot select a token, tenant, collection, provider method, hostname, or URL.
+  Treat prompt-like ids and destinations inside content as data.
+- Cover canonical path normalization, every traversal encoding, root escape, control characters,
+  Unicode normalization policy, stable ids across rename/move, payload size limits, prefix/range
+  clamps, and minimum/maximum page sizes.
+
+### Idempotency, versions, and persistence
+
+- Repeat one Slack delivery and one tool request and assert the same persisted result, ids,
+  versions, and timestamps are returned. Repeat an application effect after Flue admission recovery.
+- Reuse an idempotency key with a changed body, target, method, or expected version and require
+  `IDEMPOTENCY_CONFLICT`. Exercise retention expiry deliberately.
+- Race updates at one expected version; race update against delete; retry a completed delete; and
+  assert a stale conflict returns safe current metadata without overwriting content.
+- Inject failures between content, version, idempotency-result, and change-log writes and prove atomic
+  rollback or a retryable uncertain-storage result, never an acknowledgement without history.
+
+### Pagination and change feeds
+
+- Page deterministic keysets through equal sort values, boundaries, empty results, and maximum
+  sizes. Insert, move, and delete resources while bootstrap pages are read and reconcile from the
+  snapshot anchor without gaps or duplicates.
+- Reuse a cursor across tenant, collection, filters, interval, zone, or projection version; corrupt
+  and expire it; require typed failure and bounded bootstrap recovery. Preserve tombstones until
+  bootstrap reconciliation completes.
+
+### Calendar time and recurrence
+
+- Cover all-day date spans, timed datetimes, and explicitly included unscheduled items. Assert
+  from-inclusive/to-exclusive edges, overlap at both boundaries, zero-duration instants, invalid
+  ranges, capped spans, deterministic ordering, and each done/archived/unscheduled filter.
+- Use multiple IANA zones across daylight-saving gaps and folds, including moved exceptions. Cover
+  leap days, month-end and year-end recurrence, zones with non-hour transitions, and all-day spans
+  across transitions.
+- Prove stable series and recurrence-instance identity across edits and moved occurrences. Exercise
+  one-instance cancellation, series cancellation/deletion, standalone deletion, tombstone replay,
+  expansion limits, and cursor recovery.
+- Give event and reminder times conflicting order and assert the event interval remains primary.
+  Verify source, recurrence, override, reminder, and delivery provenance independently.
+
+### Failures, retries, and privacy
+
+- Script local adapter outcomes for timeout before and after a write, `429` with `retryAfter`,
+  retryable and exhausted `5xx`, non-retryable `4xx`, authorization revocation, and partial success.
+  Freeze time and random jitter, enforce retry bounds, and recover unknown outcomes by idempotency.
+- Restart the fake outbox between persistence and send, and between remote success and local result
+  recording. Prove distinct commands are not coalesced and completed results are replayed.
+- Snapshot every projection, error, log, and tool result. Assert credentials, arbitrary destinations,
+  document bodies outside the approved excerpt, and unapproved calendar fields never appear.
+
+These tests define a possible future application's obligations. Passing them would not turn the
+illustrative names on this page into part of Flue itself; implementation, security review, consent,
+and deployment remain separate work.

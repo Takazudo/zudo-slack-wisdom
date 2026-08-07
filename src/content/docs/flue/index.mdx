@@ -1,0 +1,75 @@
+---
+title: Flue
+description: Flue 2.x boundaries, verified sources, and Slack agent architecture on Cloudflare
+sidebar_position: 1
+---
+
+## Where Flue Fits
+
+Flue is the conversation-scoped agent execution layer in this architecture. A conversation has a
+stable instance identity, accepts messages from application code, and keeps its own durable agent
+history. Channel packages provide verified provider ingress that application code mounts explicitly.
+Those framework responsibilities are documented in Flue's tagged
+[durability guide](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/guide/durability.md)
+and [channels guide](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/guide/channels.md).
+
+For this site, that makes Flue a good boundary for receiving a Slack delivery, selecting a
+tenant-aware conversation, and running a narrowly tooled agent. The existing
+[Worker Backend](../worker-backend/index.mdx) and [Events](../events/index.mdx) sections remain the
+source for Slack request verification, acknowledgement, and transport mechanics.
+
+:::info[Architecture boundary]
+Flue is **not** the canonical store for business records, Slack OAuth installations, or Slack List
+ownership. It is also not an arbitrary durable filesystem, a sandbox/file persistence guarantee, or
+a general workflow database. Keep those concerns in application-owned stores and services; expose
+only narrow, authorized tools to the agent.
+:::
+
+Slack messages and Lists are interaction or projection surfaces, not automatic sources of truth.
+Use the [Lists](../lists/index.mdx) section for the Lists API contract and
+[Data Surfaces](../data-surfaces/index.mdx) for choosing what Slack should display.
+
+## How Claims Are Labeled
+
+This section separates evidence from design advice. Treat these labels as part of the contract:
+
+:::note[Verified fact]
+Confirmed against the version-matched primary-source hierarchy on
+[Source Map and Versioning](./source-map-and-versioning.mdx). A verified fact still belongs to the
+stated version and verification date.
+:::
+
+:::info[Inference]
+A conclusion derived from verified behavior, but not promised directly by the cited source. Recheck
+the premises before relying on it as a hard guarantee.
+:::
+
+:::tip[Proposed contract]
+A recommended application interface or architecture authored by this site. It is a design proposal,
+not an existing Flue, Slack, or Cloudflare API.
+:::
+
+:::warning[Unverified behavior]
+A claim that primary documentation or repository inspection did not settle. Do not promote it to a
+fact without a focused test and recorded evidence.
+:::
+
+## Eight-Page Section Map
+
+The complete section is organized in this order. Every title links to the finished page, and the
+category navigation below provides the same ordered entry points.
+
+| Page | Role | Default claim posture |
+|---|---|---|
+| **Flue** (this page) | Scope, boundaries, and evidence labels | Architecture boundary backed by verified framework scope |
+| **[Source Map and Versioning](./source-map-and-versioning.mdx)** | Version baseline, authority order, and known source drift | Verified facts and recorded discrepancies |
+| **[Core Concepts and API](./core-concepts-and-api.mdx)** | Agent functions, conversations, dispatch, state, and tools | Version-verified framework behavior |
+| **[Getting Started on Cloudflare](./getting-started-on-cloudflare.mdx)** | Vite integration, generated Durable Objects, bindings, migrations, and secrets | Version-verified setup plus platform boundaries |
+| **[Slack Request Handling](./slack-request-handling.mdx)** | Authenticated channel ingress, routing, dedupe, authorization, and outbound tools | Verified provider contracts plus application policy |
+| **[Testing and Operations](./testing-and-operations.mdx)** | Deterministic tests, schedules, retries, privacy-safe observability, and upgrades | Verified behavior plus operational recommendations |
+| **[Inquiry and Slack List Workflows](./inquiry-and-list-workflows.mdx)** | Separation of conversation, canonical business, and Slack projection state | Proposed application architecture with limitations labeled |
+| **[Proposed Text and Calendar Tools](./external-text-and-calendar-tools.mdx)** | Narrow future tool contracts for remote text and calendar access | Proposed contracts, never existing-API claims |
+
+## In This Section
+
+<CategoryNav category="flue" />

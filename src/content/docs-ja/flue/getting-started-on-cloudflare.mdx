@@ -1,0 +1,90 @@
+---
+title: Cloudflare で始める
+description: 生成される Durable Object を使う最小の Flue 2.0.3、Vite、Cloudflare Workers のセットアップ
+sidebar_position: 4
+---
+
+## バージョンを固定した出発点
+
+Node.js **`>=22.19.0`**、Vite ベースの project、review された 1 つの Flue release を使う。このガイドは Flue **2.0.3** を対象とする。upgrade 前には[情報源マップとバージョニング](./source-map-and-versioning.mdx)を確認する。
+
+```sh
+npm install @flue/runtime@2.0.3 hono valibot
+npm install -D @flue/cli@2.0.3 @flue/vite@2.0.3 @cloudflare/vite-plugin vite wrangler
+```
+
+plugin の順序は contract である。`flue()` が application を scan・設定した後に Cloudflare plugin が `flueWorkerConfig()` を消費する。
+
+```ts title="vite.config.ts"
+import { cloudflare } from '@cloudflare/vite-plugin';
+import { flue, flueWorkerConfig } from '@flue/vite';
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  plugins: [flue(), cloudflare({ config: flueWorkerConfig() })],
+});
+```
+
+この正確な順序と form を保つ。タグ付き 2.0.3 の Cloudflare deployment prose は `flueWorkerConfig()` を省略しているが、対応する configuration contract、changelog、実行可能な example はこれを要求する。この不一致は情報源マップに記録されている。
+
+## 生成される Agent と、アプリケーションが書く設定
+
+登録済み agent 関数ごとに Durable Object class と binding が生成される。たとえば `SupportChat` は `FlueSupportChatAgent` と `env.FLUE_SUPPORT_CHAT_AGENT` を生成する。生成される `FLUE_*` binding を手で書いてはいけない。Flue はそれらと生成した Worker entry を generated configuration に merge し、application 所有の `wrangler.jsonc` はそのまま残す。
+
+platform setting、application 所有 binding、生成 class の順序付き migration history を宣言する。
+
+```jsonc title="wrangler.jsonc"
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "support-agent",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "ai": { "binding": "AI" },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["FlueSupportChatAgent"]
+    }
+  ],
+  "vars": {
+    "PUBLIC_APP_ORIGIN": "https://app.example.com"
+  }
+}
+```
+
+Agent example で選んだ `cloudflare/...` model には、この Workers AI binding が必要である。Flue の generated configuration は application の provider binding まで作成しない。この binding を宣言するか、別の review 済み model provider と server-side credential を設定する。
+
+migration history は順序付きで append-only である。デプロイ済みの生成 class を追加、rename、remove するときは migration を追加し、必要に応じて Wrangler の `new_sqlite_classes`、`renamed_classes`、`deleted_classes` を使う。`app.ts` の route path 変更は storage migration ではない。
+
+これらは**Durable Object class migration**であり、application database schema migration ではない。D1 または external database の schema migration は、その datastore 自身の migration system で実行する。同様に application 所有の Durable Object、R2、Queue、D1、service binding は明示的に宣言する。Flue tool から呼べることだけでは conversation storage にならない。
+
+Durable Object storage は activation をまたいで残りうるが、通常の JavaScript instance field は eviction をまたいで残らない。必要な state は Durable Object storage または別の明示的な persistence service に保存する。
+
+## Secret、Variable、Environment
+
+`vars` は `PUBLIC_APP_ORIGIN` のような non-secret configuration だけに使い、binding により resource access を明示する。Slack token、signing secret、provider API key、その他の credential は server-side の Worker secret に置く。`vars`、browser に出荷される code、commit する local file に置いてはいけない。Slack 固有の扱いは既存の[シークレットと設定](../worker-backend/secrets-and-config.mdx)を参照する。
+
+名前付き Wrangler environment は個別の deployment configuration である。`--env staging` または `--env production` を使う前に、すべての binding と variable を review する。`vars` を含む non-inheritable setting はその environment に再宣言が必要であり、各 environment には意図した secret が必要である。名前付き environment は name suffix ではなく configuration review として扱う。
+
+`compatibility_date` は意図して固定する。日付を進めると runtime behavior が変わりうるので、review された変更にし、関連 test を実行して、deployment が必要とする flag だけを追加する。必要な flag も test する。Flue 2.0.3 の Cloudflare runtime には `nodejs_compat` が必要である。platform の現在の挙動は Cloudflare の[compatibility date documentation](https://developers.cloudflare.com/workers/configuration/compatibility-dates/)を参照する。
+
+## 最小の Local Command
+
+削除された `flue dev`、`flue build` ではなく Vite command を使う。
+
+```sh
+npx vite dev
+npx vite build
+npx wrangler deploy
+```
+
+最後の command は deploy であり、この documentation 作業では**実行していない**。deploy 前に target Worker name、account、environment、secret、binding、migration、compatibility date、flag を review する。local build は configuration shape を検証するが、デプロイ済み binding や secret value を証明するものではない。
+
+## 安全な Upgrade Loop
+
+1. install 済み release を調べる: `npx flue docs search "Cloudflare Vite"` と `npx flue docs read reference/configuration`。
+2. 対応するタグ付き changelog、runtime contract、実行可能な example と照合する。unversioned snippet だけで判断しない。
+3. changelog が mixed release を明示的に支持しない限り、関連する `@flue/*` package は 1 つの review された lockfile change で upgrade する。
+4. 生成される Durable Object class name を再確認し、必要な Wrangler migration を追加して、deploy 前に local Vite build を実行する。
+
+Flue conversation durability は canonical business record、application schema migration、general filesystem を置き換えるものではない。境界の分離は[コアコンセプトと API](./core-concepts-and-api.mdx)を参照する。

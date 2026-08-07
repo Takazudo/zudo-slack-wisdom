@@ -1,0 +1,241 @@
+---
+title: Testing and Operations
+description: Deterministic Slack channel tests, scheduled Flue dispatch, privacy-safe observability, and Flue 2.0.3 upgrade checks
+sidebar_position: 6
+---
+
+## Default to Synthetic and Network-Free
+
+Most failures at the Slack boundary are ordinary deterministic bugs: an altered byte invalidates a
+signature, a retry is admitted twice, an actor bypasses policy, or a tool sends to the wrong channel.
+Test those without Slack credentials, a deployed endpoint, or a model. Generate synthetic payloads,
+sign their exact bytes with a test-only signing key, freeze the clock, invoke the mounted router in
+process, and replace outbound Fetch with a fake.
+
+Cloudflare's
+[Workers Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/)
+can run code in the `workerd` runtime. A plain unit runner is also appropriate for pure policy,
+schema, key-derivation, and tool-contract functions. No default test should contact Slack or another
+provider.
+
+Keep every fixture fictional. Use impossible workspace, enterprise, channel, user, and event ids;
+neutral message content; and a dedicated test signing key. Do not copy production payloads into a
+fixture. In particular, redact or omit transient callback capabilities even when testing interaction
+and command parsing.
+
+## Signed Ingress Contract Suite
+
+Build one helper that accepts the original body bytes, timestamp, route, content type, and test
+signing key, then computes Slack's `v0` HMAC. Do not sign a parsed-and-re-serialized value. Use the
+same body bytes to construct the `Request`, and make the test clock explicit.
+
+The suite should prove all of these boundaries:
+
+- A correctly signed current Events JSON body, URL-encoded interaction body, and URL-encoded command
+  body reaches only its configured callback. A one-byte body mutation, wrong signing key, missing or
+  malformed headers, or wrong content type is rejected.
+- A timestamp just inside the accepted window succeeds; stale and too-far-future timestamps fail.
+  Replaying an otherwise valid old request must not bypass the timestamp check.
+- Malformed UTF-8, invalid JSON, form bodies that do not yield required fields, missing required
+  discriminants, duplicate interaction payload fields, oversized bodies, and misleading content
+  lengths fail without invoking application code.
+- When only `events` is configured, interaction and command paths are absent. Repeat for each route
+  combination the application deploys.
+- A valid signature from an unauthorized workspace or enterprise, app id, actor, or channel is
+  acknowledged or rejected according to the documented application policy but never dispatched.
+- Events arriving twice with one `event_id` converge on one Flue admission. Different event ids are
+  both admitted even when their content matches. Deliver newer and older events out of order and
+  assert that business state uses its own ordering/version rule rather than arrival order.
+- Bot-authored events, events whose `user` is the app's bot user, and every unsupported message
+  subtype are ignored. Add a positive case for each deliberately allowed subtype.
+
+[Verifying Requests](../worker-backend/verifying-requests.mdx),
+[Three-Second Ack](../worker-backend/three-second-ack.mdx), and
+[Events API on Workers](../events/events-api-on-workers.mdx) define the transport behavior these tests
+protect. The channel test should hold a controllable `dispatch()` admission promise unsettled and
+assert that acknowledgement has not yet been returned. Resolve durable admission and expect the
+prompt `200`; a separate unsettled model/effect promise must not delay it. If admission rejects, the
+route must not return a success that suppresses Slack's retry.
+
+## Dedupe and External Effects Are Separate Tests
+
+An Events API test is incomplete if it stops after proving that two deliveries return one dispatch
+receipt. Test two independent layers:
+
+1. **Admission convergence:** repeated `event_id` values produce one Flue submission for the same
+   agent instance.
+2. **Effect idempotency:** a repeated or recovered agent/tool execution produces at most one durable
+   business transition and one intended Slack effect for its application effect key.
+
+Force the ambiguous failure cases: the fake Slack call succeeds and the ledger write fails; the
+ledger claim succeeds and the Worker stops before the call; a timeout leaves the remote result
+unknown; and a retry begins while the first attempt is still pending. Assert the selected recovery
+policy instead of assuming Flue admission solves it.
+
+Interactions and commands require their own cases because they have no Events envelope `event_id`.
+For interactions, repeat a synthetic business-operation id and prove a conditional state transition
+applies once. For commands, prove that two identical invocations remain distinct unless the product
+contract supplies a durable operation id. Tests should also scan dispatched messages, saved records,
+tool state, logs, and traces to ensure no transient callback capability crossed into them.
+
+## Fake the Slack Web API Boundary
+
+Inject Fetch or construct `@slack/web-api` with a fake transport so every response is local and
+scripted. Exercise each outbound method the application uses, not a generic client in isolation:
+
+- A `200` response with `ok: true` returns only the narrow result contract. A `200` response with
+  `ok: false` is an application failure, not success.
+- A `429` reads `Retry-After`, schedules no earlier retry, applies the limit to the correct
+  workspace/method bucket, and hands long waits to durable retry state rather than sleeping beyond the
+  Worker lifetime.
+- A network timeout or connection failure reaches a bounded retry/recovery path. Test the
+  unknown-outcome branch for write methods.
+- A non-rate-limit `4xx` fails closed and is not blindly retried. Token revocation or missing scope
+  should disable/flag the installation for operator action without printing the token.
+- A `5xx` uses bounded backoff with jitter or a durable queue/job record and eventually surfaces an
+  exhausted failure. The fake clock makes the policy deterministic.
+
+See [Web API with fetch](../worker-backend/web-api-with-fetch.mdx) and
+[Rate Limits](../messaging/rate-limits.mdx) for the native response contract. Store fake response
+bodies in the test itself; recorded production traffic can contain private channel content.
+
+## Tool Contract Tests
+
+Call every tool's `run` function directly without a model. Validate minimum and maximum input length,
+Unicode and empty-content behavior, output schema, provider-error mapping, and the idempotency ledger.
+The decisive authorization assertions are structural:
+
+- The tool input cannot select a token, tenant, channel, thread, Web API method, or URL.
+- The destination comes from validated creation data plus the current authorized installation record.
+- Revoking the actor, installation, or channel between dispatch and tool execution causes the tool to
+  fail closed.
+- Prompt-like text containing another channel id is treated as content, not routing data.
+- Tool output contains only fields the agent needs and never echoes credentials, full provider
+  responses, private content, or transient callback capabilities.
+
+Keep separate contract cases for each allowed destination or operation. A broad `call_slack_api`
+tool is not made safe by testing a few friendly inputs; replace it with narrow tools.
+
+## Scheduled Dispatch on Cloudflare
+
+Cloudflare Cron Triggers use UTC. Treat this as part of the product contract when converting a local
+business schedule, including daylight-saving changes. The
+[Cron Trigger documentation](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
+also exposes the scheduled fire time to the handler.
+
+Choose conversation identity according to whether scheduled turns may overlap:
+
+- Use one stable id, such as `schedule:daily-summary`, when every fire should share history and Flue
+  should serialize work in one conversation. A slow fire delays the next one, so keep the workload
+  bounded.
+- Include the scheduled fire time in the id when fires are independent and may run in parallel. This
+  prevents one late run from blocking another but intentionally creates separate histories.
+
+Use the scheduled fire time, not the handler's wall-clock start, in the application idempotency key.
+That lets a repeated delivery of one fire converge without collapsing different fires.
+
+Flue's Cloudflare target merges the default export from `src/cloudflare.ts` into the generated Worker.
+Put the handler there, and configure the Cron Trigger explicitly in application-owned Wrangler
+configuration; neither the filename nor the schedule is inferred from this guide's function alone.
+
+```typescript title="src/cloudflare.ts"
+import { dispatch } from "@flue/runtime";
+import { ScheduledAssistant } from "./agents/scheduled-assistant.ts";
+
+export default {
+  async scheduled(
+    controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<void> {
+    const fire = new Date(controller.scheduledTime).toISOString();
+    const conversationId = env.SCHEDULE_PARALLEL
+      ? `schedule:daily-summary:${fire}`
+      : "schedule:daily-summary";
+
+    ctx.waitUntil(
+      dispatch(ScheduledAssistant, {
+        id: conversationId,
+        idempotencyKey: `daily-summary:${fire}`,
+        message: {
+          kind: "signal",
+          type: "schedule.daily_summary",
+          body: "Generate the authorized daily summary.",
+          attributes: { scheduledFor: fire },
+        },
+      }),
+    );
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+```jsonc title="wrangler.jsonc"
+{
+  "triggers": {
+    "crons": ["0 9 * * *"]
+  }
+}
+```
+
+Cron expressions are UTC. Treat the example schedule as an application choice, review it for the
+target environment, and test deployment configuration separately from invoking the handler.
+
+Keep the `scheduled()` handler thin: derive and validate the fire identity, enqueue or dispatch, and
+return. Complex reminders need application-owned durable job state for recurrence rules, time zones,
+cancellation, recipient authorization, effect status, and retry attempts. Flue conversation history
+is not a job scheduler or canonical reminder database. The existing
+[Cron Posting](../worker-backend/cron-posting.mdx) page covers overlap and Slack posting mechanics.
+
+Test schedules by invoking the handler with fixed UTC `scheduledTime` values. Cover boundary dates,
+repeated fires, a slow prior fire, serialized versus parallel ids, authorization changes, and the
+external-effect ledger. Do not wait for a real Cron Trigger in a test.
+
+## Privacy-Safe Observability
+
+Emit structured operational metadata: a generated request id, authenticated tenant key, route
+surface, Slack `event_id` when present, Flue submission id, agent instance hash or other non-content
+reference, outcome, latency, retry class, tool name, and application effect key. These identifiers
+should connect ingress, dispatch, tool execution, and outbound response without copying message text.
+
+Redact authorization headers, signing material, OAuth tokens, cookies, raw bodies, Slack message
+content, private-channel names, PII, model prompts/completions, full tool input/output, and transient
+callback capabilities. Apply redaction before logs, traces, exception reporting, or eval artifacts
+leave the Worker. Hashing a secret or a short-lived capability does not make it appropriate telemetry.
+
+Set retention and access controls for logs and traces, and document who can join opaque ids back to
+application records. Sample high-volume success events, but never sample away authorization failures,
+effect-ledger conflicts, exhausted retries, or invalid-signature trends. Alert on sustained callback
+failures, Slack `429`/`5xx` rates, deferred-work rejection, schedule lateness, and stalled durable jobs.
+
+## Deterministic Tests and Selective Evals
+
+Use deterministic unit, contract, and integration tests for schemas, policy, raw-body verification,
+route omission, dedupe, state transitions, tools, fake network responses, and schedule identity. They
+should be fast, offline, and required in ordinary CI.
+
+A Flue eval runs the complete agent against a live model and is therefore nondeterministic,
+cost-bearing, slower, and credentialed. The tagged
+[Flue eval guide](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/guide/evals.md)
+recommends a separate suite and behavioral assertions. Run a small reviewed set explicitly or on a
+controlled cadence to check model-specific behavior such as choosing the right narrow tool, refusing
+an unauthorized request, and not inventing destinations. Never use live Slack traffic as an eval
+fixture, and review prompt/output retention before uploading reports.
+
+## Upgrade and Source-Date Checklist
+
+This guidance was reviewed against Flue **2.0.3** and provider sources on **2026-08-08**. Before an
+upgrade or periodic security review:
+
+1. Read [Source Map and Versioning](./source-map-and-versioning.mdx), the target tagged changelog,
+   runtime dispatch/admission types, `@flue/slack` route implementation, and matching Slack example.
+2. Re-run `flue add channel slack` in a disposable synthetic project and compare the current blueprint
+   with application-owned channel code. Preserve local authorization and privacy policy deliberately.
+3. Recheck the known blueprint omission: Events dispatches must still pass `event_id` as
+   `idempotencyKey` unless the new version documents a different contract.
+4. Review Slack request signing, retry/ack, payload, OAuth/scope, token lifecycle, and Web API
+   rate-limit documentation. Recheck Cloudflare Cron UTC semantics, execution-context lifetime, and
+   testing guidance.
+5. Run the full offline boundary suite, migration/type/build checks required by the target version,
+   and then the separate selective live-model eval suite if approved.
+6. Record the exact package versions, lockfile result, source URLs, review date, unresolved
+   discrepancies, and operator rollout/rollback decision.

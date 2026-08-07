@@ -1,0 +1,72 @@
+---
+title: 情報源マップとバージョニング
+description: Flue 2.0.3 の根拠の優先順位、パッケージ確認、破壊的変更、既知の情報源の食い違い
+sidebar_position: 2
+---
+
+## 検証済みの基準
+
+**2026-08-08 に検証済み。** このセクションは **Flue 2.0.3** と **Node.js `>=22.19.0`** を対象とする。リリースはタグ付きの [2.0.3 changelog](https://github.com/withastro/flue/blob/v2.0.3/CHANGELOG.md#203---2026-08-04)に記録され、Node.js の最低バージョンは [`@flue/runtime`](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/package.json) と [`@flue/cli`](https://github.com/withastro/flue/blob/v2.0.3/packages/cli/package.json) を含む各タグ付き package manifest に記載されている。
+
+これはバージョンを固定したスナップショットであり、将来のすべての `latest` に対する主張ではない。`@flue/*` パッケージを更新する前に、以下の確認を再実行し、changelog を見直す。
+
+## 情報源の優先順位
+
+Flue の情報源が食い違う場合は、以下の順序を使う。1 つの判断に用いるすべての情報源を、文書化するパッケージバージョンと一致させる。
+
+1. **一致するタグの changelog と runtime contract。** 破壊的変更の記録と実行される型・validation により、バージョン依存の API を判断する。[v2.0.3 changelog](https://github.com/withastro/flue/blob/v2.0.3/CHANGELOG.md) とタグ付きの [`dispatch` contract](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/src/runtime/dispatch.ts)から始める。
+2. **タグ付きの実行可能な example。** 同じタグの example で contract の組み合わせ方を確認する。特に [Cloudflare example](https://github.com/withastro/flue/tree/v2.0.3/examples/cloudflare) と [Slack channel example](https://github.com/withastro/flue/tree/v2.0.3/examples/slack-channel)を参照する。
+3. **インストール済みの `flue docs`。** CLI はバージョンの一致する同梱 prose をネットワークアクセスなしで読む。公式の [`flue docs` リファレンス](https://flueframework.com/docs/cli/docs/)を参照する。発見には利用できるが、同梱された 2.0.3 prose にも後述する Cloudflare の食い違いがあるため、実行可能な snippet は必ず照合する。
+4. **ライブの解説文書。** Web サイトは発見には便利だが、リリースより先へ進んだり、同一リリース内で食い違ったりする可能性がある。バージョン固定されていない snippet を、一致するタグの contract より優先しない。
+
+:::note[照合ルール]
+バージョン依存の snippet を 1 ページだけからコピーしない。一致するタグの changelog、runtime の型または validation、実行可能なタグ付き example と照合する。解決できない不一致は未検証の挙動として記録する。
+:::
+
+## パッケージと engine の確認
+
+まずインストール済み CLI を確認し、次に無指定の `latest` ではなく registry の正確なバージョンを問い合わせる。
+
+```sh
+flue --version
+flue docs search "Cloudflare Vite"
+flue docs read reference/configuration
+npm view @flue/runtime@2.0.3 version engines --json
+npm view @flue/cli@2.0.3 version engines --json
+npm view @flue/vite@2.0.3 version engines --json
+npm view @flue/slack@2.0.3 version engines --json
+```
+
+2026-08-08 時点の registry 確認結果は以下のとおりである。
+
+| パッケージ | 正確なバージョン | Node.js engine | 一次メタデータ |
+|---|---|---|---|
+| `@flue/runtime` | `2.0.3` | `>=22.19.0` | [registry](https://registry.npmjs.org/@flue%2Fruntime/2.0.3)、[タグ付き manifest](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/package.json) |
+| `@flue/cli` | `2.0.3` | `>=22.19.0` | [registry](https://registry.npmjs.org/@flue%2Fcli/2.0.3)、[タグ付き manifest](https://github.com/withastro/flue/blob/v2.0.3/packages/cli/package.json) |
+| `@flue/vite` | `2.0.3` | `>=22.19.0` | [registry](https://registry.npmjs.org/@flue%2Fvite/2.0.3)、[タグ付き manifest](https://github.com/withastro/flue/blob/v2.0.3/packages/vite/package.json) |
+| `@flue/slack` | `2.0.3` | `>=22.19.0` | [registry](https://registry.npmjs.org/@flue%2Fslack/2.0.3)、[タグ付き manifest](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/package.json) |
+
+changelog が安全な混在バージョン構成を明示していない限り、これらのパッケージはレビューした 1 つの Flue リリースに揃える。パッケージメタデータが証明するのは publish された内容であり、アプリケーションの lockfile に同じバージョンが入ったことではないため、lockfile も確認する。
+
+## Flue 2 の contract 変更
+
+Flue 2 は Vite ベースのアプリケーションモデルである。2.0.0 changelog は次の破壊的変更を明示している。
+
+- `@flue/vite` の `flue()` が Vite に参加し、削除された `flue dev` と `flue build` は Vite のコマンドに置き換わる。
+- `app.ts` が明示的な route map になる。ファイルの配置だけでは HTTP route は自動作成されない。
+- `'use agent'` で始まる module は**大文字で始まる export 済み agent function**を登録する。`defineAgent` は削除された。
+- `defineWorkflow` を含む旧来の組み込み workflow abstraction は削除された。会話が引き続きフレームワークの durable unit であり、その外側の orchestration はアプリケーションコードまたは外部 workflow engine が担う。
+
+4 点はいずれも、タグ付きの [Flue 2.0.0 breaking changes](https://github.com/withastro/flue/blob/v2.0.3/CHANGELOG.md#200---2026-07-31)に基づく。beta 時代の API や自動 routing を現行挙動として提示しない。
+
+## v2.0.3 で既知の情報源の食い違い
+
+:::warning[Cloudflare Vite snippet]
+[タグ付きの Cloudflare deployment 解説](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/ecosystem/deploy/cloudflare.md#L28-L39)は `plugins: [flue(), cloudflare()]` を示し、`flueWorkerConfig()` を省略している。この形式は、同じリリースの [configuration contract](https://github.com/withastro/flue/blob/v2.0.3/apps/docs/src/content/docs/reference/configuration.md#flueworkerconfig)、[2.0.0 changelog](https://github.com/withastro/flue/blob/v2.0.3/CHANGELOG.md#200---2026-07-31)、[実行可能な Cloudflare example](https://github.com/withastro/flue/blob/v2.0.3/examples/cloudflare/vite.config.ts)と矛盾する。後者では `flue()` を先に置き、次に `cloudflare({ config: flueWorkerConfig() })` を置く必要がある。2.0.3 では後者の形式を使う。
+:::
+
+:::warning[Slack delivery の重複排除]
+タグ付き Slack blueprint の [`dispatch(...)` example](https://github.com/withastro/flue/blob/v2.0.3/blueprints/channel--slack.md)は、`payload.event_id` を signal attribute として記録するが、`idempotencyKey` を省略している。タグ付きの [runtime admission contract](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/src/runtime/agent-submissions.ts)は caller が選ぶ `idempotencyKey` をサポートし、タグ付きの [`@flue/slack` contract](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/README.md)は Events API の redelivery を元の admission に収束させるため `idempotencyKey: payload.event_id` を推奨している。runtime/channel contract に従い、blueprint の省略をそのままコピーしない。
+:::
+
+これらは検証済みの情報源間の差であり、このサイトが deploy 済みアプリケーションに対してどちらかの挙動をテストした証拠ではない。後続の技術ガイドでもこの区別を維持し、バージョン依存のコードを示すときはこの基準へリンクする。
