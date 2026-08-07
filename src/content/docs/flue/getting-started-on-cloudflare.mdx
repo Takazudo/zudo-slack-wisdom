@@ -1,0 +1,87 @@
+---
+title: Getting Started on Cloudflare
+description: A minimal Flue 2.0.3 Vite and Cloudflare Workers setup with generated Durable Objects
+sidebar_position: 4
+---
+
+## Versioned Starting Point
+
+Use Node.js **`>=22.19.0`**, a Vite-based project, and one reviewed Flue release. This guide targets Flue **2.0.3**; check [Source Map and Versioning](./source-map-and-versioning.mdx) before upgrading.
+
+```sh
+npm install @flue/runtime@2.0.3 hono valibot
+npm install -D @flue/cli@2.0.3 @flue/vite@2.0.3 @cloudflare/vite-plugin vite wrangler
+```
+
+The plugin order is a contract. `flue()` scans and configures the application before the Cloudflare plugin consumes `flueWorkerConfig()`.
+
+```ts title="vite.config.ts"
+import { cloudflare } from '@cloudflare/vite-plugin';
+import { flue, flueWorkerConfig } from '@flue/vite';
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  plugins: [flue(), cloudflare({ config: flueWorkerConfig() })],
+});
+```
+
+Keep that exact order and form. The tagged 2.0.3 Cloudflare deployment prose omits `flueWorkerConfig()`, but the matching configuration contract, changelog, and runnable example require it. The source map records that discrepancy.
+
+## Generated Agents and Authored Configuration
+
+Each registered agent function generates a Durable Object class and binding. For example, `SupportChat` produces `FlueSupportChatAgent` and `env.FLUE_SUPPORT_CHAT_AGENT`. Do **not** hand-author generated `FLUE_*` bindings. Flue merges those bindings and its generated Worker entry into generated configuration while leaving the application-owned `wrangler.jsonc` intact.
+
+Declare platform settings, application-owned bindings, and the ordered migration history for generated classes:
+
+```jsonc title="wrangler.jsonc"
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "support-agent",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["FlueSupportChatAgent"]
+    }
+  ],
+  "vars": {
+    "PUBLIC_APP_ORIGIN": "https://app.example.com"
+  }
+}
+```
+
+Migration history is ordered and append-only. Add a migration when adding, renaming, or removing a deployed generated class; use Wrangler's `new_sqlite_classes`, `renamed_classes`, or `deleted_classes` as appropriate. Changing an `app.ts` route path is not a storage migration.
+
+These are **Durable Object class migrations**, not application database schema migrations. Run D1 or external-database schema migrations through the datastore's own migration system. Likewise, application-owned Durable Objects, R2, Queues, D1, and service bindings must be declared explicitly; calling them from a Flue tool does not make them conversation storage.
+
+Durable Object storage can survive activation, but ordinary JavaScript instance fields do not survive eviction. Persist required state in Durable Object storage or another explicit persistence service.
+
+## Secrets, Variables, and Environments
+
+Use `vars` only for non-secret configuration such as `PUBLIC_APP_ORIGIN`; bindings make resource access explicit. Put Slack tokens, signing secrets, provider API keys, and other credentials in Worker secrets, server-side. Never place them in `vars`, browser-shipped code, or committed local files. For Slack-specific handling, use the existing [Secrets and Config](../worker-backend/secrets-and-config.mdx) guide.
+
+Named Wrangler environments are separate deployment configurations. Before using `--env staging` or `--env production`, review every binding and variable: non-inheritable settings including `vars` must be redeclared for that environment, and each environment needs its intended secrets. Treat a named environment as a configuration review, not a name suffix.
+
+Pin `compatibility_date` deliberately. Advancing it can change runtime behavior, so make it a reviewed change, run relevant tests, and add only flags the deployment needs. Test required flags too; Flue 2.0.3 requires `nodejs_compat` for its Cloudflare runtime. Consult Cloudflare's [compatibility-date documentation](https://developers.cloudflare.com/workers/configuration/compatibility-dates/) for current platform behavior.
+
+## Minimal Local Commands
+
+Use Vite commands, not removed `flue dev` or `flue build`:
+
+```sh
+npx vite dev
+npx vite build
+npx wrangler deploy
+```
+
+The final command deploys; it was **not run** for this documentation work. Before deployment, review the target Worker name, account, environment, secrets, bindings, migrations, compatibility date, and flags. A local build validates configuration shape, not deployed bindings or secret values.
+
+## Safe Upgrade Loop
+
+1. Inspect the installed release: `npx flue docs search "Cloudflare Vite"` and `npx flue docs read reference/configuration`.
+2. Compare it with the matching tagged changelog, runtime contract, and runnable example—not an unversioned snippet alone.
+3. Upgrade related `@flue/*` packages in one reviewed lockfile change unless the changelog explicitly supports a mixed release.
+4. Re-check generated Durable Object class names, append the required Wrangler migration, and run a local Vite build before deployment.
+
+Flue conversation durability does not replace canonical business records, application schema migrations, or a general filesystem. [Core Concepts and API](./core-concepts-and-api.mdx) explains those boundaries.
