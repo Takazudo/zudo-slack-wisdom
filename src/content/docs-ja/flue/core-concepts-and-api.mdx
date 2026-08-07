@@ -1,0 +1,107 @@
+---
+title: コアコンセプトと API
+description: Flue 2.0.3 のエージェント登録、会話、dispatch、永続 state、tool
+sidebar_position: 3
+---
+
+## 登録される Agent 関数
+
+このページは **Flue 2.0.3** の contract を説明する。upgrade 前や snippet の不一致を解決するときは、まず[情報源マップとバージョニング](./source-map-and-versioning.mdx)を確認する。
+
+正確に `'use agent'` directive から始まる module は、build 時に**大文字で始まる export 関数すべて**を登録する。登録と HTTP 公開は別物であり、どの登録済み agent が route を持つかは `app.ts` が明示的に選ぶ。
+
+```ts title="src/agents/support-triage.ts"
+'use agent';
+
+import { useModel, usePersistentState, useTool } from '@flue/runtime';
+import * as v from 'valibot';
+
+export function SupportTriage() {
+  useModel('cloudflare/@cf/meta/llama-3.3-70b-instruct-fp8-fast');
+  const [escalated, setEscalated] = usePersistentState('escalated', false);
+
+  useTool({
+    name: 'record_escalation',
+    description: 'Record an already-authorized escalation for this case.',
+    input: v.object({ reason: v.string() }),
+    async run({ data }) {
+      setEscalated(true);
+      return `Escalation recorded: ${data.reason}`;
+    },
+  });
+
+  return escalated
+    ? 'The case is escalated. Explain the next authorized action.'
+    : 'Triage the case. Escalate only when the authorized tool is appropriate.';
+}
+
+SupportTriage.initialData = v.object({ tenantId: v.string(), caseId: v.string() });
+```
+
+関数名は literal の `agentName` static で上書きしない限り durable identity になる。この identity は conversation storage を key にし、Cloudflare Durable Object class にも寄与する。デプロイ済み関数の rename には class migration が必要になりうるが、source file の rename では不要である。
+
+## 明示的な Route と Dispatch
+
+`app.ts` は application の route map である。mount は HTTP conversation surface を公開するが、agent を登録するものではない。mount した route には authentication と authorization middleware を適用し、conversation ID そのものを access control と見なすのではなく、その ID への access を認可する。
+
+```ts title="src/app.ts"
+import { createAgentRouter } from '@flue/runtime/routing';
+import { Hono } from 'hono';
+import { SupportTriage } from './agents/support-triage.ts';
+
+const app = new Hono();
+app.route('/agents/support', createAgentRouter(SupportTriage));
+
+export default app;
+```
+
+channel 主導の application には **dispatch-only** agent を使える。登録はされるが public な `createAgentRouter(...)` mount は持たない。application code が delivery を検証した後、認可済み conversation を選び、delivery ごとの signal を dispatch する。
+
+```ts
+import { dispatch } from '@flue/runtime';
+import { SupportTriage } from './agents/support-triage.ts';
+
+await dispatch(SupportTriage, {
+  id: `tenant:${delivery.tenantId}:case:${delivery.caseId}`,
+  initialData: { tenantId: delivery.tenantId, caseId: delivery.caseId },
+  message: {
+    kind: 'signal',
+    type: 'slack.case.updated',
+    body: delivery.summary,
+    attributes: { tenantId: delivery.tenantId, eventId: delivery.eventId },
+  },
+});
+```
+
+`dispatch()` が resolve するのは、model reply の完了時ではなく input が conversation queue へ受理された時点である。同じ conversation への direct HTTP と dispatch の input は同じ受理順序を共有する。Slack の verification、acknowledgement、raw-body の規則は、一般的な webhook recipe ではなく [Worker Backend](../worker-backend/index.mdx) と [Events](../events/index.mdx) を参照する。
+
+## Data の境界
+
+| Data | Contract | 用途 |
+|---|---|---|
+| Conversation/instance ID | caller が選ぶ安定した address | tenant 単位の case、channel thread |
+| `initialData` | 作成時に validation され一度記録される immutable な値 | tenant と case の identity |
+| Signal attributes | 1 delivery 上の data | 検証済み event ID と認可済み tenant |
+| Persistent state | 1 conversation の durable で名前を持つ state | 小さな agent 所有の進捗や gate |
+| Canonical record | application 所有の database または service | 業務上の truth、ownership、OAuth、audit |
+| File/sandbox | 選択した実装に依存 | contract が durable な場合だけ artifact |
+
+`initialData` は mutable metadata ではない。既存の conversation に渡す後続の値は無視される。`useInitialData()` で読み、現在の delivery は `useDelivery()` で読む。attributes は検証済み context であり、model による authorization ではない。
+
+conversation history と persistent agent state は framework state であり、canonical application database ではない。業務 fact は narrow な application tool と stable idempotency key を通じて保存する。conversation や Durable Object から durable filesystem を推論してはいけない。Cloudflare では Durable Object storage は残っても、通常の JavaScript instance field は eviction で消える。sandbox file には別の contract がある。
+
+## 限定された Durable Tool
+
+tool は model が呼べる capability であって authorization boundary ではない。認可済み tenant、account、credential は検証済み application context から導き、model が選べるのはその境界内だけにする。
+
+agent turn の中で復旧させる短い sequence には `durable: true` を使い、外部 effect ごとに決定的な `step.do(name, fn)` を置く。完了した result は `step.do()` が resolve する前に exactly-once-recorded される。ただし外部関数は**at-least-once-executed**である。effect の後、record 前に crash すれば再実行されうるため、downstream API と canonical write は idempotent でなければならない。
+
+- durable tool は checkpoint する agent 内 side effect に使う。
+- `init()` handle は conversation へ dispatch し、結果を待つために使う。
+- system をまたぐ広い orchestration には application code または外部 Cloudflare Workflow を使う。
+
+:::warning[Flue 2 の移行境界]
+`defineAgent`、`defineWorkflow`、auto-routing、`flue dev`、`flue build` は beta 時代の API または挙動であり、現在の Flue 2.0.3 の挙動ではない。export した agent 関数、明示的な `app.ts` route、Vite command を使う。Flue は built-in workflow abstraction を提供しない。
+:::
+
+Vite 統合、生成される Durable Object、migration、secret は[Cloudflare で始める](./getting-started-on-cloudflare.mdx)を参照する。
