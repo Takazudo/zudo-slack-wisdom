@@ -1,0 +1,229 @@
+---
+title: Inquiry and Slack List Workflows
+description: Canonical inquiry records, privacy-safe Slack projections, durable follow-up, and recovery contracts
+sidebar_position: 7
+---
+
+An inquiry agent coordinates conversation; it must not quietly become the inquiry database. Slack
+is likewise an interaction and visibility surface, not an automatic source of durable business
+truth. Keep three state boundaries explicit in the schema, authorization policy, and operational
+runbook:
+
+1. **Flue conversation state** is model-visible context for one authorized conversation: recent
+   turns, small coordination flags, and tool results. Its identity is tenant-scoped, but its history
+   is not the canonical inquiry, audit log, or job table.
+2. **Canonical inquiry business state** is an application-owned durable record. It defines the
+   lifecycle, authorization, assignment, deadlines, retention, and audit history consumed by every
+   channel.
+3. **Slack projection state** records where an inquiry appears in Slack and how fresh that copy is:
+   workspace or enterprise installation, channel, root thread/message, List and row identifiers,
+   reconciliation cursor, last successful sync, desired version, observed version, and last error.
+
+This separation lets a conversation be trimmed without deleting a case, a Slack message or List be
+recreated without changing business truth, and a Slack outage be reported as partial failure rather
+than a lost intake. [Core Concepts and API](./core-concepts-and-api.mdx#data-boundaries) defines the
+underlying Flue boundary; [Slack Request Handling](./slack-request-handling.mdx) defines verified
+ingress, prompt acknowledgement, and destination-bound tools.
+
+## Canonical Inquiry Contract
+
+Give every inquiry a stable, application-generated id scoped to the authorized tenant. Store its
+source (`public_form`, `authenticated_portal`, `slack`, or another bounded enum) separately from any
+provider delivery id. A practical canonical record includes:
+
+- requester/contact fields with an explicit privacy classification, collection purpose, visibility,
+  and retention class;
+- status, priority, owner, responsible team, and watchers;
+- `created_at`, `updated_at`, `closed_at`, due time, next follow-up, SLA target, breach time, and
+  escalation level;
+- an optimistic version plus source-operation and idempotency keys;
+- append-only transitions, assignment changes, operator notes, policy decisions, and actor/time
+  audit metadata.
+
+Keep separate tables or record families for Slack mappings, reminder/escalation jobs, and external
+action/outbox attempts. Do not overload an operator note with machine delivery state or a Slack row
+id with business identity.
+
+Use an explicit lifecycle such as `new`, `triaged`, `in_progress`, `waiting`, `resolved`, and
+`cancelled`. Each product must define its own allowed transition graph and validate it on the server.
+For example, a triage action may claim `new` at version 3 and move it to `triaged` at version 4;
+another operator attempting the same version loses the conditional update and must reload. A model,
+button payload, or List cell may *request* a transition, but only the canonical service checks the
+current version, actor, tenant, permitted edge, required fields, and terminal-state rules.
+
+Assignment follows the same rule. Resolve a Slack actor to an application principal inside the
+authorized installation, check that principal's team/role policy, and conditionally update the
+canonical inquiry. Never accept an owner id, tenant id, channel, token, or arbitrary transition from
+model/tool input. Every accepted or rejected action receives an audit entry with an opaque request
+id; sensitive message or contact content does not belong in routine logs.
+
+## Tenant-Scoped Slack Identity
+
+`channel_id + thread_ts` is not globally unique enough. Key every Slack link by the authorized
+installation and destination:
+
+- enterprise id when present **and** workspace id, otherwise workspace id;
+- channel id;
+- root thread timestamp (use `thread_ts`, falling back to the root message `ts`);
+- app/installation identity where one workspace may have more than one installation.
+
+Store the List id and row id under the same tenant boundary. Cross-tenant lookups must fail closed,
+even if an attacker supplies valid-looking Slack ids from another workspace. Replies use the stored
+root-thread mapping, not the latest event's untrusted destination fields. A reinstall, channel move,
+row recreation, or thread replacement creates a new projection mapping and audit event; it does not
+rewrite the inquiry id.
+
+## Intake and Operator Boundaries
+
+Treat public intake and authenticated operator actions as different routes and threat models.
+Public intake accepts only the documented requester fields, normalizes length/encoding, validates
+attachments separately, uses a honeypot as a low-cost signal, enforces allowed-origin/CSRF policy
+where browser credentials are involved, and rate-limits by privacy-reviewed signals. A honeypot,
+`Origin`, or rate limit is defense in depth, not identity. Persist the accepted inquiry before
+attempting Slack notification, and return a stable receipt that reveals no internal channel or user
+ids.
+
+Operator actions require authenticated application identity or a raw-body-verified Slack callback,
+then installation, actor, tenant, channel, and operation authorization. Preserve the repository's
+Slack sequence: read exact request bytes, check timestamp and signature, only then parse and
+authorize. A fast acknowledgement says Slack delivery was accepted; it does not claim that the
+business transition or later side effects succeeded.
+
+Minimize Slack OAuth scopes and expose narrow operations such as "claim this inquiry" rather than a
+generic Slack API tool. Choose destinations according to the data classification: a private
+operations channel or restricted application view may receive requester details, while a public
+channel notification should contain only an inquiry id, non-sensitive category, coarse status, and
+an authenticated link. Direct messages are not automatically an approved PII store. The same
+redaction policy applies to Block Kit, List cells, thread replies, notification previews, model
+context, logs, traces, and error reports.
+
+## Commit Intent Before External Effects
+
+Slack threads, List writes, calendar/text notifications, and other provider calls are side effects
+of canonical intent. In the canonical transaction, apply the inquiry write or transition and append
+an outbox record with a stable idempotency key such as tenant + inquiry + effect type + canonical
+version. Then a bounded worker claims and performs the effect.
+
+Each outbox action records destination class, sanitized request metadata, attempt number, claim
+owner/expiry, provider result reference, error class, next attempt, and final disposition. Bound
+attempts and exponential backoff with jitter, honor Slack `Retry-After`, and park exhausted or
+non-retryable actions for visible manual recovery. Do not hold a Worker open for a long retry delay.
+
+If Slack notification fails after intake commits, the inquiry remains accepted and the UI reports
+"saved; Slack notification pending/failed." If a thread succeeds but the List projection fails,
+record those outcomes independently and retry only the failed effect. If a timeout leaves a provider
+write uncertain, do not blindly create again: first reconcile provider state and the local mapping,
+then update, adopt, recreate, or flag a duplicate according to policy. An outbox prevents lost
+intent; it does not make a non-idempotent provider write exactly once.
+
+## Durable Follow-Up and Escalation
+
+Represent each reminder or escalation as an application-owned durable due-job record. Include tenant
+and inquiry ids, job kind, scheduled time/time-zone basis, payload class, recipient policy reference,
+canonical version or cancellation generation, status, bounded claim owner/expiry, attempt history,
+next attempt, and dead-letter reason. Flue conversation persistence and JavaScript memory timers are
+not general schedulers.
+
+A [Cloudflare Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
+can wake a thin scheduler. On each tick it claims a bounded oldest-due batch using a conditional
+write or exact coordinator, rechecks inquiry state and recipient authorization, emits stable outbox
+actions, and advances or completes the job. Claim expiry makes a crashed worker's jobs eligible
+again; idempotency keys make recovery converge. Concurrent ticks must not both own the same claim.
+Use backoff for retryable failures, dead-letter exhausted jobs, and give operators a reviewed retry,
+cancel, or mark-resolved path. Alert on overdue unclaimed work, expired claims, repeated failures,
+and dead-letter growth. [Cron Posting](../worker-backend/cron-posting.mdx) covers Worker scheduling,
+overlap, and rate-limit mechanics.
+
+## Recommended: Canonical Store, One-Way List Projection
+
+The default architecture commits inquiry writes to the application store and projects a selected,
+privacy-safe active working set into a Slack List. The bot is the operationally sole writer; human
+access is read-only apart from a named owner who does not use the List to edit inquiry truth. The
+List is a convenient board, not an alternate write API.
+
+Persist a mapping from tenant + inquiry id + projection/list id to Slack row id. A projection worker
+reads canonical versions, updates a verified mapped row, or creates and records a row when absence is
+certain. After an uncertain create result, it reconciles before any retry because a missing local
+mapping does not prove the remote row is absent. Track desired version, last success, and error so
+stale rows are visible. Periodically paginate `items.list`, including the archive policy's required
+views, to find missing, duplicated, unexpected, or manually changed rows and reconcile them. Keep the
+mirror below the workspace's plan-dependent cap and define deliberate eviction/recreation behavior.
+
+List cells should carry only the fields approved for the List's audience: for example opaque inquiry
+id, status, priority, owning team, and due date. Keep requester contact and private notes in the
+canonical application unless the destination and every viewer are approved for that data. Give the
+bot `lists:read` and `lists:write` only when needed, configure list/channel permissions deliberately,
+name the human owner/operator, and audit configuration that the API cannot read back.
+
+For exact API mechanics and constraints, use [Lists](../lists/index.mdx),
+[The One-Way Mirror Pattern](../lists/one-way-mirror.mdx),
+[No Events, No Idempotency](../lists/no-events-no-idempotency.mdx), and
+[Choosing a Dashboard Surface](../data-surfaces/choosing-a-dashboard-surface.mdx). Those pages cover
+paid-plan access, row and schema caps, permissions, pagination, missing caller-supplied upsert keys,
+and uncertainty around archive capacity; do not duplicate those assumptions in application logic.
+
+## Experimental: Slack List as Source of Truth
+
+Treat a List-authoritative design as experimental and opt in only after documenting why Slack editing
+is essential. Lists expose no change event stream, so the application must poll and paginate for
+changes; this is delayed reconciliation, not real-time synchronization. There is no caller-supplied
+native upsert key, so stable inquiry-to-row mappings, uncertain-create recovery, and duplicate
+detection remain application responsibilities.
+
+Before a pilot, specify all of the following:
+
+- who may edit, who owns the List, how app uninstall/owner departure is recovered, and how access is
+  audited despite API read-back gaps;
+- the paid-plan/admin gates, item/subtask and schema caps, required scopes, per-list permissions, API
+  pagination/rate tiers, and a bounded working-set policy;
+- which side wins simultaneous application and human edits, how field-level versions or timestamps
+  are compared, and where conflicts wait for manual resolution;
+- how row archive, unarchive, deletion, duplicate merge, List deletion, and mapping loss change the
+  canonical lifecycle;
+- how non-Slack consumers obtain consistent reads while polling is behind or Slack is unavailable.
+
+Human edits still pass through a reconciliation command that validates tenant, actor, transition,
+and version before committing application state. Invalid edits are reverted or quarantined visibly;
+they never silently override server policy. Until that end-to-end contract is proven under outages
+and concurrent edits, prefer the one-way projection.
+
+## Retention, Archive, and Deletion
+
+Archive is a canonical lifecycle operation, not a hidden Slack row. Record who archived an inquiry,
+when, why, and its retention deadline; cancel or supersede future jobs and queue privacy-safe
+projection cleanup. Unarchive must reauthorize the actor, restore only permitted jobs/projections,
+and append another transition rather than erasing history.
+
+Retention and permanent deletion are server-enforced. A UI-hidden button or archived List view does
+not satisfy them. A scheduled policy job selects eligible tenant records, observes legal/security
+holds, deletes or irreversibly anonymizes classified fields, removes Slack rows/messages where the
+approved policy requires it, revokes mappings, and records a minimal non-PII deletion tombstone.
+Provider deletion failure remains visible and retryable. Define backup, audit-log, model/eval, and
+observability retention separately; deleting the canonical row alone does not delete those copies.
+
+## Contract and End-to-End Tests
+
+Keep the default suite synthetic and network-free. Cover at least:
+
+- public intake validation/normalization, attachment limits, honeypot, origin/CSRF, rate-limit, and
+  PII classification/redaction boundaries;
+- duplicate submissions, repeated provider deliveries, stable idempotency keys, and the uncertain
+  external-write branch;
+- every allowed/forbidden lifecycle edge, stale optimistic versions, simultaneous claims, and
+  assignment races;
+- unauthorized, removed, or cross-tenant actors; tenant-scoped workspace/enterprise + channel + root
+  thread/List keys; and server-bound destinations;
+- Slack thread creation/recovery, List row create/update/reconcile, duplicate/missing/archived rows,
+  pagination, permissions, cap failures, and stale-projection visibility;
+- bounded due-job claims, overlapping ticks, claim expiry after restart, cancellation races, retry
+  backoff, exhausted dead-lettering, and reviewed manual recovery;
+- independent success/failure for thread, List, calendar, text, and other outbox effects, including
+  `429`, `5xx`, timeout-with-unknown-result, and permanent authorization failures;
+- archive/unarchive, retention holds, permanent deletion/anonymization, provider cleanup retry, and
+  attempts to bypass those policies through the UI, model, or Slack;
+- an end-to-end path from intake through Slack thread/List projection, authorized assignment,
+  follow-up/escalation, resolution, archive, and retention enforcement.
+
+[Testing and Operations](./testing-and-operations.mdx) supplies the raw-body, admission/effect,
+fake-Slack, scheduled dispatch, observability, and selective-eval contracts that complement this
+use-case suite.

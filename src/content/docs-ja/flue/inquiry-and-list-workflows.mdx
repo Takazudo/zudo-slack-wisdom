@@ -1,0 +1,218 @@
+---
+title: 問い合わせと Slack List のワークフロー
+description: 問い合わせの canonical record、privacy-safe な Slack projection、durable follow-up、recovery contract
+sidebar_position: 7
+---
+
+問い合わせ agent は会話を調整するものであり、いつの間にか問い合わせ database になってはならない。
+同様に Slack は interaction と visibility の surface であって、自動的に durable な business truth の
+source になるわけではない。schema、authorization policy、運用 runbook では、次の 3 つの state boundary を
+明示する。
+
+1. **Flue conversation state** は認可済みの 1 conversation に対する model-visible な context、すなわち
+   直近の turn、小さな coordination flag、tool result である。その identity は tenant-scoped だが、history は
+   canonical inquiry、audit log、job table ではない。
+2. **Canonical inquiry business state** は application が所有する durable record である。すべての channel が
+   参照する lifecycle、authorization、assignment、deadline、retention、audit history を定義する。
+3. **Slack projection state** は問い合わせが Slack のどこに現れ、その copy がどれだけ新しいかを記録する。
+   workspace または enterprise installation、channel、root thread/message、List と row の identifier、
+   reconciliation cursor、最後に成功した sync、desired version、observed version、last error が含まれる。
+
+この分離により、case を削除せず conversation を trim でき、business truth を変えず Slack message や List を
+再作成でき、Slack outage を intake 消失ではなく partial failure として報告できる。Flue の基本 boundary は
+[コアコンセプトと API](./core-concepts-and-api.mdx#data-boundaries)、verified ingress、迅速な acknowledge、
+destination-bound tool は [Slack リクエストの処理](./slack-request-handling.mdx)を参照する。
+
+## Canonical Inquiry Contract
+
+問い合わせには、認可済み tenant 内で application が生成する stable id を付ける。その source
+（`public_form`、`authenticated_portal`、`slack`、または別の bounded enum）は provider delivery id と分けて
+保存する。実用的な canonical record には次を含める。
+
+- 明示的な privacy classification、収集目的、visibility、retention class を伴う requester/contact field。
+- status、priority、owner、responsible team、watcher。
+- `created_at`、`updated_at`、`closed_at`、due time、next follow-up、SLA target、breach time、
+  escalation level。
+- optimistic version、source-operation key、idempotency key。
+- append-only な transition、assignment change、operator note、policy decision、actor/time の audit metadata。
+
+Slack mapping、reminder/escalation job、external action/outbox attempt は、別の table または record family にする。
+operator note に machine delivery state を、Slack row id に business identity を兼用させない。
+
+`new`、`triaged`、`in_progress`、`waiting`、`resolved`、`cancelled` のような明示的 lifecycle を使う。
+各 product が独自の allowed transition graph を定義し、server で検証しなければならない。例えば triage action が
+version 3 の `new` を claim して version 4 の `triaged` に進めたなら、同じ version を指定した別 operator の
+conditional update は失敗し、reload が必要になる。model、button payload、List cell は transition を
+*request* できるだけで、current version、actor、tenant、permitted edge、required field、terminal-state rule を
+検査するのは canonical service だけである。
+
+assignment も同じ規則に従う。Slack actor を authorized installation 内の application principal に解決し、
+その principal の team/role policy を検査したうえで canonical inquiry を conditional update する。model/tool
+input から owner id、tenant id、channel、token、任意の transition を受け取らない。受理または拒否した action
+には opaque request id 付きの audit entry を残す。sensitive な message や contact content は通常 log に
+含めない。
+
+## Tenant-Scoped Slack Identity
+
+`channel_id + thread_ts` だけでは global uniqueness が不足する。すべての Slack link を authorized
+installation と destination で key 化する。
+
+- enterprise id がある場合は enterprise id **と** workspace id、なければ workspace id。
+- channel id。
+- root thread timestamp（`thread_ts`、なければ root message の `ts`）。
+- 1 workspace に複数 installation があり得る場合は app/installation identity。
+
+List id と row id も同じ tenant boundary の内側に保存する。攻撃者が別 workspace の正しい形式の Slack id を
+渡しても cross-tenant lookup は fail closed にする。reply は最新 event の untrusted な destination field では
+なく、保存済み root-thread mapping を使う。reinstall、channel 移動、row 再作成、thread 置換では新しい
+projection mapping と audit event を作り、inquiry id は書き換えない。
+
+## Intake と Operator の Boundary
+
+public intake と authenticated operator action は異なる route と threat model として扱う。public intake は
+documented requester field だけを受け入れ、length/encoding を normalize し、attachment を別途 validate する。
+honeypot を低コストの signal として使い、browser credential が関係する場合は allowed-origin/CSRF policy を
+強制し、privacy review 済み signal で rate-limit する。honeypot、`Origin`、rate limit は defense in depth で
+あり identity ではない。Slack notification より先に受理した問い合わせを永続化し、internal channel id や
+user id を明かさない stable receipt を返す。
+
+operator action には authenticated application identity または raw-body-verified な Slack callback が必要で、
+その後 installation、actor、tenant、channel、operation を認可する。この repository の Slack sequence、つまり
+正確な request byte を読み、timestamp と signature を検証し、その後にだけ parse と authorize を行う順序を
+維持する。高速な acknowledgement は Slack delivery の受理を示すだけで、business transition や後続の
+side effect の成功を意味しない。
+
+Slack OAuth scope を最小化し、generic Slack API tool ではなく「この問い合わせを claim する」のような narrow
+operation を公開する。data classification に応じて destination を選ぶ。private operations channel や
+restricted application view には requester detail を置ける場合がある一方、public channel notification には
+inquiry id、非機密 category、粗い status、authenticated link だけを含める。DM だから自動的に認可済み PII
+store になるわけではない。同じ redaction policy を Block Kit、List cell、thread reply、notification preview、
+model context、log、trace、error report に適用する。
+
+## External Effect より先に Intent を Commit する
+
+Slack thread、List write、calendar/text notification、その他 provider call は canonical intent の side effect
+である。canonical transaction で inquiry write または transition を適用し、tenant + inquiry + effect type +
+canonical version のような stable idempotency key を持つ outbox record を append する。その後、bounded
+worker が effect を claim して実行する。
+
+各 outbox action には destination class、sanitized request metadata、attempt number、claim owner/expiry、
+provider result reference、error class、next attempt、final disposition を記録する。attempt と exponential
+backoff with jitter を制限し、Slack の `Retry-After` を尊重し、retry を使い切った action や non-retryable な
+action を可視な manual recovery に退避する。長い retry delay のために Worker を起動し続けない。
+
+intake commit 後に Slack notification が失敗しても、問い合わせは受理済みのままにし、UI には「保存済み、
+Slack notification は pending/failed」と表示する。thread は成功し List projection が失敗した場合、結果を
+独立して記録し、失敗した effect だけを retry する。timeout で provider write の結果が不明なら、blind create
+を繰り返さない。provider state と local mapping を先に reconcile し、policy に従って update、adopt、recreate、
+duplicate flag のいずれかを行う。outbox は intent の消失を防ぐが、non-idempotent な provider write を
+exactly-once にはしない。
+
+## Durable な Follow-Up と Escalation
+
+各 reminder または escalation を application-owned な durable due-job record として表現する。tenant id、
+inquiry id、job kind、scheduled time/time-zone basis、payload class、recipient policy reference、canonical
+version または cancellation generation、status、bounded claim owner/expiry、attempt history、next attempt、
+dead-letter reason を含める。Flue conversation persistence と JavaScript memory timer は general scheduler
+ではない。
+
+[Cloudflare Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/) で thin
+scheduler を起動できる。各 tick で conditional write または exact coordinator により oldest-due の bounded
+batch を claim し、inquiry state と recipient authorization を再検査し、stable outbox action を emit して、
+job を advance または complete する。claim expiry によって crash した worker の job は再び対象になり、
+idempotency key によって recovery が収束する。concurrent tick が同じ claim を同時に所有してはならない。
+retryable failure には backoff、使い切った job には dead-letter を使い、operator に reviewed retry、cancel、
+mark-resolved path を用意する。期限超過した未 claim work、expired claim、繰り返す failure、dead-letter 増加を
+alert する。Worker scheduling、overlap、rate-limit の mechanics は
+[Cron による定期投稿](../worker-backend/cron-posting.mdx)を参照する。
+
+## 推奨: Canonical Store から List への One-Way Projection
+
+default architecture では問い合わせ write を application store に commit し、privacy-safe に選択した active
+working set を Slack List に project する。bot が運用上唯一の writer である。人間の access は read-only とし、
+問い合わせの truth を List 上で edit しない named owner だけを例外とする。List は便利な board だが別の write
+API ではない。
+
+tenant + inquiry id + projection/list id から Slack row id への mapping を永続化する。projection worker は
+canonical version を読み、verified mapping の row を update するか、absence が確実な場合に row を create して
+記録する。create の結果が不明な場合、local mapping がないことは remote row の不存在を証明しないため、retry
+より前に reconcile する。desired version、last success、error を追跡して stale row を可視化する。定期的に
+`items.list` を paginate し、archive policy が要求する view も含め、missing、duplicated、unexpected、manual
+edit された row を検出して reconcile する。mirror は workspace の plan-dependent cap より十分小さく保ち、
+意図的な eviction/recreation behavior を定義する。
+
+List cell にはその List の audience に承認された field だけを置く。例えば opaque inquiry id、status、priority、
+owning team、due date である。destination と全 viewer が data について認可済みでない限り、requester contact と
+private note は canonical application に残す。必要な場合だけ bot に `lists:read` と `lists:write` を与え、
+list/channel permission を意図的に設定し、人間の owner/operator を指名し、API で read-back できない設定を
+audit する。
+
+正確な API mechanics と constraint は [Lists](../lists/index.mdx)、
+[ワンウェイミラーパターン](../lists/one-way-mirror.mdx)、
+[イベントなし、冪等性なし](../lists/no-events-no-idempotency.mdx)、
+[ダッシュボードサーフェスの選び方](../data-surfaces/choosing-a-dashboard-surface.mdx)を参照する。これらの page は
+paid-plan access、row/schema cap、permission、pagination、caller-supplied upsert key の欠如、archive capacity の
+不確実性を扱っている。それらの assumption を application logic に重複して埋め込まない。
+
+## 実験的: Slack List を Source of Truth にする
+
+List-authoritative design は experimental とし、Slack 上での editing が不可欠な理由を文書化した場合だけ opt in
+する。Lists には change event stream がないため、application が change を poll、paginate しなければならない。
+これは delayed reconciliation であって real-time synchronization ではない。caller-supplied native upsert key
+もないため、stable な inquiry-to-row mapping、uncertain-create recovery、duplicate detection は引き続き
+application の責任である。
+
+pilot の前に次をすべて定義する。
+
+- 誰が edit でき、誰が List を own し、app uninstall/owner departure からどう recover し、API の read-back
+  gap があっても access をどう audit するか。
+- paid-plan/admin gate、item/subtask と schema の cap、required scope、per-list permission、API
+  pagination/rate tier、bounded working-set policy。
+- application と人間の同時 edit でどちらが勝ち、field-level version または timestamp をどう比較し、conflict を
+  どこで manual resolution 待ちにするか。
+- row の archive、unarchive、deletion、duplicate merge、List deletion、mapping loss が canonical lifecycle を
+  どう変えるか。
+- polling の遅延中または Slack unavailable 時に、non-Slack consumer が consistent read をどう得るか。
+
+人間による edit も、application state への commit 前に tenant、actor、transition、version を検証する
+reconciliation command を通す。invalid edit は可視的に revert または quarantine し、server policy を黙って
+上書きさせない。この end-to-end contract が outage と concurrent edit のもとで証明されるまでは one-way
+projection を選ぶ。
+
+## Retention、Archive、Deletion
+
+archive は hidden Slack row ではなく canonical lifecycle operation である。誰が、いつ、なぜ問い合わせを
+archive したかと retention deadline を記録し、future job を cancel または supersede し、privacy-safe な
+projection cleanup を queue する。unarchive は actor を再認可し、許可された job/projection だけを restore し、
+history を消さずに別の transition を append する。
+
+retention と permanent deletion は server-enforced にする。UI で button を隠すことや List の archived view
+だけでは要件を満たさない。scheduled policy job が eligible tenant record を選択し、legal/security hold を
+守り、classified field を delete または不可逆 anonymize し、承認済み policy が要求する Slack row/message を
+削除し、mapping を revoke して、最小限の non-PII deletion tombstone を記録する。provider deletion failure は
+可視かつ retryable のままにする。backup、audit log、model/eval、observability の retention は個別に定義する。
+canonical row だけを削除しても、それらの copy は削除されない。
+
+## Contract Test と End-to-End Test
+
+default suite は synthetic かつ network-free に保つ。少なくとも次を cover する。
+
+- public intake の validation/normalization、attachment limit、honeypot、origin/CSRF、rate-limit、PII
+  classification/redaction boundary。
+- duplicate submission、provider delivery の繰り返し、stable idempotency key、uncertain external-write branch。
+- すべての allowed/forbidden lifecycle edge、stale optimistic version、simultaneous claim、assignment race。
+- unauthorized、removed、cross-tenant actor、tenant-scoped な workspace/enterprise + channel + root thread/List key、
+  server-bound destination。
+- Slack thread の create/recovery、List row の create/update/reconcile、duplicate/missing/archived row、pagination、
+  permission、cap failure、stale-projection visibility。
+- bounded due-job claim、overlapping tick、restart 後の claim expiry、cancellation race、retry backoff、exhausted
+  dead-letter、reviewed manual recovery。
+- thread、List、calendar、text、その他 outbox effect の独立した success/failure。`429`、`5xx`、
+  timeout-with-unknown-result、permanent authorization failure を含む。
+- archive/unarchive、retention hold、permanent deletion/anonymization、provider cleanup retry、および UI、model、
+  Slack からそれらの policy を bypass しようとする試み。
+- intake から Slack thread/List projection、authorized assignment、follow-up/escalation、resolution、archive、
+  retention enforcement までの end-to-end path。
+
+[テストと運用](./testing-and-operations.mdx)には、この use-case suite を補う raw-body、admission/effect、
+fake-Slack、scheduled dispatch、observability、selective-eval の contract がある。
