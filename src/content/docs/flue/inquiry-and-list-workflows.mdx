@@ -162,6 +162,33 @@ For exact API mechanics and constraints, use [Lists](../lists/index.mdx),
 paid-plan access, row and schema caps, permissions, pagination, missing caller-supplied upsert keys,
 and uncertainty around archive capacity; do not duplicate those assumptions in application logic.
 
+### Activation and Reconciliation Controls
+
+Keep a new List projection disabled by default. An audited, reversible activation probe must verify
+access, schema, create/write/read-back behavior, and cleanup before promotion to active. Persist the
+resolved opaque column/option ids with a schema fingerprint, and fail closed when either drifts. Keep
+schema health, explicit activation state, sync health, and a destination-wide rate-limit cooldown as
+separate state: a healthy schema does not clear a cooldown or authorize an inactive projection.
+
+For creates, store a versioned opaque ownership marker in a dedicated remote field as well as the
+local mapping. That identity lets reconciliation recover an accepted create whose response or local
+write was lost; delete only rows positively identified as owned. When approved humans may edit a
+projection, compare normalized remote cells with the desired state instead of relying on a hash of
+the last local write.
+
+Reconcile active and archived inventories separately. Model `active`, `archived`, `missing_once`,
+`confirmed_missing`, `duplicate`, `foreign`, and `owned_unmapped` as distinct outcomes; prefer an
+active row for an active desired projection and delay recreation after a first absence. Retain delete
+tombstones until a complete scan confirms absence. Record `last_attempted`,
+`last_successfully_observed`, `last_fully_applied`, backlog age, and coverage/budget watermarks
+separately, because an error-free bounded run may still be incomplete.
+
+Classify retries by failure scope: authorization, permission, and schema failures open a
+destination-level circuit; rate limits set the shared cooldown without consuming a row's permanent
+failure budget; capacity needs eviction or operator action; permanent row-data errors quarantine only
+that row. Stable run locks, heartbeat leases, and fenced claims coordinate workers, but do not
+replace external-effect idempotency or reconciliation.
+
 ## Experimental: Slack List as Source of Truth
 
 Treat a List-authoritative design as experimental and opt in only after documenting why Slack editing
@@ -215,6 +242,9 @@ Keep the default suite synthetic and network-free. Cover at least:
   thread/List keys; and server-bound destinations;
 - Slack thread creation/recovery, List row create/update/reconcile, duplicate/missing/archived rows,
   pagination, permissions, cap failures, and stale-projection visibility;
+- default-disabled List activation, reversible cleanup, schema-fingerprint drift, destination circuit
+  behavior, shared rate cooldown, ownership-marker version/forgery, active-versus-archived selection,
+  incomplete scans, zero-I/O disabled mode, and manual-recovery failure;
 - bounded due-job claims, overlapping ticks, claim expiry after restart, cancellation races, retry
   backoff, exhausted dead-lettering, and reviewed manual recovery;
 - independent success/failure for thread, List, calendar, text, and other outbox effects, including

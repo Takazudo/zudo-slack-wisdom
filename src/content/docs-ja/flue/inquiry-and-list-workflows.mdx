@@ -154,6 +154,30 @@ audit する。
 paid-plan access、row/schema cap、permission、pagination、caller-supplied upsert key の欠如、archive capacity の
 不確実性を扱っている。それらの assumption を application logic に重複して埋め込まない。
 
+### Activation と Reconciliation の Control
+
+新しい List projection は default で disabled に保つ。監査可能で reversible な activation probe で access、schema、
+create/write/read-back の挙動、cleanup を確認してから active に promote する。解決済みの opaque な column/option id と
+schema fingerprint を保存し、いずれかが drift したら fail closed にする。schema health、明示的な activation state、
+sync health、destination 全体の rate-limit cooldown は別々の state にする。schema が healthy でも cooldown を消したり
+inactive な projection を authorize したりしてはならない。
+
+create では local mapping に加え、専用 remote field に versioned で opaque な ownership marker を保存する。この
+identity により、response または local write を失った accepted create を reconciliation で回復できる。削除するのは
+positively owned と確認できた row だけである。承認済みの人間が projection を edit できる場合は、last local write の
+hash に頼らず、normalized した remote cell と desired state を比較する。
+
+active と archived の inventory は別々に reconcile する。`active`、`archived`、`missing_once`、
+`confirmed_missing`、`duplicate`、`foreign`、`owned_unmapped` を別の outcome として model 化する。active な desired
+projection には active row を優先し、最初の absence の直後には recreate しない。delete tombstone は complete scan が
+absence を確認するまで保持する。`last_attempted`、`last_successfully_observed`、`last_fully_applied`、backlog age、
+coverage/budget watermark も個別に記録する。error-free な bounded run でも incomplete でありうるためである。
+
+retry は failure scope に応じて分類する。authorization、permission、schema failure は destination-level circuit を開き、
+rate limit は row の permanent failure budget を消費せず shared cooldown を設定する。capacity は eviction または
+operator action を必要とし、permanent row-data error はその row だけを quarantine する。stable な run lock、heartbeat
+lease、fenced claim は worker を調整するが、external-effect idempotency や reconciliation の代わりにはならない。
+
 ## 実験的: Slack List を Source of Truth にする
 
 List-authoritative design は experimental とし、Slack 上での editing が不可欠な理由を文書化した場合だけ opt in
@@ -205,6 +229,9 @@ default suite は synthetic かつ network-free に保つ。少なくとも次�
   server-bound destination。
 - Slack thread の create/recovery、List row の create/update/reconcile、duplicate/missing/archived row、pagination、
   permission、cap failure、stale-projection visibility。
+- default-disabled な List activation、reversible cleanup、schema-fingerprint drift、destination circuit の挙動、shared
+  rate cooldown、ownership marker の version/forgery、active と archived の選択、incomplete scan、zero-I/O disabled mode、
+  manual-recovery failure。
 - bounded due-job claim、overlapping tick、restart 後の claim expiry、cancellation race、retry backoff、exhausted
   dead-letter、reviewed manual recovery。
 - thread、List、calendar、text、その他 outbox effect の独立した success/failure。`429`、`5xx`、
