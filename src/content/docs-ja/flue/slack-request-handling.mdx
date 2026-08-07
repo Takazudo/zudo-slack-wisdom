@@ -1,0 +1,228 @@
+---
+title: Slack リクエストの処理
+description: Flue 2.0.3 の安全な Slack ingress、tenant-aware な thread identity、retry の収束、宛先を固定した tool
+sidebar_position: 5
+---
+
+## Channel の境界
+
+`flue add channel slack` を実行し、編集可能な channel code と必要な package を追加する。Flue
+2.0.3 では、[`@flue/slack`](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/README.md)
+が認証済み inbound HTTP を担当する。Slack request の検証、provider-native payload の parse、
+Events API・interaction・slash command delivery の設定済み callback への route が責務である。
+これは stateless で、Slack への message 送信は行わない。Outbound call は公式
+`@slack/web-api` client を通して application が所有し、token 選択、authorization、rate limit
+処理、model tool の設計も application の責務になる。
+
+検証済み request であっても、agent の利用まで許可されたことにはならない。Dispatch の前に、
+application code が Slack app id、enterprise または workspace installation、actor、channel、
+event/action type、要求された business operation を許可する必要がある。Outbound effect ごとにも
+同じ installation を認可し、許可された宛先を server-side で固定する。
+
+## 使用する surface だけを mount する
+
+Flue 2 では `app.ts` が明示的な route map である。Channel router を mount するまで HTTP traffic
+は提供されない。Router 内でも Events API、interaction、command の route は対応する callback
+を設定した場合だけ存在し、`createSlackChannel()` には少なくとも 1 つの callback が必要になる。
+これはタグ付き
+[`createSlackChannel` contract](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/src/index.ts)
+の動作である。
+
+```typescript
+// app.ts
+import { Hono } from "hono";
+import { channel as slack } from "./channels/slack.ts";
+
+const app = new Hono();
+app.route("/channels/slack", slack.route());
+
+export default app;
+```
+
+この mount の場合、application が必要とする callback URL だけを Slack に設定する。
+
+- `events` を設定すると `POST /channels/slack/events` が存在する。
+- `interactions` を設定すると `POST /channels/slack/interactions` が存在する。
+- `commands` を設定すると `POST /channels/slack/commands` が存在する。
+
+受け取って無視する callback を mount するより、不要な surface は省く。省略した route が `404`
+になることを test し、Slack app の設定と deploy 済み route set を一致させる。
+
+## 検証と acknowledgement
+
+`@flue/slack` は正確な request byte を読み、body limit を適用し、
+`X-Slack-Request-Timestamp` が 5 分以内であることと `X-Slack-Signature` を検証してから JSON
+または form data を parse する。URL verification も認証後に内部処理される。Mount した router
+の前に、body を消費または書き換える body parser、正規化 middleware、別 handler を置かない。
+
+Protocol の詳細と単独 Worker での実装は
+[リクエストを検証する](../worker-backend/verifying-requests.mdx)にある。Channel package を将来置換・
+wrap する場合も、raw byte を parse より前に検証する順序を維持する。
+
+Slack には即座に acknowledgement を返す必要があり、model call などの重い処理で response を
+遅らせてはならない。Cloudflare では dispatch や application job を execution context に登録し、
+callback から空の `200` を返す。[3 秒以内の ack](../worker-backend/three-second-ack.mdx)で response
+window と deferred-work pattern を、[Workers 上の Events API](../events/events-api-on-workers.mdx)
+で Slack の retry mechanics を確認する。Slack には acknowledgement 済みなので、deferred work
+内で failure を捕捉して観測する。
+
+## Events: 認可、filter、identity、dispatch
+
+次は application pattern であり、そのまま使える authorization policy ではない。
+[Source Map と versioning](./source-map-and-versioning.mdx)に記録した blueprint/runtime の既知の差異を
+修正し、すべての Events API dispatch で `payload.event_id` を `idempotencyKey` として渡している。
+
+```typescript
+import { dispatch } from "@flue/runtime";
+import { createSlackChannel, type SlackEvent } from "@flue/slack";
+import { Assistant } from "../agents/assistant.ts";
+
+const allowedMessageSubtypes = new Set([undefined, "thread_broadcast"]);
+
+function shouldIgnoreMessage(event: SlackEvent, botUserId: string): boolean {
+  if (event.type !== "message" && event.type !== "app_mention") return false;
+  const message = event as SlackEvent & {
+    bot_id?: string;
+    subtype?: string;
+    user?: string;
+  };
+  return (
+    message.bot_id !== undefined ||
+    message.user === botUserId ||
+    !allowedMessageSubtypes.has(message.subtype)
+  );
+}
+
+function tenantKey(enterpriseId: string | null, workspaceId: string): string {
+  return enterpriseId
+    ? `enterprise:${enterpriseId}:workspace:${workspaceId}`
+    : `workspace:${workspaceId}`;
+}
+
+export const channel = createSlackChannel({
+  signingSecret: process.env.SLACK_SIGNING_SECRET!,
+
+  async events({ c, payload }) {
+    if (payload.type !== "event_callback") return;
+    const enterpriseId = payload.context_enterprise_id ?? payload.enterprise_id ?? null;
+    const workspaceId = payload.context_team_id ?? payload.team_id;
+    const installation = authorizeInstallation({
+      appId: payload.api_app_id,
+      enterpriseId,
+      workspaceId,
+    });
+    if (!installation) return;
+    if (payload.event.type !== "app_mention") return;
+    if (shouldIgnoreMessage(payload.event, installation.botUserId)) return;
+
+    const event = payload.event;
+    if (!isAllowedActor(installation, event.user)) return;
+    if (!isAllowedChannel(installation, event.channel)) return;
+
+    const rootThreadTs = event.thread_ts ?? event.ts;
+    const thread = {
+      teamId: tenantKey(enterpriseId, workspaceId),
+      channelId: event.channel,
+      threadTs: rootThreadTs,
+    };
+
+    c.executionCtx.waitUntil(
+      dispatch(Assistant, {
+        id: channel.instanceId(thread),
+        idempotencyKey: payload.event_id,
+        initialData: {
+          enterpriseId,
+          workspaceId,
+          channelId: event.channel,
+          rootThreadTs,
+          startedBy: event.user,
+          startedAt: new Date(Number(event.ts) * 1000).toISOString(),
+        },
+        message: {
+          kind: "signal",
+          type: "slack.app_mention",
+          body: event.text,
+          attributes: { eventId: payload.event_id },
+        },
+      }).catch((error: unknown) => recordDispatchFailure(error, payload.event_id)),
+    );
+  },
+});
+```
+
+`message` subscription では、許可する subtype を明示的に選ぶ。Product が意図して扱わない限り、
+`bot_message`、`message_changed`、`message_deleted`、channel join/leave notice などの subtype 固有
+event を通常の user prompt として通してはならない。`bot_id` と app 自身の bot user id も拒否する。
+これにより agent の reply が Events API から戻り、feedback loop を始めるのを防ぐ。
+
+Instance id には、enterprise がある場合は namespace 付き enterprise + workspace identity、なければ
+workspace identity を入れ、その後に channel と root thread timestamp を続ける。`teamId` という property
+名は v2.0.3 helper の制約で、上の値は application tenant key である。Enterprise と workspace の両方を
+含めることで、同じ Grid organization 内の別 workspace installation が混ざるのを避ける。Instance id
+は conversation を選ぶが、access は許可しない。
+
+`initialData` は immutable な creation facts を持つ。Agent の static `initialData` schema を定義し、
+instance 作成時に Flue がこれらの field を検証するようにして、`useInitialData()` から parse 済み値を
+読む。繰り返しの dispatch で同じ creation facts を渡してもよいが、作成後は Flue が無視する。
+Delivery ごとの非 secret facts は signal の `attributes` に置き、`eventId` は correlation に利用できる。
+どちらも authorization store として扱わない。
+
+## 3 つの異なる dedupe 境界
+
+Events API envelope には `event_id` がある。Flue 2.0.3 の idempotency key 付き dispatch は同じ
+agent、instance、caller key から同じ submission identity を導くため、Slack redelivery は元の admission
+に収束する。タグ付き Slack blueprint は `event_id` を attribute にだけ記録して key を省いているため、
+上記の runtime/package contract に従う。
+
+Interaction には Events envelope の globally unique な `event_id` がない。重要な button/modal action
+では component の `value` に application の business-operation id を入れ、tenant と actor を認可し、
+durable state transition を conditional にする（たとえば pending から approved への変更は 1 回だけ）。
+Scoped `action_ts` は診断の correlation には使えるが、Slack はすべての interaction family を横断する
+universal idempotency key として保証していない。
+
+Slash command にも `event_id` はなく、同じ actor からの同一 command が意図的な 2 回の invocation
+である場合がある。Command text の hash でまとめない。Repeat-sensitive な effect を要求する command
+では durable な application operation id を必須にするか解決し、business-state boundary で uniqueness
+を強制する。安定した operation identity がない場合は at-least-once handler とみなし、external effect
+をそれぞれ安全に retry できるようにする。
+
+:::danger[短命な capability は identity ではない]
+Interaction と command payload には短命な `trigger_id` と `response_url` capability が含まれることが
+ある。Immediate な trusted request handling だけで使う。Instance id や dedupe key には使わず、
+dispatched message、model input、durable history、log、trace、fixture、long-lived tool state に入れては
+ならない。View の `response_urls` array 内の entry にも同じ規則を適用する。
+:::
+
+Flue admission の収束は最初の境界にすぎない。Events delivery の反復が 2 回目の submission を始める
+ことは防ぐが、admit 済み turn 内の tool call、database mutation、Slack post、retry が idempotent には
+ならない。External effect ごとに `event_id + effect_name + destination` のような application key を
+作り、durable storage 上で atomic に claim し、provider result を記録してから完了とみなす。Remote
+call は成功したが結果の記録に失敗した、という曖昧な場合の recovery も設計する。
+
+## 宛先を固定した outbound tool
+
+検証済み `initialData` と認可済み installation record から tool を組み立てる。Model が与えられるのは
+reply text のような狭い content だけで、token、workspace、channel、thread timestamp、Web API method
+名、任意 URL は入力させない。Tool closure がそれらを固定し、実行時にも authorization を再確認する。
+Output の size と shape を検証し、必要最小限の provider identifier だけを返し、Slack call の前に
+application idempotency key を適用する。
+
+Native Web API behavior、`429` response、`Retry-After` は
+[fetch で Web API を呼ぶ](../worker-backend/web-api-with-fetch.mdx)と
+[レート制限](../messaging/rate-limits.mdx)で扱っている。公式 `@slack/web-api` client が request を行う
+場合も同じ規則が適用される。
+
+## Application security の責務
+
+- 実装した path が必要とする event/Web API scope だけを要求する。Tool を追加するたび scope を
+  再確認する。[Token・scope・OAuth](../getting-started/tokens-scopes-oauth.mdx)を参照。
+- Installation record と token の rotation/revocation lifecycle は application-owned storage に置く。
+  認可済み enterprise/workspace installation を解決してから token を選ぶ。
+- Private-channel content や personally identifiable information を agent history/model input に入れて
+  よいかを明示的に決める。Default は拒否とし、保持 content を最小化し、deletion/retention policy
+  に従う。
+- Human/bot actor に要求された operation の権限があるか確認する。Slack signature verification が
+  証明するのは delivery の真正性であり、actor が business record を承認・開示・変更できることではない。
+- Payload と acknowledgement の mechanics は
+  [インタラクティビティのペイロード](../events/interactivity-payloads.mdx)を参照し、その transient
+  callback field は durable agent boundary の外に置く。
