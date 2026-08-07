@@ -1,0 +1,304 @@
+---
+title: 提案段階の text / calendar tool
+description: Flue agent から remote text と calendar を自動化する将来の least-privilege contract
+sidebar_position: 7
+---
+
+:::danger[提案のみ: このような Flue API は存在しない]
+このページの endpoint、field、error code、tool 名はすべて、**将来 application で検討するための
+例示的 contract** である。Flue 2.0.3 は remote-text または calendar automation service を提供せず、
+以下の名前は application が実装して review するまで呼び出せない。
+:::
+
+## Replication と automation を分離する
+
+暗号化 synchronization transport は、title、document、event、recurrence、reminder の意味を理解せず
+opaque blob を replication できる。その surface は low-level のまま維持する。Slack app や Flue
+agent はそれを通して calendar の意味を安全に query できず、一般的な vault key や decryption key を
+決して受け取ってはならない。
+
+将来の automation surface には、独立した明示的な consent と次のいずれかの設計が必要になる。
+
+- 承認された operation に必要な field だけを返す least-privilege authenticated plaintext API。
+- automation のために構築された、個別に consent された privacy-filtered projection または index。
+
+これは sync transport の便利な view ではなく、2 つ目の security boundary である。Projection に
+入る collection を記録し、retention を最小化し、revocation と deletion を伝播し、projection lag を
+可視化する。User が新しい vault、document tree、calendar を追加したとき、projection が暗黙に
+access を広げてはならない。
+
+## Application を認可してから tool を制約する
+
+各 automation token を 1 つの tenant または Slack workspace と allowlist 済み resource collection
+に bind する。`documents:read`、`documents:write`、`calendar:read` のような granular scope を付与し、
+read-only installation を default にして不要な scope を省く。Token は non-delegating であり、sibling
+token の mint、exchange、select はできない。Credential は検証済み application context から解決し、
+application-owned storage で rotate / revoke し、model input や tool state に置かない。
+
+External adapter は call ごとに独立して authorization を行う。Model intent、検証済み Slack
+request、conversation id、stable resource id の保持は authorization ではない。実行時に tenant、
+installation、actor、operation、scope、collection、現在の resource policy を再確認する。存在しない
+resource と authorized collection 外の resource には、enumeration を防ぐ同じ denial を返す。
+
+Tool input に含めるのは stable domain id と operation 固有の value だけである。Token、tenant、
+collection、可変な title、list position、provider method、hostname、任意の destination URL は受け取ら
+ない。Adapter が destination と credential を server-side で bind する。これは
+[Slack リクエストの処理](./slack-request-handling.mdx)と同じ destination-bound rule である。Model が
+call できる tool は application が提供する capability であり、authorization boundary ではない。
+
+## 共通の reliability envelope
+
+将来の text / calendar operation はすべて、小さな typed envelope を返すべきである。Success には
+生成した `requestId`、stable resource id、resource に存在する場合は authoritative version または
+ETag、server timestamp を含める。Mutation acknowledgement が success になるのは、canonical
+content、version、change-log entry が atomically に durable commit された後だけである。Local queue
+や outbox への admission は remote mutation の成功ではない。
+
+Failure には stable な `code`、`requestId`、人に見せて安全な summary、`retryable` boolean、必要な
+場合の `retryAfter` を含める。少なくとも authorization denial、validation failure、not found、version
+conflict、idempotency conflict、cursor expired / invalid、rate limited、upstream timeout、uncertain
+storage、unavailable を定義する。Error detail で secret や private content を公開しない。
+
+- Validation と通常の authorization failure は non-retryable `4xx` outcome にする。
+- 古い expected version は、現在の安全な metadata と current version だけを含む typed conflict にし、
+  last-write-wins を暗黙に適用しない。
+- `429` は bounded な server-provided retry delay を持つ。Retryable `5xx`、network timeout、uncertain
+  storage には、上限付き exponential backoff と jitter を使用する。
+- External write 後の timeout は outcome が unknown の可能性がある。Idempotency record または status
+  lookup で recovery し、新しい key をすぐ生成して effect を繰り返さない。
+- Multi-resource operation は item ごとの outcome と全体の `partial` status を返す。一部が失敗した
+  ときに一括 success を返さない。
+
+Optional durable outbox を使う場合、network access より前に command と application-level
+idempotency key を永続化し、process restart を越えて attempt history を保持する。同じ document や
+event が target というだけで command を coalesce しない。2 つの edit、または edit 後の delete は
+semantically distinct である。
+
+## 例示的な将来の text contract
+
+:::warning[提案名であり、実装済み endpoint ではない]
+以下の `GET /automation/v1/documents/{documentId}`、`list_documents`、
+`commit_document_change` などは設計例にすぎない。Flue route や SDK method ではなく、deploy 済み
+service が存在する根拠でもない。
+:::
+
+### Identity、path、read
+
+各 document に、title と path から独立した immutable で opaque な `documentId` を割り当てる。
+Rename / move operation でも id を維持する。Tool 間の reference と永続化する operation では、search
+result の position や可変な title ではなく id を使用する。
+
+提案段階の `GET /automation/v1/documents/{documentId}` または `read_document` は、認可済み
+projection と `documentId`、許可される場合の canonical path、version または ETag、`createdAt`、
+`updatedAt`、deletion state を返す。Operation に必要な content または excerpt だけを明示的な size
+cap 付きで返す。1 document の read で collection 全体を公開しない。
+
+API が path または prefix を受け取る場合、server は authorization と lookup より前に、文書化した
+1 つの canonical form を計算する。Collection で定義した Unicode normalization の rooted かつ
+length-bounded な path を要求し、separator を一貫して normalize する。NUL / control character、`/`
+が canonical な場合の backslash、空の中間 segment、`.` / `..`、encoded traversal、decode 後に
+authorized root 外へ出る form は拒否する。Normalization で invalid path を別の valid resource に
+変えず、path を authorization credential として扱わない。
+
+### Bounded list と change cursor
+
+提案段階の `GET /automation/v1/documents?prefix=...&limit=...&after=...` または
+`list_documents` は bounded prefix listing を行う。Prefix length と page size を clamp する。
+Canonical path と `documentId` など immutable で deterministic な sort tuple に対する server-issued
+opaque keyset cursor を使う。Offset や model-visible list index を identity に使わない。
+
+Snapshot behavior を明示的に定義する。Bootstrap は stable snapshot から read するか、page の read
+中に insert された item を client が reconcile できる snapshot/change anchor を返す。各 page に
+maximum size と terminal marker を持たせる。Cursor は tenant、collection、filter、query に bind して
+authenticate し、policy に適した lifetime にする。異なる filter での再利用は fail closed にする。
+
+Optional な提案段階の `GET /automation/v1/document-changes?cursor=...` は、bounded で ordered な
+upsert と tombstone を返す。Expired / invalid cursor は、current に見える空 page ではなく typed
+`CURSOR_EXPIRED` または `CURSOR_INVALID` を生成する。Recovery は文書化された bounded bootstrap と、
+その新しい anchor 以後の change である。Bootstrap が完了するまで client は既知 state も tombstone
+も破棄しない。
+
+### Create、update、delete
+
+Text write には `documents:write`、stable application operation id、preview、そして正確な authorized
+tenant、document、base version、変更 summary に対する明示的な人の confirmation が必要である。
+Broad edit と deletion には、より強い confirmation policy を要求する。Confirmation は expire し、
+異なる body、version、resource、destination には replay できない。
+
+例示的な将来の operation は次のとおりである。
+
+- `POST /automation/v1/documents` は authorized collection 内に document を作成し、stable id、
+  canonical path、version または ETag、authoritative timestamp を返す。
+- `PATCH /automation/v1/documents/{documentId}` は stable id を更新し、`If-Match` または同等の
+  `expectedVersion` を要求する。存在しない document を暗黙に作成してはならない。
+- `DELETE /automation/v1/documents/{documentId}` も expected version を要求し、versioned tombstone
+  を記録する。Purge を提供する場合も、独立した強い権限の lifecycle action にする。
+
+すべての mutation には、tenant、collection、operation class、caller の scope 内で unique な
+`Idempotency-Key` を要求する。Key、canonical request fingerprint、authoritative result を atomically
+に永続化する。同じ key と fingerprint の繰り返しには、original id と timestamp を含む同じ result
+を返す。同じ key で method、target、expected version、body が異なる場合は typed
+`IDEMPOTENCY_CONFLICT` を返す。文書化した retry / recovery window 以上、record を保持する。
+
+Tool layer は提案段階の `preview_document_change` と `commit_document_change` のような step を公開
+できるが、commit tool は free-form routing data ではなく stable preview/operation id を受け取る。
+Adapter が write する直前に authorization、fingerprint、expected version、confirmation を再確認する。
+
+## 例示的な将来の calendar contract
+
+:::warning[Read-only の提案であり、calendar service は提供されない]
+`GET /automation/v1/calendar-occurrences` や `list_calendar_changes` は将来の application
+contract の例示名である。Calendar access は `calendar:read` が default である。このページは既存の
+Flue calendar API や calendar mutation tool を定義も示唆もしない。
+:::
+
+### Query interval と event kind
+
+Bounded occurrence query は `from`、`to`、IANA time-zone name を要求する。`from` は inclusive、`to`
+は exclusive である。`from < to` を enforce し、query span と page size を cap する。IANA zone が
+必要な場所では `PST` のような fixed-offset abbreviation を拒否する。Overlap は
+`eventStart < to && eventEnd > from` と解釈する。Zero-duration instant は
+`from <= eventStart && eventStart < to` の場合に含める。
+
+String から推測せず、別々の tagged timing shape を使う。
+
+- All-day occurrence は inclusive な local `startDate`、exclusive な local `endDate`、calendar の
+  IANA zone を持ち、midnight instant ではなく date span のまま扱う。
+- Timed occurrence は absolute な `startDateTime` / `endDateTime` instant と IANA zone を持つ。
+- Unscheduled item は event interval を持たず、明示的な unscheduled filter が有効な場合だけ現れる。
+
+Effective start、effective end、stable `eventId`、stable `instanceId` の順で deterministic に sort
+する。同じ ordering tuple を keyset pagination に適用する。`includeDone`、`includeArchived`、
+`includeUnscheduled` filter を明示的に要求し、安全な default はすべて `false` にする。Cursor を
+interval、zone、filter、tenant、collection に bind する。
+
+### Privacy-minimal event projection
+
+Bot が必要とする field だけを返す。Stable `eventId`、該当する場合の stable recurrence
+`instanceId`、minimal display label または privacy-preserving busy label、tagged timing shape、
+normalized status、version、source/schedule provenance である。Location、description、document body、
+attendee、organizer detail、conference link、reminder recipient は、個別承認済み operation が特定
+field を必要としない限り省く。
+
+Event timing と reminder / notification timing は異なる事実である。Reminder は、それ自身の stable
+id、trigger instant または offset、status、provenance を持つ独立した optional array で表す。Derived
+reminder time が event の primary start / end を置き換えることはない。Source / schedule provenance
+により、time が source event、recurrence rule、override、reminder policy、notification delivery
+record のどれから来たかを識別する。
+
+### Recurrence、daylight saving、removal
+
+Recurring series は 1 つの stable `eventId` を維持する。展開した各 occurrence には、current title、
+list position、移動後の start time ではなく、series と original scheduled occurrence identity に
+基づく stable `instanceId` を付ける。そのため occurrence を移動する exception でも instance identity
+を維持し、original timing と effective timing を公開する。Array index から identity を推測しない。
+
+Recurrence expansion を query span、maximum generated occurrence、computation budget、page size で
+bound する。Bound に達した場合は silent omission ではなく、continuation を持つ typed truncation/error
+contract を返す。Local wall-clock recurrence と absolute recurrence について source calendar が宣言
+した semantics を維持する。Daylight-saving gap / fold は source rule と IANA zone で解決し、選択した
+absolute instant と offset を返す。All-day value は date のまま維持する。Transition をまたぐ all-day
+または wall-clock occurrence に固定 24-hour duration を作らない。
+
+Cancelled recurrence instance は stable `instanceId` に結びつく tombstone/status として表す。
+Deleted standalone event または series は `eventId` に結びつく versioned tombstone で表す。Series
+deletion は、文書化した rule に従って instance も invalidate または tombstone 化する。Cancellation
+や deletion を change feed から暗黙に落とすと consumer に stale state が残るため、そうしない。
+
+### Calendar change と recovery
+
+提案段階の `GET /automation/v1/calendar-changes?cursor=...` または `list_calendar_changes` は、
+bounded で ordered な projection upsert、cancellation、tombstone を返す。Opaque cursor は tenant、
+calendar collection、projection version、filter に bind する。`CURSOR_EXPIRED` または
+`CURSOR_INVALID` では fresh な bounded occurrence bootstrap と新しい change anchor が必要になる。
+これを空の success response に変換してはならない。
+
+Calendar bootstrap にも text listing と同じ concurrent-insert requirement がある。Consistent
+snapshot または change anchor を提供し、paging 中の addition、move、cancellation、deletion を
+reconcile できるようにする。Projection schema の変更時には、非互換な event shape を混在させず、
+古い cursor を意図的に expire できる。
+
+## Flue integration pattern
+
+これらの提案 adapter は通常の application code である。Validated immutable creation context と
+current authorization record から narrow tool を構築し、1 operation に必要な stable id、bounded
+query value、content だけを受け取らせる。`run` 内で再認可し、server-bound の tenant、collection、
+token、base URL で adapter を call し、privacy-minimal な typed result を返す。
+
+Flue の idempotent dispatch は 1 つの admitted delivery を収束させるが、その後の external effect を
+deduplicate しない。Slack event と Flue admission がすでに key を持つ場合でも、authorized business
+operation から stable app-level key を導出し、text adapter で使用する。Admission と effect の違いは
+[Core Concepts と API](./core-concepts-and-api.mdx)と
+[テストと運用](./testing-and-operations.mdx)を参照する。
+
+Mutation では model は preview を request できるが、自分で confirmation はできない。Application
+code が approved destination を通して authorized human に preview を送り、scoped confirmation を
+記録し、別の commit operation を dispatch する。New version、authorization の変更、expired
+preview、request-fingerprint mismatch があれば preview に戻す。
+
+## Network-free contract test matrix
+
+すべての test で fictional な tenant、resource、timestamp と in-memory または disposable local
+adapter を使用する。Model、credential、live calendar、remote text store、external mutation を使わず、
+tool の `run` function を直接 call する。
+
+### Authorization と validation
+
+- Valid、expired、revoked、malformed、wrong-audience token、すべての scope 組み合わせ、
+  tenant/workspace と collection の mismatch、non-delegation、preview と execution 間の authorization
+  revoke、存在しない lookup と unauthorized lookup の区別不能性を cover する。
+- Tool schema が token、tenant、collection、provider method、hostname、URL を選べないことを証明する。
+  Content 内の prompt-like id や destination は data として扱う。
+- Canonical path normalization、すべての traversal encoding、root escape、control character、Unicode
+  normalization policy、rename/move をまたぐ stable id、payload size limit、prefix/range clamp、page
+  size の最小値/最大値を cover する。
+
+### Idempotency、version、persistence
+
+- 1 つの Slack delivery と 1 つの tool request を繰り返し、同じ persisted result、id、version、
+  timestamp が返ることを assert する。Flue admission recovery 後にも application effect を繰り返す。
+- Body、target、method、expected version を変更して idempotency key を再利用し、
+  `IDEMPOTENCY_CONFLICT` を要求する。Retention expiry を意図的に exercise する。
+- 1 つの expected version に対する update 同士、update と delete を race させ、完了済み delete を
+  retry する。Stale conflict が content を overwrite せず safe current metadata を返すことを assert
+  する。
+- Content、version、idempotency-result、change-log の write 間に failure を inject し、atomic rollback
+  または retryable uncertain-storage result になり、history のない acknowledgement を返さないことを
+  証明する。
+
+### Pagination と change feed
+
+- Equal sort value、boundary、empty result、maximum size を通して deterministic keyset を page する。
+  Bootstrap page の read 中に resource を insert、move、delete し、gap や duplicate なく snapshot
+  anchor から reconcile する。
+- Cursor を tenant、collection、filter、interval、zone、projection version をまたいで再利用し、
+  corrupt / expire させる。Typed failure と bounded bootstrap recovery を要求し、bootstrap reconcile
+  完了まで tombstone を維持する。
+
+### Calendar time と recurrence
+
+- All-day date span、timed datetime、明示的に含めた unscheduled item を cover する。
+  From-inclusive / to-exclusive edge、両 boundary での overlap、zero-duration instant、invalid range、
+  capped span、deterministic ordering、各 done/archived/unscheduled filter を assert する。
+- Moved exception を含め、複数の IANA zone で daylight-saving gap / fold を使う。Leap day、month-end /
+  year-end recurrence、1 時間単位でない transition の zone、transition をまたぐ all-day span を cover
+  する。
+- Edit と moved occurrence をまたぐ stable series / recurrence-instance identity を証明する。1 instance
+  の cancellation、series cancellation/deletion、standalone deletion、tombstone replay、expansion
+  limit、cursor recovery を exercise する。
+- Event time と reminder time の順序を競合させ、event interval が primary のままであることを assert
+  する。Source、recurrence、override、reminder、delivery provenance を独立して verify する。
+
+### Failure、retry、privacy
+
+- Write 前後の timeout、`429` とその `retryAfter`、retryable / exhausted `5xx`、non-retryable `4xx`、
+  authorization revoke、partial success を local adapter で script する。Time と random jitter を freeze
+  し、retry bound を enforce し、unknown outcome を idempotency で recover する。
+- Persistence と send の間、および remote success と local result record の間で fake outbox を restart
+  する。Distinct command が coalesce されず、completed result が replay されることを証明する。
+- すべての projection、error、log、tool result を snapshot する。Credential、任意の destination、
+  approved excerpt 外の document body、未承認 calendar field が現れないことを assert する。
+
+これらの test は、将来実装する可能性がある application の obligation を定義する。Pass しても、
+このページの例示名が Flue 自体の一部になるわけではない。Implementation、security review、consent、
+deployment は引き続き別の work である。
