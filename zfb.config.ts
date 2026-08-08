@@ -5,6 +5,11 @@ export default defineConfig(
   zudoDoc({
     siteName: "zudo-slack-wisdom",
     siteDescription: "Slack developer knowledge base with a Cloudflare Worker backend editorial stance, for me and AI agents",
+    // Must be explicit: zudo-doc defaults `logo` to "auto", which silently
+    // renders a generated mark seeded by siteName instead of this site's own.
+    // The asset is a flat fill:#fff silhouette by design — it is consumed as a
+    // `bg-fg` CSS mask (its own colors are discarded), not painted directly.
+    logo: "/img/logo.svg",
     // siteUrl host MUST match the wrangler.toml custom-domain route (added in
     // the deploy-config sub-issue).
     siteUrl: "https://zudo-slack-wisdom.takazudomodular.com",
