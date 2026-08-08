@@ -69,4 +69,6 @@ Flue 2 は Vite ベースのアプリケーションモデルである。2.0.0 c
 タグ付き Slack blueprint の [`dispatch(...)` example](https://github.com/withastro/flue/blob/v2.0.3/blueprints/channel--slack.md)は、`payload.event_id` を signal attribute として記録するが、`idempotencyKey` を省略している。タグ付きの [runtime admission contract](https://github.com/withastro/flue/blob/v2.0.3/packages/runtime/src/runtime/agent-submissions.ts)は caller が選ぶ `idempotencyKey` をサポートし、タグ付きの [`@flue/slack` contract](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/README.md)は Events API の redelivery を元の admission に収束させるため `idempotencyKey: payload.event_id` を推奨している。runtime/channel contract に従い、blueprint の省略をそのままコピーしない。
 :::
 
-これらは検証済みの情報源間の差であり、このサイトが deploy 済みアプリケーションに対してどちらかの挙動をテストした証拠ではない。後続の技術ガイドでもこの区別を維持し、バージョン依存のコードを示すときはこの基準へリンクする。
+どちらの項目も、出発点は検証済みの*情報源*間の差だった。ただし Cloudflare の項目は、その後読解ではなく実行によって決着した。実在の Flue 2.0.3 Worker を build したところ（[zudolab/zudo-text#4625](https://github.com/zudolab/zudo-text/issues/4625)）、`flueWorkerConfig()` を欠いた形式は build できず、実行可能な example の形式は build できることが確認された。plugin 順序の結論はテスト済みの挙動として扱ってよい。Slack の重複排除の項目は情報源の照合にとどまる。後続の技術ガイドでもこの区別を維持し、バージョン依存のコードを示すときはこの基準へリンクする。
+
+同じ build 作業は、タグ付き prose が述べていない 2.0.3 の挙動をいくつも実際に踏んだ。peer version の下限、`compatibility_date` の最小値、`providers` による bundle の lever、build を deploy より先に走らせる順序である。これらは実際に手を動かす場所、すなわち[Cloudflare で始める](./getting-started-on-cloudflare.mdx)に記録した。同じ取り組みが確定させた HTTP conversation contract は[コアコンセプトと API](./core-concepts-and-api.mdx)にある。

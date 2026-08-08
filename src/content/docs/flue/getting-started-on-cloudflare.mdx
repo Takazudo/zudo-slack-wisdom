@@ -10,8 +10,25 @@ Use Node.js **`>=22.19.0`**, a Vite-based project, and one reviewed Flue release
 
 ```sh
 npm install @flue/runtime@2.0.3 hono valibot
-npm install -D @flue/cli@2.0.3 @flue/vite@2.0.3 @cloudflare/vite-plugin vite wrangler
+npm install -D @flue/cli@2.0.3 @flue/vite@2.0.3 @cloudflare/vite-plugin vite@^8 wrangler@^4.120.0
 ```
+
+:::note[Verified peer floors]
+Installing the toolchain against a working repository pinned three floors the tagged prose does not
+state, all confirmed by building `workers/agent-server` in
+[zudolab/zudo-text#4625](https://github.com/zudolab/zudo-text/issues/4625):
+
+- `@flue/vite@2.0.3` peer-depends on **`vite@^8.0.0`** — not 6, not 7. A monorepo whose root is on
+  an older Vite cannot share it with the Flue worker; the worker carries its own.
+- `@cloudflare/vite-plugin@1.51.x` wants **`wrangler@^4.120.0`**, which is ahead of many existing
+  repositories' pin.
+- Every `@flue/*` manifest enforces **Node.js `>=22.19.0`**, so a repository-wide `engines.node`
+  below that fails installation, not just the Flue package.
+
+Also worth stating because they are the names one would guess: `@flue/vite-plugin` and `@flue/agent`
+do **not** exist on npm. The published packages are `@flue/runtime`, `@flue/cli`, `@flue/vite`, and
+`@flue/slack`.
+:::
 
 The plugin order is a contract. `flue()` scans and configures the application before the Cloudflare plugin consumes `flueWorkerConfig()`.
 
@@ -21,15 +38,37 @@ import { flue, flueWorkerConfig } from '@flue/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
-  plugins: [flue(), cloudflare({ config: flueWorkerConfig() })],
+  plugins: [flue({ providers: ['cloudflare'] }), cloudflare({ config: flueWorkerConfig() })],
 });
 ```
 
-Keep that exact order and form. The tagged 2.0.3 Cloudflare deployment prose omits `flueWorkerConfig()`, but the matching configuration contract, changelog, and runnable example require it. The source map records that discrepancy.
+Keep that exact order and form. The tagged 2.0.3 Cloudflare deployment prose omits `flueWorkerConfig()`, but the matching configuration contract, changelog, and runnable example require it — and a real build settles it: the runnable-example form is the one that builds. The source map records the discrepancy.
+
+:::note[Verified: `providers` is the bundle-size lever, and the default overshoots the free tier]
+With `providers` unset, Flue registers *every* built-in pi-ai provider and the Worker uploads at
+**1249 KB gzipped** — Anthropic, OpenAI, Google Vertex, Mistral, Azure, and an OpenTelemetry chunk,
+none of them reachable from a Workers-AI-only Worker. Setting
+`flue({ providers: ['cloudflare'] })` cuts the same Worker to **783 KB gzipped**, a 37% reduction,
+with all bindings intact; `'cloudflare'` is the Workers AI *binding* provider and is explicitly
+filtered out of the pi-ai import list, so it costs nothing to name. This matters because the free
+Workers tier caps an upload at 1 MB gzipped, which the default configuration exceeds. The option is
+documented only in the `FlueConfig.providers` JSDoc, not in the Cloudflare getting-started prose.
+Measured in [zudolab/zudo-text#4625](https://github.com/zudolab/zudo-text/issues/4625). List a
+provider id here only when this Worker actually dispatches to it.
+:::
 
 ## Generated Agents and Authored Configuration
 
 Each registered agent function generates a Durable Object class and binding. For example, `SupportChat` produces `FlueSupportChatAgent` and `env.FLUE_SUPPORT_CHAT_AGENT`. Do **not** hand-author generated `FLUE_*` bindings. Flue merges those bindings and its generated Worker entry into generated configuration while leaving the application-owned `wrangler.jsonc` intact.
+
+:::note[Verified: the naming rule, and why to read it back anyway]
+The transformation is `agentClassName()` producing `` `Flue${PascalCase}Agent` `` and
+`agentBindingName()` splitting camel boundaries into `FLUE_<SNAKE_UPPER>_AGENT` — read from the
+plugin source and confirmed twice against a built `dist/<worker>/wrangler.json`, where an agent
+named `ZudoAssistant` produced class `FlueZudoAssistantAgent` and binding
+`FLUE_ZUDO_ASSISTANT_AGENT`. Predicting the name is reliable; verifying it from the build output is
+still the right habit, because that generated file is what the `migrations` tag has to agree with.
+:::
 
 Declare platform settings, application-owned bindings, and the ordered migration history for generated classes:
 
@@ -70,6 +109,19 @@ Named Wrangler environments are separate deployment configurations. Before using
 
 Pin `compatibility_date` deliberately. Advancing it can change runtime behavior, so make it a reviewed change, run relevant tests, and add only flags the deployment needs. Test required flags too; Flue 2.0.3 requires `nodejs_compat` for its Cloudflare runtime. Consult Cloudflare's [compatibility-date documentation](https://developers.cloudflare.com/workers/configuration/compatibility-dates/) for current platform behavior.
 
+:::note[Verified: `compatibility_date` has a hard floor of `2026-04-01`]
+`MIN_COMPATIBILITY_DATE` in the Vite plugin throws the build below that date, citing SQLite-backed
+Durable Objects, `nodejs_compat` v2, and `AsyncLocalStorage`. This is the fastest way to fail when
+adding a Flue Worker to a repository whose other Workers sit on an older date — copying a sibling's
+configuration fails immediately rather than subtly. Hit and confirmed in
+[zudolab/zudo-text#4625](https://github.com/zudolab/zudo-text/issues/4625).
+:::
+
+One generated-configuration quirk worth knowing before wiring D1 into a Flue Worker: the merge
+injects `migrations_dir: "../../migrations"` into the D1 binding. That path is relative to the
+*build output* directory, not the package root, so it is harmless while `wrangler d1 migrations
+apply` is never run from this package and surprising the moment it is.
+
 ## Minimal Local Commands
 
 Use Vite commands, not removed `flue dev` or `flue build`:
@@ -80,7 +132,27 @@ npx vite build
 npx wrangler deploy
 ```
 
+:::note[Verified: the build is not optional before the deploy, and the ordering is load-bearing]
+`wrangler.jsonc` has no `main` — `flue()` generates the Worker entry — so `wrangler deploy` cannot
+resolve anything on its own. What makes the bare command work is that `vite build` writes
+`.wrangler/deploy/config.json`, a one-line redirect
+(`{"configPath":"../../dist/<worker>/wrangler.json"}`) that wrangler follows to the generated
+configuration. The tagged guide's bare `npx wrangler deploy` is therefore accurate but silently
+depends on a build having run in the same checkout. A CI job that deploys without a preceding build
+step fails confusingly; make the build an explicit prerequisite of the deploy job. Confirmed in
+[zudolab/zudo-text#4625](https://github.com/zudolab/zudo-text/issues/4625).
+:::
+
 The final command deploys; it was **not run** for this documentation work. Before deployment, review the target Worker name, account, environment, secrets, bindings, migrations, compatibility date, and flags. A local build validates configuration shape, not deployed bindings or secret values.
+
+One testing consequence of this build model is worth planning for. `createAgentRouter()` resolves
+its agent identity from the function name at import time and calls `requireRuntime()` only when a
+route is actually *invoked*, so an authored `app.ts` imports cleanly into a plain Vitest run with no
+Flue plugin and no Miniflare-plus-Flue harness. What such a test cannot do is execute an agent route
+— that throws because the runtime was never configured. Assert the routing decision (a mounted path
+reaches the router, an unmounted path 404s) rather than a response body, and cover the agent's
+behavior at the tool layer and through live evaluations instead. [Testing and
+Operations](./testing-and-operations.mdx) covers the rest of that split.
 
 ## Safe Upgrade Loop
 

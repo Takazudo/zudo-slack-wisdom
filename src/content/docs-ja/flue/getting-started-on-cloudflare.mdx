@@ -10,8 +10,18 @@ Node.js **`>=22.19.0`**、Vite ベースの project、review された 1 つの 
 
 ```sh
 npm install @flue/runtime@2.0.3 hono valibot
-npm install -D @flue/cli@2.0.3 @flue/vite@2.0.3 @cloudflare/vite-plugin vite wrangler
+npm install -D @flue/cli@2.0.3 @flue/vite@2.0.3 @cloudflare/vite-plugin vite@^8 wrangler@^4.120.0
 ```
+
+:::note[検証済みの peer 下限]
+実在の repository に toolchain を install したところ、タグ付き prose が述べていない下限が 3 つ確定した。いずれも [zudolab/zudo-text#4625](https://github.com/zudolab/zudo-text/issues/4625) で `workers/agent-server` を build して確認したものである。
+
+- `@flue/vite@2.0.3` の peer dependency は **`vite@^8.0.0`** である——6 でも 7 でもない。root が古い Vite の monorepo は、それを Flue worker と共有できない。worker が自前の Vite を持つことになる。
+- `@cloudflare/vite-plugin@1.51.x` は **`wrangler@^4.120.0`** を要求する。既存 repository の pin より新しいことが多い。
+- すべての `@flue/*` manifest が **Node.js `>=22.19.0`** を強制する。repository 全体の `engines.node` がそれ未満なら、Flue package だけでなく install 自体が失敗する。
+
+名前として推測しがちなので明記しておくと、`@flue/vite-plugin` と `@flue/agent` は npm に**存在しない**。公開されている package は `@flue/runtime`、`@flue/cli`、`@flue/vite`、`@flue/slack` である。
+:::
 
 plugin の順序は contract である。`flue()` が application を scan・設定した後に Cloudflare plugin が `flueWorkerConfig()` を消費する。
 
@@ -21,15 +31,23 @@ import { flue, flueWorkerConfig } from '@flue/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
-  plugins: [flue(), cloudflare({ config: flueWorkerConfig() })],
+  plugins: [flue({ providers: ['cloudflare'] }), cloudflare({ config: flueWorkerConfig() })],
 });
 ```
 
-この正確な順序と form を保つ。タグ付き 2.0.3 の Cloudflare deployment prose は `flueWorkerConfig()` を省略しているが、対応する configuration contract、changelog、実行可能な example はこれを要求する。この不一致は情報源マップに記録されている。
+この正確な順序と form を保つ。タグ付き 2.0.3 の Cloudflare deployment prose は `flueWorkerConfig()` を省略しているが、対応する configuration contract、changelog、実行可能な example はこれを要求する。そして実際の build が決着を付けた。build が通るのは実行可能な example の form のほうである。この不一致は情報源マップに記録されている。
+
+:::note[検証済み: `providers` は bundle size の lever であり、default は free tier を超える]
+`providers` を指定しない場合、Flue は built-in の pi-ai provider を*すべて*登録し、Worker の upload は **gzip 後 1249 KB** になる。Anthropic、OpenAI、Google Vertex、Mistral、Azure、そして OpenTelemetry の chunk が含まれるが、Workers AI しか使わない Worker からはどれにも到達しない。`flue({ providers: ['cloudflare'] })` を指定すると、同じ Worker が binding をすべて保ったまま **gzip 後 783 KB**、37% 減になる。`'cloudflare'` は Workers AI の *binding* provider であり、pi-ai の import 一覧から明示的に除外されているため、名前を挙げてもコストはかからない。free の Workers tier は upload を gzip 後 1 MB に制限しており、default 設定はそれを超えるので、この差は実用上効く。この option は `FlueConfig.providers` の JSDoc にしか書かれておらず、Cloudflare の getting-started prose には登場しない。計測は [zudolab/zudo-text#4625](https://github.com/zudolab/zudo-text/issues/4625)。ここに provider id を並べるのは、その Worker が実際にその provider へ dispatch するときだけにする。
+:::
 
 ## 生成される Agent と、アプリケーションが書く設定
 
 登録済み agent 関数ごとに Durable Object class と binding が生成される。たとえば `SupportChat` は `FlueSupportChatAgent` と `env.FLUE_SUPPORT_CHAT_AGENT` を生成する。生成される `FLUE_*` binding を手で書いてはいけない。Flue はそれらと生成した Worker entry を generated configuration に merge し、application 所有の `wrangler.jsonc` はそのまま残す。
+
+:::note[検証済み: 命名規則と、それでも build 出力を読み返すべき理由]
+変換規則は `agentClassName()` が `` `Flue${PascalCase}Agent` `` を作り、`agentBindingName()` が camel の境界を分割して `FLUE_<SNAKE_UPPER>_AGENT` を作る、というものである。plugin の source から読み取り、build 済みの `dist/<worker>/wrangler.json` に対して 2 度確認した。`ZudoAssistant` という agent は class `FlueZudoAssistantAgent`、binding `FLUE_ZUDO_ASSISTANT_AGENT` を生成した。名前の予測は確実に当たるが、それでも build 出力から確認するのが正しい習慣である。`migrations` の tag が一致していなければならない相手は、その生成ファイルだからである。
+:::
 
 platform setting、application 所有 binding、生成 class の順序付き migration history を宣言する。
 
@@ -68,6 +86,12 @@ Durable Object storage は activation をまたいで残りうるが、通常の
 
 `compatibility_date` は意図して固定する。日付を進めると runtime behavior が変わりうるので、review された変更にし、関連 test を実行して、deployment が必要とする flag だけを追加する。必要な flag も test する。Flue 2.0.3 の Cloudflare runtime には `nodejs_compat` が必要である。platform の現在の挙動は Cloudflare の[compatibility date documentation](https://developers.cloudflare.com/workers/configuration/compatibility-dates/)を参照する。
 
+:::note[検証済み: `compatibility_date` には `2026-04-01` という下限がある]
+Vite plugin の `MIN_COMPATIBILITY_DATE` が、その日付未満では build を throw させる。理由として SQLite backed の Durable Object、`nodejs_compat` v2、`AsyncLocalStorage` が挙げられている。既存 Worker が古い日付で動いている repository に Flue Worker を追加するとき、これが最初にぶつかる失敗になる。兄弟 Worker の設定をコピーすると、微妙にではなく即座に失敗する。[zudolab/zudo-text#4625](https://github.com/zudolab/zudo-text/issues/4625) で遭遇し確認した。
+:::
+
+Flue Worker に D1 を組み込む前に知っておくとよい generated configuration の癖が 1 つある。merge が D1 binding に `migrations_dir: "../../migrations"` を注入する。この path は package root ではなく*build 出力*ディレクトリからの相対であるため、この package から `wrangler d1 migrations apply` を実行しない限り無害だが、実行した途端に驚かされる。
+
 ## 最小の Local Command
 
 削除された `flue dev`、`flue build` ではなく Vite command を使う。
@@ -78,7 +102,13 @@ npx vite build
 npx wrangler deploy
 ```
 
+:::note[検証済み: deploy の前の build は省略できず、順序が効く]
+`wrangler.jsonc` には `main` がない——Worker entry は `flue()` が生成する——ので、`wrangler deploy` は単独では何も解決できない。この素の command が動くのは、`vite build` が `.wrangler/deploy/config.json` という 1 行の redirect（`{"configPath":"../../dist/<worker>/wrangler.json"}`）を書き出し、wrangler がそれを辿って生成 configuration に到達するからである。つまりタグ付きガイドの素の `npx wrangler deploy` は正確ではあるが、同じ checkout で build が走っていることに暗黙に依存している。build step を挟まずに deploy する CI job は分かりにくい形で失敗するので、build を deploy job の明示的な前提条件にする。[zudolab/zudo-text#4625](https://github.com/zudolab/zudo-text/issues/4625) で確認した。
+:::
+
 最後の command は deploy であり、この documentation 作業では**実行していない**。deploy 前に target Worker name、account、environment、secret、binding、migration、compatibility date、flag を review する。local build は configuration shape を検証するが、デプロイ済み binding や secret value を証明するものではない。
+
+この build model には、計画に織り込んでおくべき test 上の帰結が 1 つある。`createAgentRouter()` は import 時に関数名から agent identity を解決し、`requireRuntime()` を呼ぶのは route が実際に*起動された*ときだけである。そのため、書いた `app.ts` は Flue plugin も Miniflare + Flue の harness もない素の Vitest にそのまま import できる。できないのは agent route の実行で、runtime が設定されていないため throw する。response body ではなく routing の判断（mount した path が router に届く、mount していない path が 404 になる）を assert し、agent 自体の挙動は tool 層と live evaluation で担保する。この分割の残りは[テストと運用](./testing-and-operations.mdx)を参照する。
 
 ## 安全な Upgrade Loop
 

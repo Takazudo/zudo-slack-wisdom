@@ -108,6 +108,17 @@ recommends `idempotencyKey: payload.event_id` so an Events API redelivery conver
 admission. Follow the runtime/channel contract; do not silently copy the blueprint omission.
 :::
 
-These discrepancies are verified source differences, not evidence that either behavior was tested
-against a deployed application here. The later technical guides must preserve that distinction and
-link back to this baseline when showing version-sensitive code.
+Both entries began as verified *source* differences. The Cloudflare one has since been settled by
+execution rather than by reading: building a real Flue 2.0.3 Worker
+([zudolab/zudo-text#4625](https://github.com/zudolab/zudo-text/issues/4625)) confirmed that the
+`flueWorkerConfig()`-less form does not build and the runnable-example form does. Treat the
+plugin-order resolution as tested behavior; the Slack dedupe entry remains a source reconciliation
+only. The later technical guides must preserve that distinction and link back to this baseline when
+showing version-sensitive code.
+
+The same build work exercised several 2.0.3 behaviors the tagged prose leaves unstated — peer
+version floors, the `compatibility_date` minimum, the `providers` bundle lever, and the
+build-before-deploy ordering. Those are recorded where they are actionable, on
+[Getting Started on Cloudflare](./getting-started-on-cloudflare.mdx), and the HTTP conversation
+contract pinned by the same effort is on
+[Core Concepts and API](./core-concepts-and-api.mdx).

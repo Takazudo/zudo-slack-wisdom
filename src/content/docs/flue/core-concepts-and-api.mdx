@@ -40,6 +40,8 @@ SupportTriage.initialData = v.object({ tenantId: v.string(), caseId: v.string() 
 
 The function name is the durable identity unless a literal `agentName` static overrides it. That identity keys conversation storage and contributes to the Cloudflare Durable Object class. Renaming a deployed function can therefore require a class migration; renaming its source file does not.
 
+The root agent function is called with props containing `id`, the conversation's durable address, which is how a tool closure keys per-conversation state without parsing anything back out of a delivery. Subagent renders receive no props.
+
 ## Explicit Routes and Dispatch
 
 `app.ts` is the application route map. A mount exposes an HTTP conversation surface; it does not register the agent. Apply authentication and authorization middleware to mounted routes, and authorize the particular conversation ID rather than treating it as access control.
@@ -54,6 +56,25 @@ app.route('/agents/support', createAgentRouter(SupportTriage));
 
 export default app;
 ```
+
+:::note[Verified fact]
+A mounted agent has **no built-in authentication or authorization**: anyone who can reach the URL
+can send, read the full history, and abort. There is no per-agent middleware export. Protection is
+ordinary Hono composition layered before the mount, and a `/*` middleware placed in front of the
+mount does intercept every router route — POST, history read, SSE read, `HEAD`, abort, and
+attachment reads alike. Confirmed by probe against Flue 2.0.3 in
+[zudolab/zudo-text#4622](https://github.com/zudolab/zudo-text/issues/4622).
+:::
+
+Authorization is per **conversation id**, not merely per caller. Ids are caller-chosen path
+segments, so an authenticated user reads another user's conversation by guessing an id unless the
+middleware also checks ownership. Prefer server-derived ids so the check is an equality test, or
+skip the mount entirely — see [Agent Behind an Ingress](./agent-behind-an-ingress.mdx).
+
+The router sets no `Access-Control-*` headers either. A cross-origin caller needs an application
+CORS layer that exposes `Stream-Next-Offset`, `Stream-Up-To-Date`, and `Location`; browsers hide
+those otherwise and header-based stream resume breaks silently. `vite dev` applies permissive
+localhost defaults, so this configuration works locally and fails once deployed.
 
 Channel-driven applications can use a **dispatch-only** agent: registered, but with no public `createAgentRouter(...)` mount. After application code verifies a delivery, it chooses the authorized conversation and dispatches a per-delivery signal.
 
@@ -75,18 +96,217 @@ await dispatch(SupportTriage, {
 
 `dispatch()` resolves when the input is admitted to the conversation queue, not when a model reply finishes. Direct HTTP and dispatch inputs to one conversation share an accepted order. Slack verification, acknowledgement, and raw-body rules remain on [Worker Backend](../worker-backend/index.mdx) and [Events](../events/index.mdx), not in a generic webhook recipe.
 
+## The Mounted Conversation Surface
+
+:::note[Verified fact]
+Every route shape, status code, response body, and chunk name in this section was pinned
+empirically against **Flue 2.0.3** — the installed `@flue/runtime` dist (`dist/routing.mjs` into
+`dist/dispatch-*.mjs`: `createAgentRouter`, `handleAgentRequest`, `handleAgentConversationRead`,
+`sseResponse`), the version-matched bundled prose (`flue docs read reference/streaming-protocol`),
+and a running probe with a faux provider driving a tool-calling turn. Evidence:
+[zudolab/zudo-text#4622](https://github.com/zudolab/zudo-text/issues/4622). Streaming and tool
+activity are native; no application-side SSE bridge is required.
+:::
+
+`createAgentRouter(agent)` returns a Hono sub-router whose paths are relative to the mount. `:id` is
+the caller-chosen conversation id, and the mount path is pure routing — conversations are keyed by
+the agent's durable identity, never by the URL.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/:id` | Deliver one message; answers `202` on admission |
+| `GET` | `/:id` | Read: `?view=history` (default snapshot) or `?view=updates` (chunks) |
+| `HEAD` | `/:id` | Stream metadata in headers, no body |
+| `POST` | `/:id/abort` | Abort in-flight and queued work |
+| `GET` | `/:id/attachments/:attachmentId` | Attachment bytes |
+
+`DELETE /:id` and `PUT /:id` answer `405` with `Allow: GET, HEAD, POST`. Every read route answers
+`404 stream_not_found` until the first `POST` creates the conversation — including the streaming
+route, which returns JSON rather than an event stream. A client must POST before it opens a stream,
+or tolerate that 404 and retry.
+
+### Admission is not an answer
+
+A send is fire-and-forget. `202` means durably admitted, not answered, and there is no synchronous
+wait — `?wait=…` is rejected with `400`. The admission body and its `Location` plus
+`Stream-Next-Offset` headers carry every handle the client needs afterwards.
+
+```jsonc
+{
+  "streamUrl": "https://…/agents/support/case-1", // the request URL, query stripped
+  "offset": "0000000000000000_0000000000000000",  // durable head at admission
+  "submissionId": "sub_01KZH5…",                  // matches the settlement chunk
+  "uid": "inst_01KZH5…"                           // the contacted incarnation
+}
+```
+
+Resume the stream from that `offset` to see exactly what this submission produces without replaying
+history. Optional reserved siblings on the request body are `initialData` (consulted only when this
+send creates the instance), `uid` (a send condition: a string continues only that incarnation,
+`null` creates only, omitted is unconditional), and `idempotencyKey` (256 characters or fewer; a
+redelivery with the same key converges on the original submission).
+
+### History and live updates
+
+`GET /:id` returns a snapshot with `Stream-Up-To-Date: true`. One assistant message is one whole
+response: every model step of a submission folds into that submission's **first** assistant message,
+with parts accumulating across steps. A `display` field marks each message `visible`, `diagnostic`,
+or `hidden`; only the root conversation is exposed, never subagent conversations.
+
+A message's `parts` are `text` or `reasoning` (each with a `streaming` or `done` state), `file`,
+`data-${name}`, or `dynamic-tool`. A `dynamic-tool` part carries `toolName` and `toolCallId` and
+sits in `input-available`, `output-available`, or `output-error`, which is how a history render
+reconstructs tool activity that a live client saw as chunks. The snapshot also carries a
+`settlements` array pairing each `submissionId` with its outcome, so a client that reconnects after
+a turn finished can still learn how it ended.
+
+`GET /:id?view=updates&offset=<offset>&live=sse` streams chunks. `offset` is required exactly once
+(`-1` replays everything). The SSE framing is:
+
+```
+event: data
+data:[{ "type": "message-delta", … }, …]
+
+event: control
+data:{"streamNextOffset":"0000000000000000_0000000000000007","upToDate":true}
+
+: heartbeat
+```
+
+A `data` event carries a JSON **array** of chunks and appears only when a read cycle produced some.
+A `control` event follows every read cycle including empty ones, so even a caught-up stream emits
+one within 30 seconds; `: heartbeat` arrives every 15 seconds. The stream never ends server-side —
+the client always stops reading early, so it must **cancel** the response body rather than release
+the reader, or it leaks one live HTTP connection per turn. Delivery is at-least-once across
+reconnects: dedupe on each chunk's `position` (a `batch` and `index` pair, compared
+lexicographically). Note that `data:` has no space after the colon, so use a tolerant parser.
+
+Reading the same route **without** `live=sse` returns the chunk array as a plain JSON body, with
+`Stream-Next-Offset` and `Stream-Up-To-Date` as response headers instead of an inline `control`
+event. `live=long-poll` parks up to 30 seconds and answers `200 []` on timeout, which makes a
+headless caller's whole loop "POST, then long-poll to settlement, then read the snapshot" with no
+SSE parsing at all.
+
+### Chunk vocabulary
+
+```ts
+type ChunkBody =
+  | { type: 'conversation-reset'; conversationId: string; snapshot: FlueConversationSnapshot }
+  | { type: 'message-appended'; conversationId: string; message: FlueConversationMessage }
+  | { type: 'message-started'; conversationId: string; messageId: string; submissionId?: string }
+  | { type: 'message-metadata'; conversationId: string; messageId: string; metadata: Record<string, unknown> }
+  | { type: 'data-part'; conversationId: string; messageId: string; name: string; data: unknown }
+  | { type: 'message-delta'; conversationId: string; messageId: string; kind: 'text' | 'reasoning'; delta: string }
+  | { type: 'tool-input'; conversationId: string; messageId: string; toolCallId: string; toolName: string; input: unknown }
+  | { type: 'tool-output'; conversationId: string; toolCallId: string; output: unknown; durationMs?: number }
+  | { type: 'tool-output-error'; conversationId: string; toolCallId: string; errorText: string; durationMs?: number }
+  | { type: 'message-completed'; conversationId: string; messageId: string }
+  | { type: 'submission-settled'; conversationId: string; submissionId: string;
+      outcome: 'completed' | 'failed' | 'aborted'; error?: unknown };
+```
+
+`conversation-reset` replaces all accumulated state and subsumes every other chunk in its batch, so
+a read from `offset=-1` always begins with one. A `stream-checkpoint` item leads every updates read
+and carries no `position`, so the dedupe rule skips it naturally. `tool-output` and
+`tool-output-error` carry **no** `messageId` — correlate them by `toolCallId` alone, including
+across a `message-completed` boundary.
+
+:::warning[The one trap: `message-completed` is per model step]
+`message-completed` fires **once per model step**, not once per turn. The observed sequence for a
+single tool-calling turn is `message-started`, `tool-input`, **`message-completed`**, `tool-output`,
+`message-started` again (same `messageId`, a continuation), several `message-delta`, another
+`message-completed`, and only then `submission-settled`. A client that treats `message-completed`
+as end-of-turn truncates the stream right after the tool call and drops the real answer. Terminate
+on a `submission-settled` whose `submissionId` matches the admission response, and ignore
+settlements for any other submission.
+:::
+
+Because `202` already means durable admission, a failed *read* is not a failed turn: the answer is
+still being produced and the offset is still valid. Retry a `5xx` on stream open inside a reconnect
+budget rather than surfacing a dead turn, keep `4xx` terminal, and reset that budget after any
+connection that actually delivered chunks — otherwise a long turn that survives occasional drops is
+capped like a stream that keeps dying.
+
+Errors use one envelope, so branch on `type` and never on prose:
+
+```jsonc
+{ "error": { "type": "invalid_request", "message": "…", "details": "…", "meta": {} } }
+```
+
+Verified codes include `stream_not_found` (404), `agent_instance_not_found` (404),
+`attachment_not_found` (404), `method_not_allowed` (405, with `Allow`), `agent_instance_exists`
+(409, with `meta.uid` naming the existing incarnation), `unsupported_media_type` (415),
+`invalid_request` and `invalid_json` (400), `runtime_unavailable` (503, with `Retry-After`, seen on
+local dev reloads), and `internal_error` (500).
+
+## Nothing Deletes a Conversation
+
+:::warning[Verified: Flue 2.0.3 has no delete affordance at any layer]
+The router serves no `DELETE`. `ConversationStreamStore` exposes only create, acquire-producer,
+append, read, `getMeta`, and subscribe, and its contract states that streams are append-only and
+canonical records are never rewritten. `AgentSubmissionStore` says sessions are append-only for the
+life of the agent instance with no per-session deletion. On Cloudflare the adapter surface does not
+apply at all: each instance persists in its own Durable Object SQLite, and the runtime exposes no
+destroy. `POST /:id/abort` stops work and deletes nothing — an idle conversation answers
+`200 {"aborted": false}`.
+:::
+
+Three consequences follow for any product with a retention or "delete this conversation"
+requirement:
+
+- **"New conversation" means a new conversation id.** Rotation is the native reset; the old stream
+  stays durable and addressable by whoever knows its id.
+- **The application must own a conversation index** — id, owner, created and last-used timestamps.
+  Flue offers no enumeration, so an unlisted id is otherwise unreachable *and* un-erasable.
+- **Real erasure requires application-owned code inside the generated Durable Object**, not a
+  framework call. Scope it explicitly; do not plan around a delete that does not exist.
+
+A workable middle ground is to mint conversation ids with a random tail and treat deleting the index
+row as the delete. The old Durable Object stream is orphaned, and reusing the same client-facing
+name mints a new id and therefore a new instance, so history cannot be resurrected. Write the
+retention copy honestly: the conversation becomes unlisted and unreachable immediately, and its
+bytes age out with the Durable Object. Do not claim it was permanently erased.
+
 ## Data Boundaries
 
 | Data | Contract | Use |
 |---|---|---|
 | Conversation/instance ID | Caller-selected stable address | Tenant-scoped case or channel thread |
 | `initialData` | Validated at creation, recorded once, immutable | Tenant and case identity |
-| Signal attributes | Per-delivery metadata; trust depends on ingress | Verified event ID and current actor on server-authored dispatch |
+| Signal attributes | Per-delivery metadata, rendered into the model prompt and kept forever | Non-sensitive correlation values such as a verified event ID |
 | Persistent state | Durable named state for one conversation | Small agent-owned progress or gates |
 | Canonical records | Application-owned database or service | Business truth, ownership, OAuth, audit |
 | Files/sandboxes | Depend on the selected implementation | Artifacts only when its contract is durable |
 
-`initialData` is not mutable metadata: later values on an existing conversation are ignored. Read it with `useInitialData()`; read the current delivery with `useDelivery()`. Server-authored dispatch attributes can carry context the application already verified. Attributes submitted through a directly mounted client route are caller input: validate and authorize them, and never mistake Flue's shape validation for authenticity. Neither form is model authorization.
+`initialData` is not mutable metadata: later values on an existing conversation are ignored. Read it with `useInitialData()`; read the current delivery with `useDelivery()`. Two practical notes from building against 2.0.3: send `initialData` on *every* message rather than only the one your own index believes created the instance — Flue ignores creation data on an existing instance, so repeating it is free, whereas sending it conditionally races two concurrent first messages into an instance created with no creation data at all. And `useInitialData()` really can return `undefined` even when the agent declares a required schema, because a bare tooling render carries no creation data; type it as possibly-undefined and degrade rather than destructuring it.
+
+Server-authored dispatch attributes can carry context the application already verified. Attributes submitted through a directly mounted client route are caller input: validate and authorize them, and never mistake Flue's shape validation for authenticity. Neither form is model authorization.
+
+:::danger[Verified: signal attributes are model-visible prompt text, permanently]
+`renderSignalMessage()` in the installed `@flue/runtime` dist serialises a signal into the model
+context as an element whose attributes are written out **verbatim**:
+
+```
+<tagName type="…" attrName="attrValue" …>
+body
+</tagName>
+```
+
+`buildConversationContextEntries()` feeds that string straight into the LLM context, and the
+delivery is also an append-only canonical record replayed forever by `GET /:id?view=history`. A
+bearer token, API key, session id, or personal detail placed in `attributes` therefore lands in both
+the prompt and permanent history. Verified while implementing
+[zudolab/zudo-text#4632](https://github.com/zudolab/zudo-text/issues/4632), where it invalidated a
+planned `attributes: { userId, vaultId, bearer }` design before it shipped.
+
+**Flue 2.0.3 has no non-model-visible per-delivery channel.** A `user` body is prompt text, signal
+attributes are prompt text, `usePersistentState` is durable but agent-owned, and `initialData` is
+immutable after creation. Identity that the agent legitimately needs belongs in `initialData`;
+anything secret belongs in application-owned storage that the tool reads at execution time. A
+module-scoped map in the Worker is not an alternative — tools run inside the generated Durable
+Object, which shares the Worker's *bindings* but neither its isolate nor its request scope, so only
+shared storage or the message itself crosses that boundary.
+:::
 
 Conversation history and persistent agent state are framework state, not the canonical application database. Persist business facts through narrow application tools and stable idempotency keys. Do not infer a durable filesystem from a conversation or Durable Object: on Cloudflare, Durable Object storage can persist while ordinary JavaScript instance fields disappear at eviction, and sandbox files have a separate contract.
 
@@ -100,8 +320,20 @@ For a short recoverable sequence within an agent turn, use `durable: true` and p
 - Use an `init()` handle to dispatch to and await a conversation.
 - Use application code or an external Cloudflare Workflow for broader orchestration across systems.
 
+:::note[Verified: a tool with an `output` schema reports failure by throwing]
+A schema-less tool can return a friendly failure sentence as its string result. A tool that declares
+an `output` schema cannot — `ToolRunReturn<S>` no longer permits the bare-string fallback. The
+correct pattern is to `throw new Error('…')`: the runtime catches it and converts it into an
+`isError` outcome, surfaced to the client as a `tool-output-error` chunk and to the model as an
+`output-error` tool state carrying the thrown message. The runtime's own contract comment on
+`reexecuteDurableToolCall` states it plainly — a throw becomes an `isError` outcome the model sees.
+Read out of the bundled `@flue/runtime` dist while implementing
+[zudolab/zudo-text#4636](https://github.com/zudolab/zudo-text/issues/4636). Do not try to encode an
+error into the success schema.
+:::
+
 :::warning[Flue 2 migration boundary]
 `defineAgent`, `defineWorkflow`, auto-routing, `flue dev`, and `flue build` are beta-era APIs or behavior, not current Flue 2.0.3 behavior. Use exported agent functions, explicit `app.ts` routes, and Vite commands. Flue no longer supplies a built-in workflow abstraction.
 :::
 
-Continue with [Getting Started on Cloudflare](./getting-started-on-cloudflare.mdx) for Vite integration, generated Durable Objects, migrations, and secrets.
+Continue with [Getting Started on Cloudflare](./getting-started-on-cloudflare.mdx) for Vite integration, generated Durable Objects, migrations, and secrets, or with [Agent Behind an Ingress](./agent-behind-an-ingress.mdx) for the reference architecture that keeps the router unmounted.

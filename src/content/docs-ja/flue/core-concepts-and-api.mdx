@@ -40,6 +40,8 @@ SupportTriage.initialData = v.object({ tenantId: v.string(), caseId: v.string() 
 
 関数名は literal の `agentName` static で上書きしない限り durable identity になる。この identity は conversation storage を key にし、Cloudflare Durable Object class にも寄与する。デプロイ済み関数の rename には class migration が必要になりうるが、source file の rename では不要である。
 
+root の agent 関数は `id`、すなわち conversation の durable address を含む props を受け取って呼ばれる。tool の closure が conversation 単位の state を key 付けできるのはこのためであり、delivery から何かを parse し直す必要はない。subagent の render には props が渡らない。
+
 ## 明示的な Route と Dispatch
 
 `app.ts` は application の route map である。mount は HTTP conversation surface を公開するが、agent を登録するものではない。mount した route には authentication と authorization middleware を適用し、conversation ID そのものを access control と見なすのではなく、その ID への access を認可する。
@@ -54,6 +56,14 @@ app.route('/agents/support', createAgentRouter(SupportTriage));
 
 export default app;
 ```
+
+:::note[検証済みの事実]
+mount した agent には**組み込みの authentication も authorization も存在しない**。URL に到達できる者は誰でも送信でき、履歴全体を読み、abort できる。agent ごとの middleware export も存在しない。保護は mount の手前に重ねる通常の Hono composition であり、mount の前に置いた `/*` middleware は router のすべての route——POST、履歴 read、SSE read、`HEAD`、abort、attachment read——を実際に横取りする。Flue 2.0.3 に対する probe で確認した（[zudolab/zudo-text#4622](https://github.com/zudolab/zudo-text/issues/4622)）。
+:::
+
+authorization は caller 単位ではなく **conversation id 単位**で行う。id は caller が選ぶ path segment なので、middleware が ownership も確認しない限り、認証済みユーザーは id を推測するだけで他人の conversation を読める。確認が等値比較で済むよう server 側で id を導出するか、そもそも mount しない。後者は[Ingress の背後に置く Agent](./agent-behind-an-ingress.mdx)を参照する。
+
+router は `Access-Control-*` header も一切設定しない。cross-origin の caller には、`Stream-Next-Offset`、`Stream-Up-To-Date`、`Location` を expose する application 側の CORS layer が必要である。そうしないと browser がこれらを隠し、header に依存した stream resume が無言で壊れる。`vite dev` は localhost 向けの緩い default を適用するため、この設定漏れは local では動き、デプロイ後に初めて失敗する。
 
 channel 主導の application には **dispatch-only** agent を使える。登録はされるが public な `createAgentRouter(...)` mount は持たない。application code が delivery を検証した後、認可済み conversation を選び、delivery ごとの signal を dispatch する。
 
@@ -75,18 +85,137 @@ await dispatch(SupportTriage, {
 
 `dispatch()` が resolve するのは、model reply の完了時ではなく input が conversation queue へ受理された時点である。同じ conversation への direct HTTP と dispatch の input は同じ受理順序を共有する。Slack の verification、acknowledgement、raw-body の規則は、一般的な webhook recipe ではなく [Worker Backend](../worker-backend/index.mdx) と [Events](../events/index.mdx) を参照する。
 
+## Mount した Conversation Surface
+
+:::note[検証済みの事実]
+このセクションの route、status code、response body、chunk 名はすべて **Flue 2.0.3** に対して実測で確定した。根拠は install 済みの `@flue/runtime` dist（`dist/routing.mjs` から `dist/dispatch-*.mjs` の `createAgentRouter`、`handleAgentRequest`、`handleAgentConversationRead`、`sseResponse`）、バージョンが一致する同梱 prose（`flue docs read reference/streaming-protocol`）、および faux provider で tool 呼び出しの turn を走らせた probe である（[zudolab/zudo-text#4622](https://github.com/zudolab/zudo-text/issues/4622)）。streaming と tool activity は native であり、application 側の SSE bridge は不要である。
+:::
+
+`createAgentRouter(agent)` は mount からの相対 path を持つ Hono sub-router を返す。`:id` は caller が選ぶ conversation id であり、mount path は純粋な routing にすぎない。conversation は agent の durable identity で key 付けされ、URL では key 付けされないからである。
+
+| Method | Path | 目的 |
+|---|---|---|
+| `POST` | `/:id` | メッセージを 1 件 deliver する。受理時に `202` を返す |
+| `GET` | `/:id` | read: `?view=history`（default の snapshot）または `?view=updates`（chunk） |
+| `HEAD` | `/:id` | header のみの stream metadata。body なし |
+| `POST` | `/:id/abort` | 実行中および queue 済みの作業を abort する |
+| `GET` | `/:id/attachments/:attachmentId` | attachment のバイト列 |
+
+`DELETE /:id` と `PUT /:id` は `Allow: GET, HEAD, POST` を伴う `405` を返す。read 系の route は、最初の `POST` が conversation を作るまですべて `404 stream_not_found` を返す。streaming route も例外ではなく、event stream ではなく JSON が返る。client は stream を開く前に POST するか、その 404 を許容して retry しなければならない。
+
+### 受理は回答ではない
+
+送信は fire-and-forget である。`202` は durable に受理されたという意味であって、回答されたという意味ではない。同期的な待機手段もなく、`?wait=…` は `400` で拒否される。受理時の body と、その `Location` および `Stream-Next-Offset` header に、client がその後必要とするすべての handle が含まれる。
+
+```jsonc
+{
+  "streamUrl": "https://…/agents/support/case-1", // the request URL, query stripped
+  "offset": "0000000000000000_0000000000000000",  // durable head at admission
+  "submissionId": "sub_01KZH5…",                  // matches the settlement chunk
+  "uid": "inst_01KZH5…"                           // the contacted incarnation
+}
+```
+
+この `offset` から stream を resume すれば、履歴を replay せずにこの submission が生成するものだけを見られる。request body の予約された任意 field は `initialData`（この送信が instance を作る場合にのみ参照される）、`uid`（送信条件。文字列ならその incarnation のみ継続、`null` なら作成のみ、省略なら無条件）、`idempotencyKey`（256 文字以下。同じ key の再送は元の submission に収束する）である。
+
+### 履歴と live update
+
+`GET /:id` は `Stream-Up-To-Date: true` を伴う snapshot を返す。assistant message 1 件が回答 1 つ分に対応する。1 submission のすべての model step は、その submission の**最初の** assistant message に畳み込まれ、part が step をまたいで蓄積される。各 message の `display` field は `visible`、`diagnostic`、`hidden` のいずれかを示す。公開されるのは root の conversation だけで、subagent の conversation は決して現れない。
+
+message の `parts` は `text` または `reasoning`（それぞれ `streaming` か `done` の state を持つ）、`file`、`data-${name}`、`dynamic-tool` のいずれかである。`dynamic-tool` の part は `toolName` と `toolCallId` を持ち、`input-available`、`output-available`、`output-error` のいずれかの状態を取る。live な client が chunk として見た tool activity を、履歴の描画側はこれで再構成する。snapshot にはさらに `settlements` の配列があり、各 `submissionId` と outcome を対応付ける。turn が終わった後に再接続した client でも、どう終わったかを知ることができる。
+
+`GET /:id?view=updates&offset=<offset>&live=sse` は chunk を stream する。`offset` はちょうど 1 回必須である（`-1` ですべてを replay する）。SSE の framing は次のとおり。
+
+```
+event: data
+data:[{ "type": "message-delta", … }, …]
+
+event: control
+data:{"streamNextOffset":"0000000000000000_0000000000000007","upToDate":true}
+
+: heartbeat
+```
+
+`data` event は chunk の JSON **配列**を運び、read cycle が何かを生成したときにだけ現れる。`control` event は空の cycle も含めて毎 cycle 後に続くので、追いついた stream でも 30 秒以内に 1 つは届く。`: heartbeat` は 15 秒ごとに届く。stream は server 側からは終わらない。client は必ず途中で読むのをやめるため、reader を release するのではなく response body を**cancel** しなければならない。さもないと turn ごとに 1 本ずつ HTTP connection が残る。reconnect をまたぐ配送は at-least-once なので、各 chunk の `position`（`batch` と `index` の組を辞書順で比較する）で dedupe する。`data:` のコロン直後に空白がない点にも注意し、寛容な parser を使う。
+
+同じ route を `live=sse` **なし**で読むと、chunk の配列が素の JSON body として返り、inline の `control` event の代わりに `Stream-Next-Offset` と `Stream-Up-To-Date` が response header に載る。`live=long-poll` は最大 30 秒 park し、timeout 時は `200 []` を返す。これにより headless な caller のループは「POST し、settlement まで long-poll し、最後に snapshot を読む」だけになり、SSE の parse は一切不要になる。
+
+### Chunk の語彙
+
+```ts
+type ChunkBody =
+  | { type: 'conversation-reset'; conversationId: string; snapshot: FlueConversationSnapshot }
+  | { type: 'message-appended'; conversationId: string; message: FlueConversationMessage }
+  | { type: 'message-started'; conversationId: string; messageId: string; submissionId?: string }
+  | { type: 'message-metadata'; conversationId: string; messageId: string; metadata: Record<string, unknown> }
+  | { type: 'data-part'; conversationId: string; messageId: string; name: string; data: unknown }
+  | { type: 'message-delta'; conversationId: string; messageId: string; kind: 'text' | 'reasoning'; delta: string }
+  | { type: 'tool-input'; conversationId: string; messageId: string; toolCallId: string; toolName: string; input: unknown }
+  | { type: 'tool-output'; conversationId: string; toolCallId: string; output: unknown; durationMs?: number }
+  | { type: 'tool-output-error'; conversationId: string; toolCallId: string; errorText: string; durationMs?: number }
+  | { type: 'message-completed'; conversationId: string; messageId: string }
+  | { type: 'submission-settled'; conversationId: string; submissionId: string;
+      outcome: 'completed' | 'failed' | 'aborted'; error?: unknown };
+```
+
+`conversation-reset` は蓄積された state をすべて置き換え、同じ batch の他のすべての chunk を包含する。そのため `offset=-1` からの read は必ずこれで始まる。updates read の先頭には `stream-checkpoint` item が付くが `position` を持たないので、dedupe 規則が自然に読み飛ばす。`tool-output` と `tool-output-error` は `messageId` を**持たない**。`message-completed` の境界をまたぐ場合も含め、`toolCallId` だけで対応付ける。
+
+:::warning[唯一の罠: `message-completed` は model step ごとに発火する]
+`message-completed` は turn ごとではなく **model step ごとに 1 回**発火する。tool 呼び出しを 1 回含む turn で観測された順序は、`message-started`、`tool-input`、**`message-completed`**、`tool-output`、再度の `message-started`（同じ `messageId` の継続）、複数の `message-delta`、もう一度の `message-completed`、そして最後に `submission-settled` である。`message-completed` を turn の終端として扱う client は、tool 呼び出しの直後で stream を打ち切り、本来の回答を落とす。終端は、受理 response の `submissionId` と一致する `submission-settled` だけとし、他の submission の settlement は無視する。
+:::
+
+`202` の時点ですでに durable に受理されているため、read の失敗は turn の失敗ではない。回答は生成され続けており、offset も有効なままである。stream を開くときの `5xx` は turn の死として表面化させず reconnect の予算内で retry し、`4xx` は終端として扱う。そして chunk を実際に配送できた connection の後は予算を reset する。そうしないと、たまに切断されながらも継続する長い turn が、死に続ける stream と同じ上限で打ち切られてしまう。
+
+error は 1 つの envelope に統一されているので、prose ではなく `type` で分岐する。
+
+```jsonc
+{ "error": { "type": "invalid_request", "message": "…", "details": "…", "meta": {} } }
+```
+
+確認済みの code には `stream_not_found`（404）、`agent_instance_not_found`（404）、`attachment_not_found`（404）、`method_not_allowed`（405、`Allow` 付き）、`agent_instance_exists`（409、`meta.uid` が既存の incarnation を示す）、`unsupported_media_type`（415）、`invalid_request` と `invalid_json`（400）、`runtime_unavailable`（503、`Retry-After` 付き。local dev の reload で観測）、`internal_error`（500）がある。
+
+## Conversation を削除する手段はない
+
+:::warning[検証済み: Flue 2.0.3 にはどの層にも削除手段がない]
+router は `DELETE` を提供しない。`ConversationStreamStore` が公開するのは create、acquire-producer、append、read、`getMeta`、subscribe だけで、その contract には stream は append-only であり canonical record は決して書き換えないと明記されている。`AgentSubmissionStore` も、session は agent instance の生存期間にわたって append-only であり session ごとの削除は contract に存在しないと述べている。Cloudflare では adapter surface 自体が適用されず、各 instance は自身の Durable Object SQLite に永続化されるが、runtime に destroy は存在しない。`POST /:id/abort` は作業を止めるだけで何も消さない。idle な conversation は `200 {"aborted": false}` を返す。
+:::
+
+retention や「この会話を削除する」という要件を持つプロダクトには、次の 3 点が帰結する。
+
+- **「新しい会話」とは新しい conversation id のことである。** rotation が native な reset であり、古い stream は durable なまま残り、id を知る者からは到達可能である。
+- **conversation の index は application が持たなければならない**——id、owner、作成時刻、最終利用時刻。Flue に列挙手段はないので、index から漏れた id は到達不能であると同時に**消去も不能**になる。
+- **本当の消去には、生成された Durable Object の内側に置く application 所有の code が要る。** framework の呼び出しでは実現できない。存在しない delete を前提に計画せず、この作業を明示的に scope する。
+
+現実的な折衷案は、conversation id に random な末尾を付けて mint し、index 行の削除を削除とみなすことである。古い Durable Object の stream は orphan になり、client 側の同じ名前を再利用しても新しい id、すなわち新しい instance が mint されるため、履歴を復活させられない。retention の文言は正直に書く。conversation は直ちに unlist され到達不能になり、そのバイト列は Durable Object とともに老朽化して消える。「完全に消去した」とは書かない。
+
 ## Data の境界
 
 | Data | Contract | 用途 |
 |---|---|---|
 | Conversation/instance ID | caller が選ぶ安定した address | tenant 単位の case、channel thread |
 | `initialData` | 作成時に validation され一度記録される immutable な値 | tenant と case の identity |
-| Signal attributes | delivery ごとの metadata。trust は ingress に依存 | server-authored dispatch 上の検証済み event ID と現在の actor |
+| Signal attributes | delivery ごとの metadata。model の prompt に描画され永続化される | 検証済み event ID のような、機微でない相関用の値 |
 | Persistent state | 1 conversation の durable で名前を持つ state | 小さな agent 所有の進捗や gate |
 | Canonical record | application 所有の database または service | 業務上の truth、ownership、OAuth、audit |
 | File/sandbox | 選択した実装に依存 | contract が durable な場合だけ artifact |
 
-`initialData` は mutable metadata ではない。既存の conversation に渡す後続の値は無視される。`useInitialData()` で読み、現在の delivery は `useDelivery()` で読む。Server-authored dispatch の attributes には application が検証済みの context を入れられる。一方、直接 mount した client route から届く attributes は caller input であるため、validation と authorization を行い、Flue の shape validation を真正性と取り違えてはならない。どちらも model による authorization ではない。
+`initialData` は mutable metadata ではない。既存の conversation に渡す後続の値は無視される。`useInitialData()` で読み、現在の delivery は `useDelivery()` で読む。2.0.3 に対する実装から得られた実務上の注意が 2 つある。まず `initialData` は、自前の index が「今 instance を作った」と判断した送信だけでなく、**すべての**メッセージに載せる。Flue は既存 instance の creation data を無視するので繰り返しは無害である一方、条件付きで送ると同時に届いた 2 つの最初のメッセージが競合し、creation data を一切持たない instance が作られうる。次に `useInitialData()` は、agent が必須の schema を宣言していても実際に `undefined` を返しうる。tooling だけの render には creation data が伴わないためである。destructure せず、undefined を許す型にして degrade させる。
+
+Server-authored dispatch の attributes には application が検証済みの context を入れられる。一方、直接 mount した client route から届く attributes は caller input であるため、validation と authorization を行い、Flue の shape validation を真正性と取り違えてはならない。どちらも model による authorization ではない。
+
+:::danger[検証済み: signal attributes は model から見える prompt text であり、永続する]
+install 済みの `@flue/runtime` dist にある `renderSignalMessage()` は、signal を model context 向けに、attribute を**そのまま**書き出す要素へと serialize する。
+
+```
+<tagName type="…" attrName="attrValue" …>
+body
+</tagName>
+```
+
+`buildConversationContextEntries()` はその文字列をそのまま LLM の context に渡し、さらにその delivery は `GET /:id?view=history` が永久に replay する append-only の canonical record でもある。つまり `attributes` に置いた bearer token、API key、session id、個人情報は、prompt と永続履歴の両方に残る。[zudolab/zudo-text#4632](https://github.com/zudolab/zudo-text/issues/4632) の実装中に確認し、計画されていた `attributes: { userId, vaultId, bearer }` という設計を出荷前に破棄した。
+
+**Flue 2.0.3 には、model から見えない delivery ごとの channel が存在しない。** `user` の body は prompt text、signal attributes も prompt text、`usePersistentState` は durable だが agent 所有、`initialData` は作成後 immutable である。agent が正当に必要とする identity は `initialData` に置き、秘密情報は application 所有の storage に置いて tool が実行時に読む。Worker の module scope に置いた map は代替にならない。tool は生成された Durable Object の内側で動き、そこは Worker の**binding** は共有するが isolate も request scope も共有しないため、その境界を越えられるのは共有 storage かメッセージ自身だけである。
+:::
 
 conversation history と persistent agent state は framework state であり、canonical application database ではない。業務 fact は narrow な application tool と stable idempotency key を通じて保存する。conversation や Durable Object から durable filesystem を推論してはいけない。Cloudflare では Durable Object storage は残っても、通常の JavaScript instance field は eviction で消える。sandbox file には別の contract がある。
 
@@ -100,8 +229,12 @@ agent turn の中で復旧させる短い sequence には `durable: true` を使
 - `init()` handle は conversation へ dispatch し、結果を待つために使う。
 - system をまたぐ広い orchestration には application code または外部 Cloudflare Workflow を使う。
 
+:::note[検証済み: `output` schema を持つ tool は throw で失敗を伝える]
+schema を持たない tool は、失敗時に読みやすい文章を string の結果として返せる。`output` schema を宣言した tool ではそれができない。`ToolRunReturn<S>` がその素の string への fallback を許さなくなるからである。正しい書き方は `throw new Error('…')` である。runtime がこれを捕捉して `isError` の outcome に変換し、client には `tool-output-error` chunk として、model には throw されたメッセージを持つ `output-error` の tool state として現れる。runtime 自身の `reexecuteDurableToolCall` の contract comment がそれを明言している——throw は model が見る `isError` の outcome になる、と。[zudolab/zudo-text#4636](https://github.com/zudolab/zudo-text/issues/4636) の実装中に、同梱の `@flue/runtime` dist から読み取って確認した。error を success schema に押し込もうとしてはいけない。
+:::
+
 :::warning[Flue 2 の移行境界]
 `defineAgent`、`defineWorkflow`、auto-routing、`flue dev`、`flue build` は beta 時代の API または挙動であり、現在の Flue 2.0.3 の挙動ではない。export した agent 関数、明示的な `app.ts` route、Vite command を使う。Flue は built-in workflow abstraction を提供しない。
 :::
 
-Vite 統合、生成される Durable Object、migration、secret は[Cloudflare で始める](./getting-started-on-cloudflare.mdx)を参照する。
+Vite 統合、生成される Durable Object、migration、secret は[Cloudflare で始める](./getting-started-on-cloudflare.mdx)を、router を mount しないまま運用する reference architecture は[Ingress の背後に置く Agent](./agent-behind-an-ingress.mdx)を参照する。
