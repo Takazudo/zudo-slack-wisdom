@@ -27,7 +27,7 @@ Documentation site built with [zudo-doc](https://github.com/zudolab/zudo-doc) �
 - `pnpm check:template-drift` — diff host files (`pages/`, `src/styles/global.css`, the `claudeSkills` files) against the matching `create-zudo-doc` release, fetched on demand and cached under `node_modules/.cache/` (`scripts/check-template-drift.sh`); genuine intentional divergences go in `.template-drift-allowlist`
 - `pnpm check:html` — validate built HTML (`.htmlvalidate.json` rules) via `pnpm dlx html-validate`
 - `pnpm check:links` — broken-link check on built `dist/` + absolute-link check on MDX source (`scripts/check-links.js`); known exceptions go in `.check-links-allowlist`
-- `pnpm setup:doc-skill` — generate the `zudo-slack-wisdom` skill (see "Doc Skill" below) + symlink it into the user-scope skills directory
+- `pnpm setup:doc-skill` — generate the `slack-wisdom` skill (see "Doc Skill" below) + symlink it into the user-scope skills directory
 
 ## Key Directories
 
@@ -170,7 +170,7 @@ Auto-generated directories (no header nav entry, managed by the `claudeResources
 
 ## Doc Skill
 
-`pnpm setup:doc-skill` (`scripts/setup-doc-skill.sh`) generates the `zudo-slack-wisdom` skill from this site's built docs and symlinks it into the user-scope skills directory (`~/.claude/skills/` and/or `~/.codex/skills/`). The generated `.claude/skills/zudo-slack-wisdom/` / `.codex/skills/zudo-slack-wisdom/` directories are gitignored — do not track or hand-edit them; re-run `pnpm setup:doc-skill` to refresh. The `src/content/docs/claude*/` pages consumed by that skill are written by the `claudeResources` build integration on every `pnpm build`; edit the site's `.claude/` sources (`CLAUDE.md`, skills, commands, agents), not those generated pages, to change their content.
+`pnpm setup:doc-skill` (`scripts/setup-doc-skill.sh`) generates the `slack-wisdom` skill from this site's built docs and symlinks it into the user-scope skills directory (`~/.claude/skills/` and/or `~/.codex/skills/`). The skill name is overridden to `slack-wisdom` via the `SKILL_NAME` env var in the `setup:doc-skill*` package.json scripts (the script would otherwise derive `zudo-slack-wisdom` from the package name). The generated `.claude/skills/slack-wisdom/` / `.codex/skills/slack-wisdom/` directories are gitignored — do not track or hand-edit them; re-run `pnpm setup:doc-skill` to refresh. The `src/content/docs/claude*/` pages consumed by that skill are written by the `claudeResources` build integration on every `pnpm build`; edit the site's `.claude/` sources (`CLAUDE.md`, skills, commands, agents), not those generated pages, to change their content.
 
 ## Enabled Features
 

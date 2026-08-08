@@ -27,10 +27,14 @@ pnpm-debug.log*
 # zudo-doc build artifact (routes-src/ staged here at build time)
 .zudo-doc/
 
-# Generated doc-lookup skill
-.claude/skills/zudo-slack-wisdom/SKILL.md
-.claude/skills/zudo-slack-wisdom/docs
-.codex/skills/zudo-slack-wisdom/SKILL.md
-.codex/skills/zudo-slack-wisdom/docs
-.claude/skills/zudo-slack-wisdom/docs-ja
-.codex/skills/zudo-slack-wisdom/docs-ja
+# Generated doc-lookup skill (SKILL_NAME=slack-wisdom override in package.json)
+.claude/skills/slack-wisdom/SKILL.md
+.claude/skills/slack-wisdom/docs
+.codex/skills/slack-wisdom/SKILL.md
+.codex/skills/slack-wisdom/docs
+.claude/skills/slack-wisdom/docs-ja
+.codex/skills/slack-wisdom/docs-ja
+# claudeResources self-documents the generated skill on machines that ran
+# `pnpm setup:doc-skill` (skill dir is absent on CI, so production never
+# builds this page — keep it out of git too)
+src/content/docs/claude-skills/slack-wisdom/
