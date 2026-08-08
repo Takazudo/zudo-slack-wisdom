@@ -241,6 +241,21 @@ code が approved destination を通して authorized human に preview を送�
 記録し、別の commit operation を dispatch する。New version、authorization の変更、expired
 preview、request-fingerprint mismatch があれば preview に戻す。
 
+## 実装された reference implementation
+
+:::note[他所で実装されたが、ここではあくまで提案]
+その後、この方向で automation surface を構築し、Flue の agent tool を実際にそこへ向けた application が 1 つ現れた。zudo-text の automation API であり、`zudolab/zudo-text` repository の `doc/src/content/docs/backend-api/automation-api.mdx` に文書化され、[epic #4621](https://github.com/zudolab/zudo-text/issues/4621) で構築された。これは**別プロダクトの実装**であって、このページの名前が昇格したわけではない。上記の endpoint、field、tool 名はすべて例示のままである。この実装が与えてくれるのは、この提案のどの部分が実際に出荷されたシステムとの接触に耐え、どの部分が意図的に捨てられたか、という証拠である。
+:::
+
+とくに挙げる価値のある乖離が 4 つある。どれも見落としではなく、検討のうえでの選択である。
+
+- **不透明な `documentId` ではなく path による addressing。** このページは rename と move を越えて生き残る immutable な id を推している。あの実装は document を canonical な vault path で addressing する。path がプロダクト自身のユーザーに見える identity であり、並行する id 空間を作ればそれと突き合わせ続けなければならないからである。このページの正規化要件——rooted、長さ上限、traversal の拒否、authorization より前に 1 つの canonical form を計算する——はそのまま適用され、path addressing のもとではむしろ重みを増す。
+- **常設の privacy-filtered projection ではなく key-session による consent model。** automation が継続的に読む projection を維持するのではなく、ユーザーが短命な session を許諾する。そのために導出された鍵は server memory に最大 1 時間だけ存在し、access は自然に失効する。これはこのページの「個別に consent を得る」という要件に、durable な index ではなく期限付きの許諾で答えるものである。projection の lag と暗黙の権限拡大という問題は消える代わりに、再 consent の問題が現れる。session は会話の途中で失効しうるので、client は黙って再導出するのではなく、再度プロンプトを出して turn を retry しなければならない。
+- **subscription による gate。** automation の各 route は、認証、scope、ownership、vault binding に加えて有効な subscription も確認する。このページの認可リストは、商用上の gate をセキュリティ上の確認と同格の first-class な check として想定していなかった。
+- **calendar surface が存在しない。** 上記の calendar contract はあの実装では未実装であり、今後もそのままになる見込みである。もっとも近い実機能は、kanban board の card の日付を解決して、区間を限定した時間の問い合わせに答える tool である。calendar API ではなく、プロダクト自身のドメインモデル上の agent tool である。理由は上記の recurrence、夏時間、instance identity の要件そのものにある。それらは本物の calendar には正しい scope だが、実際の必要に対しては過大である。
+
+あの実装は、下の[test matrix](#network-free-contract-test-matrix)についての datapoint も 1 つ生んだ。mint 時に単一の collection へ意図的に binding した token が、automation の route では実際にはその collection に限定されていなかった。binding の確認が別の route group に置かれていたためである。これはまさにこの matrix が求める「tenant/workspace と collection の不一致」と「非委譲」のケースであり、そのリストから書かれた test が捕まえた。matrix は元を取っている。
+
 ## Network-free contract test matrix
 
 すべての test で fictional な tenant、resource、timestamp と in-memory または disposable local

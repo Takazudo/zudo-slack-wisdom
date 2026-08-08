@@ -246,6 +246,48 @@ the preview to an authorized human through an approved destination, records a sc
 and dispatches a separate commit operation. A new version, changed authorization, expired preview,
 or request-fingerprint mismatch sends the flow back to preview.
 
+## A Realized Reference Implementation
+
+:::note[Realized elsewhere, still a proposal here]
+One application has since built an automation surface along these lines and driven Flue agent tools
+against it: zudo-text's automation API, documented in the `zudolab/zudo-text` repository at
+`doc/src/content/docs/backend-api/automation-api.mdx` and built out through
+[epic #4621](https://github.com/zudolab/zudo-text/issues/4621). It is a **different product's
+implementation**, not a promotion of this page's names — every endpoint, field, and tool name above
+remains illustrative. What it offers is evidence about which parts of this proposal survive contact
+with a shipped system, and which were deliberately traded away.
+:::
+
+Four divergences are worth naming, because each was a considered choice rather than an omission:
+
+- **Path addressing instead of an opaque `documentId`.** This page argues for an immutable id that
+  survives rename and move. That implementation addresses documents by canonical vault path, because
+  the paths are the product's own user-visible identity and a parallel id space would have to be
+  reconciled with it. The page's normalization requirements — rooted, length-bounded, traversal
+  rejected, one canonical form computed before authorization — apply unchanged and carry more weight
+  under path addressing, not less.
+- **A key-session consent model instead of a standing privacy-filtered projection.** Rather than
+  maintaining a projection that automation reads continuously, the user grants a short-lived
+  session; keys derived for it live in server memory for at most an hour, and access lapses on its
+  own. That answers this page's "separately consented" requirement with an expiring grant instead of
+  a durable index, which removes the projection-lag and silent-broadening problems and replaces them
+  with a re-consent problem — a session can expire mid-conversation, and the client has to re-prompt
+  and retry rather than silently re-derive.
+- **Subscription-gated.** Every automation route checks an active subscription in addition to
+  authentication, scope, ownership, and vault binding. This page's authorization list did not
+  anticipate a commercial gate as a first-class check alongside the security ones.
+- **No calendar surface at all.** The calendar contract above is unimplemented there and likely to
+  stay that way. The nearest real capability is a kanban-board query tool that resolves card dates
+  and answers bounded time-window questions — an agent tool over the product's own domain model, not
+  a calendar API. The recurrence, daylight-saving, and instance-identity requirements above are the
+  reason: they are the correct scope for a real calendar and far too much for the actual need.
+
+That implementation also produced one datapoint about the [test matrix](#network-free-contract-test-matrix)
+below. A token deliberately bound to a single collection at mint time turned out not to be confined
+to it on the automation routes, because the binding check lived on a different route group — exactly
+the "tenant/workspace and collection mismatch" and "non-delegation" cases this matrix calls for, and
+it was a test written from that list that caught it. The matrix earns its keep.
+
 ## Network-Free Contract Test Matrix
 
 All tests use fictional tenants, resources, timestamps, and in-memory or disposable local adapters.
