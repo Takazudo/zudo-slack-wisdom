@@ -34,7 +34,8 @@ pnpm-debug.log*
 .codex/skills/slack-wisdom/docs
 .claude/skills/slack-wisdom/docs-ja
 .codex/skills/slack-wisdom/docs-ja
-# claudeResources self-documents the generated skill on machines that ran
-# `pnpm setup:doc-skill` (skill dir is absent on CI, so production never
-# builds this page — keep it out of git too)
-src/content/docs/claude-skills/slack-wisdom/
+# Generated claude-skills docs (claudeResources build integration,
+# regenerated on every `pnpm build`) — fleet convention, matches the other
+# wisdom repos. Supersedes the narrower slack-wisdom/-only rule this used to
+# be.
+src/content/docs/claude-skills/
