@@ -1,6 +1,6 @@
 ---
 title: Cron Posting
-description: Scheduled Workers that mirror external data into Slack -- overlap protection, freshness stamps, and batching under rate tiers.
+description: Scheduled Workers that mirror external data into Slack -- at-least-once ticks, overlap suppression, local-time windows, idempotent posting, and per-tick budgets.
 sidebar_position: 6
 ---
 
@@ -65,45 +65,610 @@ Workers runtime considers a `scheduled()` invocation finished as soon as the
 function returns, so the actual Slack call needs to be registered with
 `waitUntil()` or the runtime may tear the isolate down before it completes.
 
-## Overlap protection: a run lock
+Everything after this section is about one question: what happens when a
+tick does not run exactly once. Cloudflare can deliver the same tick more
+than once, two runs can overlap, and Slack and your database cannot commit
+together. The next three sections are one stack, weakest layer first: a
+per-tick claim collapses duplicate _delivery_, a lease suppresses
+overlapping _runs_, and a per-item marker is the only layer that actually
+prevents a duplicate _Slack post_. A job small enough to rely on the last
+layer alone is a defensible design; a job that skips the last layer is not.
 
-Cron Triggers don't guarantee mutual exclusion — if a tick's work
-occasionally takes longer than the interval between triggers (a slow
-upstream API, a large batch), two invocations can end up running at once.
-For a mirror job that posts a single message, two overlapping runs racing
-to `chat.update` the same `ts` don't corrupt anything, but they do waste a
-Web API call and can post a half-built board if the two runs read
-different snapshots of the source data mid-flight. A short-TTL lease in
-KV is enough to serialize runs:
+## Cron delivery is at-least-once
+
+Cron Triggers are not exactly-once. The runtime can invoke `scheduled()`
+more than once for the **same** tick — the same `cron` expression and the
+same `scheduledTime`. The clearest signal in the platform's own API is
+[`ScheduledController.noRetry()`](https://developers.cloudflare.com/workers/runtime-apis/handlers/scheduled/):
+a method whose entire purpose is to suppress redelivery only makes sense in
+a system that redelivers.
+
+Collapse the duplicates with a claim keyed on the tick's identity, written
+**before** any work starts:
 
 ```typescript
-const LOCK_KEY = "status-board:sync-lock";
-const LOCK_TTL_SECONDS = 60; // Longer than a single tick should ever take.
+const TICK_CLAIM_TTL_SECONDS = 900; // Comfortably longer than the cron interval.
 
-async function withRunLock(env: Env, fn: () => Promise<void>): Promise<void> {
-  const existing = await env.KV.get(LOCK_KEY);
-  if (existing) {
-    console.log("[cron] previous run still holds the lock, skipping this tick");
-    return;
+// `scheduledTime` is unique per tick, so a claim for one tick can never block
+// the next one -- nothing has to clear it, the TTL does that.
+function tickClaimKey(controller: ScheduledController): string {
+  return `tick-claim:${controller.cron}-${controller.scheduledTime}`;
+}
+
+async function claimTick(env: Env, key: string): Promise<boolean> {
+  if (await env.KV.get(key)) return false;
+  await env.KV.put(key, String(Date.now()), { expirationTtl: TICK_CLAIM_TTL_SECONDS });
+  return true;
+}
+
+export default {
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      (async () => {
+        const key = tickClaimKey(controller);
+        if (!(await claimTick(env, key))) {
+          console.log(`[cron] duplicate delivery of ${key}, skipping`);
+          return;
+        }
+        await syncToSlack(env, controller);
+      })(),
+    );
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+The TTL is the only tuning knob, and it wants to be comfortably longer than
+the cron interval — long enough that a redelivery arriving late still finds
+the claim, short enough that keys don't accumulate forever. Because
+`scheduledTime` differs on every tick, a long TTL costs nothing in
+correctness: the next tick has a different key.
+
+A Worker that also exposes a manual admin trigger runs the same pipeline
+from an HTTP request, where there is no tick to collapse. Give that path a
+key that is unique per invocation, so the claim is a deliberate no-op rather
+than an accidental lock:
+
+```typescript
+// A manual run has no scheduled tick to deduplicate against, so its claim key
+// is unique per invocation -- the claim always succeeds, by design.
+function manualClaimKey(): string {
+  return `tick-claim:manual-${crypto.randomUUID()}`;
+}
+```
+
+:::warning[This layer is best-effort, not authoritative]
+`KV.get()` followed by `KV.put()` is not atomic, and KV is eventually
+consistent — two deliveries of the same tick landing close together can both
+read "unclaimed" and both proceed. That is true even with a single logical
+entry point. Treat this as **duplicate suppression**, not deduplication: it
+removes the common case cheaply and does nothing for the rare one. If per-tick
+dedupe has to be authoritative, replace the KV claim with a unique insert into
+D1 and let the constraint violation be the "already claimed" signal.
+
+Note also what this layer does _not_ cover. It collapses duplicate delivery of
+one tick. It says nothing about whether an individual row gets posted twice —
+that is per-item idempotency, a separate mechanism with a different ordering
+rule, covered under "Idempotent posting: mark after success" below.
+:::
+
+## Overlap suppression: a heartbeat lease in D1
+
+Cron Triggers don't guarantee mutual exclusion. If a tick's work
+occasionally takes longer than the interval between triggers — a slow
+upstream API, a large batch — two invocations can end up running at once.
+For a mirror job, two overlapping runs racing to `chat.update` the same `ts`
+waste a Web API call and can publish a half-built board if the two runs read
+different snapshots of the source data mid-flight. For a job that posts
+per-row notifications, the overlap is worse: it is a duplicate message in
+someone's channel.
+
+:::caution[Correction: a short-TTL KV lease is not enough]
+An earlier version of this page recommended a short-TTL KV lease as the run
+lock. That advice holds only for a job whose **sole** entry point is the cron
+tick and whose worst case is a skipped tick. Real deployments almost always
+grow a second entry point — a manual admin trigger, a webhook-initiated sync —
+and at that point KV's eventual consistency (a cache floor around 60 seconds)
+makes the lease unsound: two runs starting from different entry points can both
+read "no lock" and both proceed. The KV lease is retained above only as the
+per-tick claim, where a missed suppression costs duplicated work rather than a
+duplicated post.
+:::
+
+The pattern that holds up is a singleton row in D1, claimed by an atomic
+conditional `UPDATE`, and kept alive by a heartbeat rather than a TTL:
+
+```sql
+CREATE TABLE sync_lease (
+  id           INTEGER PRIMARY KEY CHECK (id = 1), -- Singleton row.
+  run_id       TEXT,
+  holder       TEXT,
+  started_at   INTEGER,
+  heartbeat_at INTEGER
+);
+
+INSERT OR IGNORE INTO sync_lease (id, run_id) VALUES (1, NULL);
+```
+
+```typescript
+const HEARTBEAT_INTERVAL_MS = 2 * 60 * 1000;
+const STALE_AFTER_MS = 10 * 60 * 1000;
+
+// One atomic conditional UPDATE does the whole acquisition: the row is claimable
+// only when it is free, or when its last heartbeat is older than the staleness
+// window. `meta.changes === 0` means we lost the race -- there is no separate
+// read to go stale between check and write.
+async function acquireLease(env: Env, holder: string): Promise<string | null> {
+  const runId = crypto.randomUUID();
+  const now = Date.now();
+
+  const res = await env.DB.prepare(
+    `UPDATE sync_lease
+        SET run_id = ?, holder = ?, started_at = ?, heartbeat_at = ?
+      WHERE id = 1
+        AND (run_id IS NULL OR heartbeat_at < ?)`,
+  )
+    .bind(runId, holder, now, now, now - STALE_AFTER_MS)
+    .run();
+
+  return res.meta.changes === 1 ? runId : null;
+}
+
+// Fenced by run_id: a run that was already taken over cannot renew or release
+// a lease that now belongs to somebody else.
+async function renewLease(env: Env, runId: string): Promise<boolean> {
+  const res = await env.DB.prepare(
+    `UPDATE sync_lease SET heartbeat_at = ? WHERE id = 1 AND run_id = ?`,
+  )
+    .bind(Date.now(), runId)
+    .run();
+  return res.meta.changes === 1;
+}
+
+async function releaseLease(env: Env, runId: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE sync_lease SET run_id = NULL, holder = NULL WHERE id = 1 AND run_id = ?`,
+  )
+    .bind(runId)
+    .run();
+}
+```
+
+The heartbeat is what makes this pleasant to operate. A TTL forces you to
+guess the slowest realistic tick up front and be wrong in one direction or
+the other: too short and a legitimately slow run loses its own lock, too
+long and a crashed run blocks every tick until it expires. Renewing every
+two minutes and treating a lease as stale only ten minutes after its last
+heartbeat removes the guess entirely. A slow-but-alive run keeps renewing
+and holds the lock as long as it needs; an evicted Worker stops renewing and
+the lease clears itself.
+
+Renewal doubles as the ownership check, so the run has a single question to
+ask between work units:
+
+```typescript
+class Lease {
+  private lastBeat = Date.now();
+
+  constructor(
+    private readonly env: Env,
+    readonly runId: string,
+  ) {}
+
+  // Answers the only question a work loop cares about: do we still own this run?
+  // Renews when the heartbeat interval has elapsed, and otherwise just reads.
+  async stillOurs(): Promise<boolean> {
+    if (Date.now() - this.lastBeat < HEARTBEAT_INTERVAL_MS) {
+      const row = await this.env.DB.prepare(
+        `SELECT run_id FROM sync_lease WHERE id = 1`,
+      ).first<{ run_id: string | null }>();
+      return row?.run_id === this.runId;
+    }
+
+    const renewed = await renewLease(this.env, this.runId);
+    if (renewed) this.lastBeat = Date.now();
+    return renewed;
   }
+}
 
-  await env.KV.put(LOCK_KEY, String(Date.now()), { expirationTtl: LOCK_TTL_SECONDS });
-  try {
-    await fn();
-  } finally {
-    await env.KV.delete(LOCK_KEY);
+for (const item of deliverables) {
+  // Check ownership immediately before anything user-visible, not once at the
+  // top of the run. A takeover between two items must not produce a second post.
+  if (!(await lease.stillOurs())) {
+    console.warn("[cron] lease lost mid-run, stopping before the next post");
+    break;
+  }
+  await postAndStamp(env, lease.runId, item);
+}
+```
+
+The two entry points want different behaviour when they lose the race. A
+cron tick skips cleanly — the next tick will pick the work up. A manual
+trigger has a caller waiting, so tell them who holds the lease:
+
+```typescript
+const runId = await acquireLease(env, "manual");
+if (!runId) {
+  const holder = await env.DB.prepare(
+    `SELECT holder, started_at, heartbeat_at FROM sync_lease WHERE id = 1`,
+  ).first();
+  return Response.json({ error: "sync_in_progress", holder }, { status: 409 });
+}
+```
+
+:::danger[This is overlap suppression, not an at-most-one guarantee]
+Do not read the lease as mutual exclusion. Takeover is time-based, and a
+holder that stopped heartbeating is not necessarily a holder that stopped
+running — an isolate stalled on a slow `fetch` can wake up after its lease was
+reassigned and issue Slack calls with no idea it was replaced. Three
+consequences follow, and all three are load-bearing:
+
+1. **Check for lease loss immediately before every side effect**, not once at
+   the start of the run.
+2. **Fence database writes with the `run_id`**, so a superseded run cannot
+   overwrite state the new holder has already advanced.
+3. **Keep per-deliverable idempotency.** The lease makes duplicates rare; only
+   the marker in the next section makes them impossible to publish twice.
+
+What earns the lease its place is the cost asymmetry, confirmed by a production
+reference integration: a skipped tick is invisible and self-healing, while a
+duplicate Slack post is user-visible and cannot be un-seen. This design sits
+below a [Durable Object](https://developers.cloudflare.com/durable-objects/) in
+complexity and above a KV lease in soundness; reach for the Durable Object when
+the workload genuinely needs serialization rather than suppression.
+:::
+
+## Idempotent posting: mark after success
+
+Slack and your storage cannot commit atomically. There is no transaction
+that spans `chat.postMessage` and a D1 `UPDATE`, so some ordering has to be
+chosen and some failure window has to be accepted. Choose the one whose
+failure mode is recoverable.
+
+Drive the notify loop from the **absence** of a marker, and write the marker
+only **after** Slack has accepted the post:
+
+```typescript
+// The query is the queue: anything without a marker is still owed a post, so a
+// crashed run resumes exactly where it stopped on the next tick.
+const pending = await env.DB.prepare(
+  `SELECT id, payload FROM deliverables
+    WHERE notified_at IS NULL AND due_date = ?
+    ORDER BY id
+    LIMIT ?`,
+)
+  .bind(localDate, BATCH_LIMIT)
+  .all<{ id: string; payload: string }>();
+
+for (const row of pending.results) {
+  await postToSlack(env, row.payload);
+
+  // Stamp only once Slack accepted, and repeat the NULL check in the WHERE
+  // clause so a concurrent run holding the same row cannot double-stamp it.
+  await env.DB.prepare(
+    `UPDATE deliverables SET notified_at = ? WHERE id = ? AND notified_at IS NULL`,
+  )
+    .bind(Date.now(), row.id)
+    .run();
+}
+```
+
+The window that remains is the gap between "Slack accepted the post" and
+"the marker was written." A crash inside that gap means the next tick sees
+`notified_at IS NULL` and posts the item again: exactly one duplicate. That
+window can be narrowed — keep the two operations adjacent, never batch the
+marker writes to the end of the loop — but it cannot be eliminated. This is
+"best-effort once," and it is a deliberate trade: a duplicate is visible,
+explainable, and deletable, while the opposite ordering fails by marking an
+item as delivered that was never posted, and nobody ever notices a message
+that didn't arrive.
+
+:::tip[Two orderings for two failure modes]
+Both of the ordering rules on this page are correct, and each is wrong in the
+other's place.
+
+**Claim before work** when the goal is to skip duplicate _work_ — the per-tick
+claim is written first, so a redelivery finds it and does nothing.
+
+**Mark after success** when the goal is to never lose a user-visible _post_ —
+the per-item marker is written only once Slack has accepted.
+
+Swapping them produces precisely the failure each was meant to prevent: a claim
+written after the work lets the duplicate run through, and a marker written
+before the post silently swallows the post it was supposed to record.
+:::
+
+Use **one marker column per deliverable**, not one per run or per day. A
+single "synced today" flag means one failed item suppresses the same-day
+retry of every other item behind it; a per-deliverable marker lets each item
+fail and recover on its own schedule.
+
+For a higher-contention queue — many concurrent workers over the same
+table — upgrade the bare marker to a claim with a lease. Each worker writes
+a random token, work is acknowledged with that same token, and a crashed
+claimant's rows become claimable again when the lease expires instead of
+being stuck forever:
+
+```typescript
+// Claim: take the row only if nobody holds it, or the previous claim expired.
+const token = crypto.randomUUID();
+const now = Date.now();
+
+const claimed = await env.DB.prepare(
+  `UPDATE deliverables
+      SET claim_token = ?, claim_expires_at = ?
+    WHERE id = ? AND notified_at IS NULL
+      AND (claim_token IS NULL OR claim_expires_at < ?)`,
+)
+  .bind(token, now + CLAIM_LEASE_MS, row.id, now)
+  .run();
+
+if (claimed.meta.changes === 1) {
+  await postToSlack(env, row.payload);
+
+  // Acknowledge with the same token: a claim that expired mid-post and was
+  // taken over by another worker cannot stamp the row out from under it.
+  await env.DB.prepare(
+    `UPDATE deliverables
+        SET notified_at = ?, claim_token = NULL
+      WHERE id = ? AND claim_token = ? AND notified_at IS NULL`,
+  )
+    .bind(Date.now(), row.id, token)
+    .run();
+}
+```
+
+## Scheduling in local time
+
+Cron Triggers fire on UTC. A posting window expressed in local time — "every
+15 minutes between 08:00 and 21:00 JST" — has to be translated by hand, and
+the translation has a trap in it: a local window whose start falls before
+the UTC offset wraps past UTC midnight, landing as a discontiguous set of
+UTC hours.
+
+A second constraint compounds it. Cron's minute field applies to **every**
+hour the expression matches, so a single expression cannot say "every 15
+minutes from 23:00 through 11:59, and then exactly 12:00." The window needs
+two rules: an hour-range rule and a closing-tick rule.
+
+```toml
+[triggers]
+crons = [
+  "*/15 0-11,23 * * *", # 08:00-20:45 local; the window wraps past UTC midnight.
+  "0 12 * * *",         # 21:00 local exactly -- the closing tick.
+]
+```
+
+That comment block is the entire documentation of the mapping, which is
+exactly why it rots. Any edit to the window, any daylight-saving assumption,
+any added rule can silently push a tick outside the intended local hours,
+and nothing fails — the job just posts at 07:45. Make the mapping a test
+that reads the same configuration the Worker deploys with:
+
+```typescript
+// Expand every deployed cron expression into its individual ticks, convert each
+// to local time, and assert it lands inside the window. A schedule edit that
+// drifts outside the intended hours then fails CI instead of surprising users.
+import { CRON_EXPRESSIONS, POSTING_WINDOW } from "../src/config";
+import { expandCron, toLocalMinutes } from "./helpers/cron";
+
+test("every cron tick falls inside the local posting window", () => {
+  const ticks = CRON_EXPRESSIONS.flatMap((expression) => expandCron(expression));
+  expect(ticks.length).toBeGreaterThan(0);
+
+  for (const utcTick of ticks) {
+    const local = toLocalMinutes(utcTick, POSTING_WINDOW.timeZone);
+    expect(local).toBeGreaterThanOrEqual(POSTING_WINDOW.startMinutes);
+    expect(local).toBeLessThanOrEqual(POSTING_WINDOW.endMinutes);
+  }
+});
+```
+
+The test only has value if `CRON_EXPRESSIONS` is the array the deployment
+actually uses — generate `wrangler.toml`'s `crons` from it, or assert the
+two match. A test against a hand-copied duplicate of the schedule proves
+nothing.
+
+:::tip[Derive dates from `scheduledTime`, never `Date.now()`]
+Inside the handler, every date and window calculation comes from
+`controller.scheduledTime` — the time the tick was **intended** to run — and
+never from `Date.now()`. A tick delayed by a cold start, or redelivered several
+minutes late, still has to act under the local date it was scheduled for;
+`Date.now()` will occasionally have rolled past local midnight and make the run
+compute tomorrow's board. Reserve `Date.now()` for measuring elapsed time
+within the run: heartbeats, deadlines, retry backoff.
+:::
+
+```typescript
+const localDate = toLocalDate(controller.scheduledTime, POSTING_WINDOW.timeZone);
+```
+
+## Retry budgets by call class
+
+A single retry policy across the whole tick is wrong in both directions.
+Keep one API wrapper and parameterize it by call class — `maxRetries`, a
+`maxRetryAfterMs` clamp, and whether `5xx` responses are retried at all:
+
+```typescript
+interface RetryPolicy {
+  maxRetries: number;
+  maxRetryAfterMs: number;
+  retryServerErrors: boolean;
+}
+
+// Per-item posting: fail fast. A long Retry-After sleep here stalls every
+// remaining item in the loop, and the un-set marker retries this one next tick.
+const POSTING_POLICY: RetryPolicy = {
+  maxRetries: 2,
+  maxRetryAfterMs: 2_000,
+  retryServerErrors: false,
+};
+
+// Once-per-tick reads and sweeps: be patient. A throttled non-Marketplace app
+// can legitimately be told to wait ~60s, and there is no item loop to stall.
+const SWEEP_POLICY: RetryPolicy = {
+  maxRetries: 5,
+  maxRetryAfterMs: 60_000,
+  retryServerErrors: true,
+};
+
+async function callSlackApiWithPolicy<T>(
+  method: string,
+  body: unknown,
+  token: string,
+  policy: RetryPolicy,
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(`https://slack.com/api/${method}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (res.status === 429) {
+      const waitMs = Number(res.headers.get("retry-after") ?? 1) * 1000;
+      if (attempt >= policy.maxRetries || waitMs > policy.maxRetryAfterMs) {
+        throw new SlackRateLimitError(method, waitMs);
+      }
+      await sleep(waitMs);
+      continue;
+    }
+
+    if (res.status >= 500) {
+      if (!policy.retryServerErrors || attempt >= policy.maxRetries) {
+        throw new SlackServerError(method, res.status);
+      }
+      await sleep(backoffMs(attempt));
+      continue;
+    }
+
+    return (await res.json()) as T;
   }
 }
 ```
 
-:::warning[KV locking is best-effort, not exact]
-KV is eventually consistent, so this lease can't guarantee perfect mutual
-exclusion under high concurrency. For a job that fires every minute or less
-often, and where the worst case is "skip one tick," this is more than
-sufficient. If a run genuinely needs exact single-flight guarantees, reach
-for a [Durable Object](https://developers.cloudflare.com/durable-objects/)
-instead.
-:::
+The asymmetry is the point. On the posting path, patience is actively
+harmful: sleeping through a 30-second `Retry-After` blocks every other item
+in the loop, and there is a cheaper recovery available — the item's marker
+was never set, so the next tick retries it for free. That is also why any
+`5xx` throws immediately there rather than retrying; a transient Slack
+error is not worth stalling the batch for. On the once-per-tick read or
+sweep path there is no queue behind the call, so waiting is the cheapest
+option available, and a long `Retry-After` on a throttled non-Marketplace
+app is a normal, correct instruction to follow rather than an error.
+
+## Read-side budgets and fairness
+
+A read sweep that pages an upstream API has no natural stopping point, and
+a tick that runs until it finishes is a tick that eventually runs past its
+lease heartbeat. Give the sweep an explicit per-tick budget: a page count, a
+call count, and a soft wall-clock deadline checked between work units rather
+than mid-request.
+
+```typescript
+interface SweepBudget {
+  maxPages: number;
+  maxCalls: number;
+  deadlineAt: number; // Soft: checked between work units, never mid-request.
+}
+
+function newSweepBudget(): SweepBudget {
+  return { maxPages: 20, maxCalls: 60, deadlineAt: Date.now() + 20_000 };
+}
+
+function budgetExhausted(budget: SweepBudget): boolean {
+  return budget.maxPages <= 0 || budget.maxCalls <= 0 || Date.now() >= budget.deadlineAt;
+}
+```
+
+**Budget exhaustion is a clean truncation, not an error.** The sweep stops
+where it is, records that it truncated, and the next tick continues from the
+same rotation. Throwing on exhaustion turns a normal steady-state condition
+into a page, and teams stop reading the alerts.
+
+Coverage is easier to reason about in two phases. Bulk paging handles the
+recent window cheaply; a tail rotation of per-item fetches covers whatever
+the bulk window missed, oldest last-polled first, with never-polled items
+ahead of everything:
+
+```typescript
+async function sweep(env: Env, budget: SweepBudget): Promise<SweepStats> {
+  const stats = { pages: 0, tailFetched: 0, truncated: false };
+
+  // Phase 1 -- bulk: page the recent window until the budget runs out.
+  let cursor: string | undefined;
+  do {
+    if (budgetExhausted(budget)) {
+      stats.truncated = true;
+      break;
+    }
+    const page = await fetchRecentPage(env, cursor, budget);
+    await upsertRows(env, page.rows);
+
+    // Stamp last-polled on SUCCESS only: a page that failed did not cover its
+    // rows, and must not leave them looking covered.
+    await stampLastPolled(env, page.rows.map((row) => row.id));
+    cursor = page.nextCursor;
+    stats.pages++;
+  } while (cursor);
+
+  // Phase 2 -- tail rotation: per-item fetches over what bulk missed. NULL
+  // (never polled) sorts ahead of everything, then oldest last-polled first.
+  const tail = await env.DB.prepare(
+    `SELECT id FROM tracked_items
+      ORDER BY last_polled_at IS NOT NULL, last_polled_at ASC
+      LIMIT ?`,
+  )
+    .bind(TAIL_BATCH)
+    .all<{ id: string }>();
+
+  for (const row of tail.results) {
+    if (budgetExhausted(budget)) {
+      stats.truncated = true;
+      break;
+    }
+    try {
+      await upsertRows(env, [await fetchOne(env, row.id, budget)]);
+    } catch (err) {
+      console.warn(`[cron] tail fetch failed for ${row.id}`, err);
+    } finally {
+      // Stamp EVERY attempt here, success or failure. An item that fails
+      // permanently and keeps its old stamp parks at the head of the rotation
+      // forever and starves everything behind it.
+      await stampLastPolled(env, [row.id]);
+    }
+    stats.tailFetched++;
+  }
+
+  return stats;
+}
+```
+
+The asymmetry between the two phases is deliberate and easy to get wrong.
+Bulk stamps on success only, because the stamp there is a claim of coverage
+and a failed page covered nothing. The tail stamps on every attempt
+including failures, because the stamp there is a fairness cursor: an item
+whose fetch fails every single time would otherwise hold the oldest stamp
+forever, be selected first on every tick, and consume the tail budget before
+any healthy item behind it gets a turn. Fairness beats retry aggressiveness
+here — the failing item comes back around next rotation like everything
+else.
+
+Log the budget counters on every tick, because they are the earliest signal
+that a sweep has stopped keeping up:
+
+```typescript
+console.log(
+  `[cron] sweep pages=${stats.pages} tail=${stats.tailFetched} truncated=${stats.truncated}`,
+);
+```
+
+One truncated tick is normal. Truncation on **every** tick for an extended
+stretch means the rotation is no longer completing, and the tail is
+effectively unmonitored — that is the condition worth alerting on, not the
+individual truncation.
 
 ## Freshness stamps
 
@@ -124,8 +689,8 @@ function buildStatusBlocks(rows: StatusRow[]): unknown[] {
 }
 ```
 
-If a tick fails partway (the run lock times out, the upstream fetch
-errors), the previous message keeps its old timestamp rather than silently
+If a tick fails partway (the lease was taken over, the upstream fetch
+errored), the previous message keeps its old timestamp rather than silently
 looking current. Combine this with alerting on "the freshness stamp hasn't
 moved in N ticks" if the board is important enough to notice going stale.
 
@@ -167,9 +732,17 @@ outside a cron context — see [Web API with fetch](./web-api-with-fetch.mdx).
 - **A `scheduled()` handler that returns without `ctx.waitUntil()` can be
   killed mid-sync.** Same rule as [Three-Second Ack](./three-second-ack.mdx),
   just without an HTTP response driving it — wrap the real work.
-- **The run lock's TTL must outlive the slowest realistic tick, not the
-  average one.** A lock that expires while a slow run is still legitimately
-  in progress lets a second run start concurrently, defeating the point.
+- **The lease suppresses overlap; it does not prevent it.** A superseded run
+  can still be alive and still be calling Slack. Every user-visible side
+  effect needs a lease-loss check immediately before it, every database write
+  needs `run_id` fencing, and the per-item marker remains the only mechanism
+  that actually stops a second post.
+- **`Date.now()` is not the tick's time.** Anything date- or window-derived
+  comes from `controller.scheduledTime`; `Date.now()` is only for measuring
+  elapsed time within the run.
+- **A budget-truncated tick is a success.** Alert on truncation persisting
+  across many consecutive ticks, not on a single truncation — the latter is
+  the mechanism working as designed.
 - **A cron job has no caller to report errors to.** Unlike a webhook
   handler, there's no HTTP response to carry a failure back — log loudly
   (and alert, if the board matters) inside the `scheduled()` handler itself,
