@@ -101,10 +101,20 @@ async function getMessagePermalink(
 }
 ```
 
-以降のパターンで効いてくるドキュメント化済みのエラーは 2 つある。`message_ts` で指定された
-メッセージが見つからない場合の `message_not_found` と、`channel` に渡された値が不正な場合の
-`channel_not_found` だ。どちらもそのメッセージ 1 件について恒久的なもので、削除されたメッセージ
-も、bot がアクセスを失ったチャンネルも、あとのティックで解決可能になることはない。
+以降のパターンで効いてくるドキュメント化済みのエラーは 2 つあり、この 2 つは同じだけ最終的な
+ものではない。
+
+- **`message_not_found`** — `message_ts` で指定されたメッセージが見つからない。Slack では削除を
+  取り消せないので、こちらはそのメッセージについて本当に恒久的だ。
+- **`channel_not_found`** — `channel` に渡された値が、このトークンから見えるチャンネルでは
+  なかった。これは存在についてではなく**現時点のアクセス権**についての言明だ。チャンネルから
+  外された bot はその中の全メッセージについてこのエラーを受け取るが、bot を招待し直せば同じ
+  呼び出しが再び成功するようになる。リトライ可能なものとして扱うこと。
+
+この区別が、ティックがどの行を恒久的に諦めてよいかを決める。そして間違えたときのコストは片側に
+だけ偏っている。生きているチャンネルを死んだものと印を付けてしまうと、誰かがメンバーシップを
+直したあともダイジェストは黙ってそのリンクを出さなくなり、しかもその判断をあとから見直す仕組み
+はどこにもない。
 
 ## 投稿する: `unfurl_links: true` と `unfurl_media: false`
 
@@ -196,6 +206,7 @@ async function backfillPermalinks(env: Env): Promise<void> {
   const { results } = await env.DB.prepare(
     `SELECT id, slack_channel_id, slack_ts FROM items
      WHERE slack_ts IS NOT NULL AND slack_permalink IS NULL
+     ORDER BY permalink_attempted_at ASC NULLS FIRST
      LIMIT ?`,
   )
     .bind(BACKFILL_PER_TICK)
@@ -210,6 +221,11 @@ async function backfillPermalinks(env: Env): Promise<void> {
         row.slack_ts,
       );
     } catch (err) {
+      // Stamp the attempt BEFORE moving on: an unstamped failure keeps this row
+      // at the front of every future batch and starves the rows behind it.
+      await env.DB.prepare("UPDATE items SET permalink_attempted_at = ? WHERE id = ?")
+        .bind(Date.now(), row.id)
+        .run();
       // One unreachable message must not end the batch.
       console.warn(`permalink backfill skipped ${row.id}`, err);
       continue;
@@ -228,11 +244,20 @@ async function backfillPermalinks(env: Env): Promise<void> {
 }
 ```
 
-このループで肝心なのは次の 3 点だ。
+このループで肝心なのは次の 4 点だ。
 
 - **バッチに上限がある。** `LIMIT 20` はティックの実行時間と、そこから発行しうる Slack 呼び出しの
   回数の両方を抑える。1000 行の滞留は 1 ティックの予算を吹き飛ばすのではなく、50 ティックかけて
   さばかれる。バックフィルは日和見的な仕事であり、ティック本来の仕事を押しのけてはならない。
+- **バッチがローテーションする。** `ORDER BY permalink_attempted_at ASC NULLS FIRST` と、失敗の
+  たびに書き込む試行時刻のスタンプ。この 2 つが、上限を罠に変えないための仕掛けだ。これがないと
+  `SELECT` には順序がまったくなく、失敗した行は `NULL` のまま対象であり続ける — つまり恒久的に
+  壊れた 20 行が毎ティック同じ 20 枠を取り続け、その後ろに並んだ正常な行は一度も試行されない。
+  これは「遅いバックフィル」ではなく「止まったバックフィル」であり、外から見ると健全なティックと
+  見分けがつかない。先にスタンプを押し、古いものから処理することで、バッチはすべての行に順番が
+  回るローテーションになる。これは[チャンネル履歴の読み取り](./reading-channel-history.mdx)の
+  末尾ローテーションが従っているのと同じ公平性のルールで、理由も同じだ。*最後に試したのはいつか*
+  で並べたキューは動き続けるが、*まだ何が残っているか*で並べたキューは詰まりうる。
 - **書き込みにガードがある。** `WHERE id = ? AND slack_ts = ? AND slack_permalink IS NULL` は
   compare-and-swap であり、この反復が読んだ状態を行がまだ保っている場合にのみ適用される。複数の
   ティックが同じ行を選ぶのは正常な事態で — cron の重なり、手動での再実行、リトライ — ガードは
@@ -254,7 +279,9 @@ async function backfillPermalinks(env: Env): Promise<void> {
 フォールバックし、失敗はそれを起こした候補 1 件に閉じ込める。
 
 ```typescript
-const PERMANENT_PERMALINK_ERRORS = new Set(["message_not_found", "channel_not_found"]);
+// Deletion is the only thing that cannot be undone. channel_not_found is an
+// access problem, and access comes back the moment the bot is re-invited.
+const PERMANENT_PERMALINK_ERRORS = new Set(["message_not_found"]);
 
 async function buildDigestLines(env: Env, rows: ItemRow[]): Promise<string[]> {
   const lines: string[] = [];
@@ -272,9 +299,11 @@ async function buildDigestLines(env: Env, rows: ItemRow[]): Promise<string[]> {
         );
       } catch (err) {
         if (err instanceof SlackApiError && PERMANENT_PERMALINK_ERRORS.has(err.slackError)) {
-          // Deleted message or lost channel access: never resolvable again.
+          // The message itself is gone: no later tick can resolve this row.
           await markPermalinkUnavailable(env, row.id);
         }
+        // Everything else -- channel_not_found, ratelimited, a 5xx -- leaves
+        // the row untouched, so the backfill rotation retries it later.
         // Skip this ONE entry; the digest still goes out with everything else.
         console.warn(`digest: no permalink for ${row.id}, omitting`, err);
         continue;
@@ -303,7 +332,15 @@ async function buildDigestLines(env: Env, rows: ItemRow[]): Promise<string[]> {
   注釈するのではなく、そこで終わらせなければならない。外側のダイジェスト関数に独自の try/catch が
   あるなら、候補ごとの `catch` が本当にループの内側にあるかを確認すること。
 
-恒久的に死んだ候補に印を付けておくことは、時間が経つほど効いてくる。`message_not_found` と
-`channel_not_found` は、タイムアウトや `429` とは違ってメッセージが失われたことを意味し、
-何ティック待とうと戻ってはこない。その事実を記録しておけば、以後のティックが同じことを学ぶために
-Slack 呼び出しを費やさずに済む。
+恒久的に死んだ候補に印を付けておくことは、時間が経つほど効いてくる。`message_not_found` は、
+タイムアウトや `429` とは違ってメッセージが失われたことを意味し、何ティック待とうと戻っては
+こない。その事実を記録しておけば、以後のティックが同じことを学ぶために Slack 呼び出しを費やさずに
+済む。
+
+**この印付けは削除だけに限ること。** この集合に加えたくなるのが `channel_not_found` だ。同じ
+くらい確実に失敗し、catch ブロックの中から見れば同じくらい絶望的に見えるからだ。だが実際には
+違う。よくある原因は bot がチャンネルから外されたことで、よくあるその後は誰かが気づいて招待し
+直すことだ。アクセス由来のエラーを根拠に死んだと印を付けられた行は、アクセスが戻ったあとも死んだ
+ままになる。そして症状は、チャンネル 1 つ分のリンクをダイジェストが黙って落とし続け、しかも
+ログにはもう何も文句が出ていない、という形で現れる。アクセスのエラーは `429` と同じ扱いにする —
+行は対象のまま残し、試行のスタンプを押し、ローテーションが再び回ってくるのを待つ。

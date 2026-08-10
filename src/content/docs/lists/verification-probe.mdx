@@ -384,7 +384,23 @@ that expects to fail. A silent survival is precisely the class of surprise this 
 exists to catch; assuming it away in the cleanup step would be the one place the probe took
 the API's word for something.
 
+**Any failure is not the same as the right failure.** The read has to come back with an error
+that means *this row does not exist* — the row-missing family from
+[Errors Reference](./errors-reference.mdx). A `ratelimited`, an auth error, or a 5xx says the
+read never reached a verdict at all, and treating "the call failed" as "the row is gone" would
+confirm cleanup on exactly the runs where the probe knows least.
+
 ```ts
+// items.info spells "that row is not there" four different ways. Anything
+// outside this set -- ratelimited, an auth failure, a transient 5xx -- means
+// the read reached no verdict, which is NOT evidence the delete worked.
+const ROW_MISSING_ERRORS = new Set([
+  "record_not_found",
+  "record_deleted",
+  "row_not_found",
+  "invalid_row_id",
+]);
+
 async function deleteProbeRow(
   token: string,
   listId: string,
@@ -402,14 +418,26 @@ async function deleteProbeRow(
       { allowNotOk: true },
     );
     if (check.ok) throw new Error("probe row survived items.delete");
+    if (!ROW_MISSING_ERRORS.has(check.error ?? "")) {
+      throw new Error(`cleanup UNCONFIRMED: items.info answered ${check.error ?? "no error code"}`);
+    }
     return true;
-  } catch {
+  } catch (err) {
     console.error(`CLEANUP FAILED -- delete row ${rowId} from list ${listId} by hand.`);
     console.error("Leave production List writes disabled until that row is gone.");
+    console.error(err instanceof Error ? err.message : String(err));
     return false;
   }
 }
 ```
+
+Three outcomes, two of which are failures. The row-missing error is the only confirmation. An
+`ok` means the row survived its own delete. Everything else is unconfirmed — the row may well be
+gone, but the probe cannot say so, and a gate that guesses in its own favor is not a gate.
+Unconfirmed and survived take the same exit on purpose: both leave a row that a human has to look
+at. Retrying the `items.info` a couple of times with backoff before giving up is a reasonable
+refinement, since `ratelimited` is the likeliest way to land here — but the fallback when the
+retries run out is still this hard failure, never an optimistic pass.
 
 The escalation line names the row id, in the clear, because that id is the only thing a human
 needs to finish the job — and the probe row carries the identity marker written in step 5, so
