@@ -60,19 +60,39 @@ sidebar_position: 6
 ## `latest_reply` がスレッド変更のウォーターマークになる
 
 `reply_count` だけではスレッドが変化したことを判定できない。返信が 1 件増えて 1 件削除されれば
-値は同じままだからだ。`latest_reply` なら判定できる。スレッドごとにこの値を保存しておき、手元
-の値より先に進んだスレッドについてだけ `conversations.replies` を取得する。
+値は同じままだからだ。`latest_reply` ならもう少しうまくやれる。スレッドごとにこの値を保存して
+おき、手元の値と異なるスレッドについてだけ `conversations.replies` を取得する。
 
 ```typescript
 for (const message of historyPage.messages) {
   if (!message.reply_count) continue;
   const watermark = storedWatermarks.get(message.ts);
-  // Slack timestamps are fixed-width ("1754467200.123456"), so lexical
-  // comparison and numeric comparison agree.
-  if (watermark && watermark >= message.latest_reply) continue;
+  // Any CHANGE is a signal, not just an advance: deleting the newest reply
+  // moves latest_reply BACKWARD, and a >= test would skip that thread forever.
+  if (watermark && watermark === message.latest_reply) continue;
   await syncThread(channelId, message.ts, message.latest_reply);
 }
 ```
+
+**このウォーターマークが検出できるのは新しい返信だけで、それ以外は何も検出できない。**
+`latest_reply` はスレッド内で最も新しい返信のタイムスタンプなので、返信が追加されたときには動く
+が、既存の返信が編集・削除されたりリアクションが付いたりしても微動だにしない。先週火曜の返信の
+本文を書き換えてもウォーターマークは変わらないし、その返信にリアクションを 3 つ付けても変わら
+ない。最新でない返信を削除しても変わらない。これらのスレッドはいずれも DB 上では古くなっている
+のに、このチェックからは最新に見える。
+
+とりわけ `>=` での比較が痛い目に遭うのが、最も新しい返信が削除されたケースだ。次に新しい返信が
+`latest_reply` になるため、値は保存済みのウォーターマークより**下**へ動く。`watermark >=
+latest_reply` はこれを「新しいものは何もない」と読んでそのスレッドをスキップし、ウォーターマーク
+が自然に下がることはないので、以降のティックでもスキップし続ける。等値でない場合に取得する形に
+すればコストはゼロで、恒久的な穴が同期 1 回分に変わる。
+
+修正したうえでも、これはカバレッジの仕組みではなく高速化の手段として扱いたい。変化していない
+大多数のスレッドを 1 ティックで安く読み飛ばすためのものであり、後述の「二段階のカバレッジ:
+一括ウィンドウと末尾ローテーション」で説明する定期的な再取得と必ずセットで使う — ここでは
+見えなかった変更しかないスレッドを最終的に読み直すのは、そのローテーションのほうだ。したがって
+ローテーションの周期はチューニングの調整項目ではなく正しさに関わる判断になる。その周期が、
+ウォーターマークからは見えない編集・削除・リアクションの、最悪ケースでの陳腐化時間そのものだ。
 
 `syncThread` の内部の順序が、逆にしてしまいがちなところだ。**ウォーターマークの書き込みは、
 返信の書き込みが成功したあとに行う。**
@@ -356,22 +376,36 @@ Slack は再送も重複配信もするし、差分を 2 回適用すれば状�
   キャッシュを捨てる実装は、正しいが少し古い表示名を生の ID に置き換えてしまう — 誰かが会社を
   去ったことをきっかけに、目に見える劣化が起きることになる。古い値のほうが空欄よりましだ。
 
-## スコープ: `channels:history` と `groups:history`
+## スコープ: 会話の種別ごとに 1 つ
 
-パブリックチャンネルの読み取りとプライベートチャンネルの読み取りは別々の権限で、その分岐は
-チャンネル ID に対応している。
+`conversations.history` が読む会話には 4 つの種別があり、それぞれ別々の権限になっている。いま
+手元にあるのがどの種別なのかを教えてくれるのは、会話オブジェクト自身が持つ boolean のフラグだ。
+これは [`conversations.info`](https://docs.slack.dev/reference/methods/conversations.info/) でも、
+[`conversations.list`](https://docs.slack.dev/reference/methods/conversations.list/) の 1 ページ
+に含まれる各エントリでも返ってくる。
 
-| チャンネル種別 | ID の接頭辞 | スコープ |
+| 会話の種別 | 判定に使うフラグ | スコープ |
 |---|---|---|
-| パブリックチャンネル | `C…` | [`channels:history`](https://docs.slack.dev/reference/scopes/channels.history/) |
-| プライベートチャンネル | `G…` | [`groups:history`](https://docs.slack.dev/reference/scopes/groups.history/) |
-| DM / グループ DM | `D…` / `mpdm…` | `im:history` / `mpim:history` |
+| パブリックチャンネル | `is_channel: true`, `is_private: false` | [`channels:history`](https://docs.slack.dev/reference/scopes/channels.history/) |
+| プライベートチャンネル | `is_private: true` | [`groups:history`](https://docs.slack.dev/reference/scopes/groups.history/) |
+| 複数人 DM | `is_mpim: true` | [`mpim:history`](https://docs.slack.dev/reference/scopes/mpim.history/) |
+| DM | `is_im: true` | [`im:history`](https://docs.slack.dev/reference/scopes/im.history/) |
+
+**`is_private` へ落とす前に、`is_im` と `is_mpim` を先に判定すること。** 複数人 DM もプライベート
+な会話なので、`is_private` に先に到達する判定はこれをプライベートチャンネルと分類し、
+`groups:history` を要求してしまう。スコープが違うので当然失敗するが、その失敗が表に出るのは誰かが
+bot をグループ DM に追加したときだけだ。
 
 `channels:history` だけを付与されたアプリは、パブリックチャンネルは問題なく読めて、最初の
 プライベートチャンネルで失敗する — パブリックのテストチャンネルに対して書かれたテストはすべて
-通り、誰かが bot をプライベートチャンネルに招待した日に初めて表面化する、という類の不具合だ。
-どちらのチャンネルもありうる運用なら、最初から両方のスコープを要求しておくこと。
+通り、誰かが bot を別の場所に招待した日に初めて表面化する、という類の不具合だ。その運用で
+ありうる種別のスコープは、最初からすべて要求しておくこと。
 
-ID の接頭辞は実務上のルーティングの手がかりで、複数種別のチャンネルが混在する構成でも呼び出し
-を消費せずに判定できる。ただしこれは契約ではなく慣例だ。確実さが必要な場面では、
-`conversations.info` が `is_private` で正式な答えを返す。
+**ID の接頭辞でルーティングしてはいけない。** 呼び出しを消費せず無料で判定できるので魅力的に
+見えるが、実際に現れる会話の全範囲には耐えられない。古いワークスペースではプライベート
+チャンネルと複数人 DM が同じ `G…` 系の ID を共有するため、接頭辞では `groups:history` と
+`mpim:history` をそもそも区別できない。さらに新しいワークスペースでは、以前なら `G…` が
+発行されていた場面で `C…` の ID が割り当てられるので、パブリックとプライベートの区別のほうも
+崩れる。そして複数人 DM の接頭辞に見える `mpdm…` という文字列は、そもそも ID の接頭辞ではない。
+それはこの種の会話に自動生成される `name` の形であって、まったく別のフィールドだ。会話を一覧した
+時点のペイロードにすでに入っているフラグを読むこと。

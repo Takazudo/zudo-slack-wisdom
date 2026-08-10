@@ -58,19 +58,39 @@ the bottom of this page earns its keep.
 ## `latest_reply` Is the Thread-Change Watermark
 
 `reply_count` alone cannot tell you a thread changed — a reply added and another deleted leaves it
-identical. `latest_reply` can: store it per thread and fetch `conversations.replies` only for
-threads whose value moved past what you have.
+identical. `latest_reply` does better: store it per thread and fetch `conversations.replies` only
+for threads whose value differs from what you have.
 
 ```typescript
 for (const message of historyPage.messages) {
   if (!message.reply_count) continue;
   const watermark = storedWatermarks.get(message.ts);
-  // Slack timestamps are fixed-width ("1754467200.123456"), so lexical
-  // comparison and numeric comparison agree.
-  if (watermark && watermark >= message.latest_reply) continue;
+  // Any CHANGE is a signal, not just an advance: deleting the newest reply
+  // moves latest_reply BACKWARD, and a >= test would skip that thread forever.
+  if (watermark && watermark === message.latest_reply) continue;
   await syncThread(channelId, message.ts, message.latest_reply);
 }
 ```
+
+**What this watermark detects is new replies, and nothing else.** `latest_reply` is the timestamp
+of the newest reply in the thread, so it moves when a reply is added — and sits perfectly still
+while replies are edited, deleted, or reacted to. Edit the text of a reply from last Tuesday and
+the watermark is unchanged; add three reactions to it and the watermark is unchanged; delete any
+reply that is not the newest one and the watermark is unchanged. Every one of those threads is now
+stale in the database and looks current to this check.
+
+Deletion of the newest reply is the case that punishes a `>=` comparison specifically. The next
+newest reply becomes `latest_reply`, so the value moves **backward**, below the stored watermark —
+and `watermark >= latest_reply` reads that as "nothing new here" and skips the thread on this tick
+and on every tick after it, because the watermark never comes back down on its own. Comparing for
+inequality instead costs nothing and turns a permanent hole into one extra sync.
+
+Even corrected, treat this as an accelerator rather than a coverage mechanism. It exists so a tick
+can skip the overwhelming majority of unchanged threads cheaply, and it must be paired with the
+periodic refresh described under "Two-Phase Coverage: Bulk Window Plus Tail Rotation" below — that
+rotation is what eventually re-reads a thread whose only change was invisible here. Sizing the
+rotation is therefore a correctness decision, not a tuning knob: its period is the worst-case
+staleness for every edit, deletion, and reaction the watermark cannot see.
 
 The ordering inside `syncThread` is the part that is easy to get backwards. **Write the watermark
 only after the replies write has succeeded.**
@@ -350,22 +370,36 @@ Reactors and repliers arrive as raw user IDs (`U…`). Resolving them to display
   a cached name on failure replaces a correct-but-old display name with a raw ID — a visible
   regression triggered by someone leaving the company. Stale beats blank.
 
-## Scopes: `channels:history` and `groups:history`
+## Scopes: One Per Conversation Type
 
-Reading public and private channels are separate permissions, and the split follows the channel
-ID:
+`conversations.history` reads four different kinds of conversation, and each one is a separate
+permission. The conversation object's own boolean flags — returned by both
+[`conversations.info`](https://docs.slack.dev/reference/methods/conversations.info/) and every
+entry in a [`conversations.list`](https://docs.slack.dev/reference/methods/conversations.list/)
+page — are what say which kind you are holding:
 
-| Channel type | ID prefix | Scope |
+| Conversation type | Flag that identifies it | Scope |
 |---|---|---|
-| Public channel | `C…` | [`channels:history`](https://docs.slack.dev/reference/scopes/channels.history/) |
-| Private channel | `G…` | [`groups:history`](https://docs.slack.dev/reference/scopes/groups.history/) |
-| DM / group DM | `D…` / `mpdm…` | `im:history` / `mpim:history` |
+| Public channel | `is_channel: true`, `is_private: false` | [`channels:history`](https://docs.slack.dev/reference/scopes/channels.history/) |
+| Private channel | `is_private: true` | [`groups:history`](https://docs.slack.dev/reference/scopes/groups.history/) |
+| Multiparty DM | `is_mpim: true` | [`mpim:history`](https://docs.slack.dev/reference/scopes/mpim.history/) |
+| DM | `is_im: true` | [`im:history`](https://docs.slack.dev/reference/scopes/im.history/) |
+
+**Test `is_im` and `is_mpim` before falling back to `is_private`.** A multiparty DM is a private
+conversation, so a check that reaches `is_private` first classifies it as a private channel and
+asks for `groups:history` — the wrong scope, and a failure that only appears once somebody adds
+the bot to a group DM.
 
 An app granted only `channels:history` reads public channels perfectly and fails on the first
-private one — which is exactly the kind of defect that passes every test written against a public
-test channel and surfaces the day somebody invites the bot into a private one. Request both scopes
-up front if the deployment can involve either.
+private one — exactly the kind of defect that passes every test written against a public test
+channel and surfaces the day somebody invites the bot somewhere else. Request every scope the
+deployment can encounter up front.
 
-The ID prefix is the practical routing signal, and it is what a mixed-channel deployment can check
-without spending a call. It is a convention rather than a contract, though: where certainty
-matters, `conversations.info` reports `is_private` authoritatively.
+**Do not route on the ID prefix.** It is tempting, because it is free and needs no call, but it
+does not survive contact with the full range of conversations. Private channels and multiparty DMs
+share the `G…` family in older workspaces, so a prefix check cannot separate `groups:history` from
+`mpim:history` at all — and newer workspaces hand out `C…` IDs where an older one would have issued
+`G…`, which breaks the public-versus-private half of the split too. The `mpdm…` string that looks
+like a multiparty-DM prefix is not an ID prefix in the first place: it is the shape of the
+generated `name` of such a conversation, a different field entirely. Read the flags, which are
+already in the payload that listed the conversation.

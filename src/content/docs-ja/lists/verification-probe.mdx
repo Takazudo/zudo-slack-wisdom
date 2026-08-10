@@ -331,7 +331,19 @@ async function exerciseRow(
 
 **`ok` が返ってきたことは、行が消えた証拠ではない。** 失敗することを期待した読み取りで確認する。「静かに生き残る」は、このスクリプト全体が捕まえるために存在する種類の驚きそのものだ。クリーンアップの段でそれを仮定で済ませてしまえば、プローブが API の言い分をそのまま信じる唯一の場所になってしまう。
 
+**とはいえ「何かしら失敗した」ことと「正しく失敗した」ことは別物だ。** 読み取りが返すべきなのは*この行は存在しない*ことを意味するエラー、つまり[エラーリファレンス](./errors-reference.mdx)にある行欠落系のコードだ。`ratelimited` や認証エラー、5xx が返ってきた場合、その読み取りはそもそも判定に到達していない。「呼び出しが失敗した」を「行が消えた」として扱えば、プローブが最も何も分かっていない実行に限ってクリーンアップを確認済みにしてしまう。
+
 ```ts
+// items.info spells "that row is not there" four different ways. Anything
+// outside this set -- ratelimited, an auth failure, a transient 5xx -- means
+// the read reached no verdict, which is NOT evidence the delete worked.
+const ROW_MISSING_ERRORS = new Set([
+  "record_not_found",
+  "record_deleted",
+  "row_not_found",
+  "invalid_row_id",
+]);
+
 async function deleteProbeRow(
   token: string,
   listId: string,
@@ -349,14 +361,20 @@ async function deleteProbeRow(
       { allowNotOk: true },
     );
     if (check.ok) throw new Error("probe row survived items.delete");
+    if (!ROW_MISSING_ERRORS.has(check.error ?? "")) {
+      throw new Error(`cleanup UNCONFIRMED: items.info answered ${check.error ?? "no error code"}`);
+    }
     return true;
-  } catch {
+  } catch (err) {
     console.error(`CLEANUP FAILED -- delete row ${rowId} from list ${listId} by hand.`);
     console.error("Leave production List writes disabled until that row is gone.");
+    console.error(err instanceof Error ? err.message : String(err));
     return false;
   }
 }
 ```
+
+結果は 3 通りあり、そのうち 2 つは失敗だ。確認が取れたと言えるのは行欠落系のエラーが返ったときだけ。`ok` は行が自分の削除を生き延びたことを意味する。それ以外はすべて未確認だ — 実際には消えているかもしれないが、プローブにはそう言えない。そして自分に都合よく推測するゲートは、ゲートとして機能していない。未確認と生き残りが同じ出口を通るのは意図的で、どちらも人間が目で見るべき行を残しているからだ。ここに来る原因として最もありそうなのは `ratelimited` なので、諦める前に `items.info` をバックオフ付きで数回リトライするのは妥当な改良になる — ただしリトライを使い切ったあとのフォールバックは、あくまでこのハードエラーであって、楽観的な PASS ではない。
 
 エスカレーションの行が行 ID をそのまま出しているのは、人間が後始末を終えるのに必要なものがその ID だけだからだ — しかもプローブ行にはステップ 5 で書いた識別マーカーが載っているので、リストを開いた人はどれが孤児なのかひと目で判断できる。
 

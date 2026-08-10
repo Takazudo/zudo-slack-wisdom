@@ -112,14 +112,24 @@ two or three consistent meanings instead of a dozen to memorize.
 
 ## Link Buttons
 
-An `actions` block button with `url` set and `action_id` left off works as a pure link button:
-clicking it opens the URL in the user's browser, no different from clicking any other link. Slack's
-button reference notes that a `url` button still generates an interaction payload the app could
-handle if it chose to
-([Button element](https://docs.slack.dev/reference/block-kit/block-elements/button-element/)) —
-but if the app has no Interactivity Request URL configured at all, there's simply nowhere for that
-payload to be delivered. The link still opens either way, so a bot that only ever ships link
-buttons never needs to turn on Interactivity for the app in the first place.
+An `actions` block button with `url` set works as a pure link button: clicking it opens the URL in
+the user's browser, no different from clicking any other link. Omitting `action_id` is spec-legal
+rather than a shortcut — Slack's button reference lists `type` and `text` as the element's only
+required fields, with `action_id`, `url`, `value`, and `style` all optional
+([Button element](https://docs.slack.dev/reference/block-kit/block-elements/button-element/)).
+
+Read the rest of that reference before concluding the payload does not exist. It says that if
+you're using `url` you'll still receive an interaction payload and will need to acknowledge it —
+which is a stronger statement than "the app may handle it if it likes." What makes the link button
+work anyway is configuration, not the schema: an app with no Interactivity Request URL set has
+nowhere for Slack to deliver that payload, so there is no unacknowledged request to answer. The
+link opens regardless, which is why a bot that only ever ships link buttons never needs to turn on
+Interactivity in the first place.
+
+**Set a stable `action_id` anyway.** It costs one line, it is documented as the field you match on
+when an interaction payload does arrive, and it is the difference between "turn Interactivity on"
+being a config change and being a hunt through every button the bot has ever shipped. The sample
+below leaves it off to show the minimum that works; production code is better off with one.
 
 ```typescript
 {

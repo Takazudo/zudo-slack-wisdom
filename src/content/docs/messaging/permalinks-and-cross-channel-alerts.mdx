@@ -101,10 +101,19 @@ async function getMessagePermalink(
 }
 ```
 
-Two documented errors matter for the patterns below: `message_not_found`, when the message
-identified by `message_ts` cannot be found, and `channel_not_found`, when the value passed for
-`channel` was invalid. Both are permanent for that one message — a deleted message and a channel
-the bot has lost access to never become resolvable on a later tick.
+Two documented errors matter for the patterns below, and they are not equally final:
+
+- **`message_not_found`** — the message identified by `message_ts` cannot be found. Deletion is
+  irreversible in Slack, so this one is genuinely permanent for that message.
+- **`channel_not_found`** — the value passed for `channel` was not a channel this token can see.
+  That is a statement about **access right now**, not about existence. A bot removed from a channel
+  gets this error for every message in it; re-invite the bot and the same call starts succeeding
+  again. Treat it as retryable.
+
+The distinction decides which rows a tick may permanently give up on, and getting it wrong is
+expensive in one direction only: marking a live channel dead means the digest silently stops
+linking to it long after somebody fixed the membership, and nothing in the system ever revisits
+that decision.
 
 ## Posting It: `unfurl_links: true`, `unfurl_media: false`
 
@@ -196,6 +205,7 @@ async function backfillPermalinks(env: Env): Promise<void> {
   const { results } = await env.DB.prepare(
     `SELECT id, slack_channel_id, slack_ts FROM items
      WHERE slack_ts IS NOT NULL AND slack_permalink IS NULL
+     ORDER BY permalink_attempted_at ASC NULLS FIRST
      LIMIT ?`,
   )
     .bind(BACKFILL_PER_TICK)
@@ -210,6 +220,11 @@ async function backfillPermalinks(env: Env): Promise<void> {
         row.slack_ts,
       );
     } catch (err) {
+      // Stamp the attempt BEFORE moving on: an unstamped failure keeps this row
+      // at the front of every future batch and starves the rows behind it.
+      await env.DB.prepare("UPDATE items SET permalink_attempted_at = ? WHERE id = ?")
+        .bind(Date.now(), row.id)
+        .run();
       // One unreachable message must not end the batch.
       console.warn(`permalink backfill skipped ${row.id}`, err);
       continue;
@@ -228,11 +243,21 @@ async function backfillPermalinks(env: Env): Promise<void> {
 }
 ```
 
-Three properties of that loop are the whole point:
+Four properties of that loop are the whole point:
 
 - **The batch is capped.** `LIMIT 20` bounds both the tick's runtime and the number of Slack calls
   it can make, so a backlog of a thousand rows drains over fifty ticks instead of blowing one
   tick's budget. Backfill is opportunistic work and must never crowd out the tick's real job.
+- **The batch rotates.** `ORDER BY permalink_attempted_at ASC NULLS FIRST`, plus a stamp written on
+  every failure, is what keeps the cap from becoming a trap. Without it the `SELECT` has no
+  ordering at all, and rows that fail stay `NULL` and stay eligible — so twenty permanently broken
+  rows can win the same twenty slots on every tick forever, and a valid row queued behind them is
+  never attempted at all. It is not a slow backfill; it is a stalled one, and it looks identical to
+  a healthy tick from the outside. Stamping first, oldest first, turns the batch into a rotation
+  where every row gets its turn. This is the same fairness rule the tail rotation in
+  [Reading Channel History](./reading-channel-history.mdx) runs on, for the same reason: a queue
+  ordered by *when we last tried* keeps moving, and a queue ordered by *what still needs doing*
+  can wedge.
 - **The write is guarded.** `WHERE id = ? AND slack_ts = ? AND slack_permalink IS NULL` is a
   compare-and-swap: it applies only if the row still holds the state this iteration read.
   Overlapping ticks selecting the same row is normal — cron overlap, a manual re-run, a retry —
@@ -253,7 +278,9 @@ pointed at a deleted message. Read the stored value first, fall back to a live c
 missing, and isolate the failure to the one candidate that caused it:
 
 ```typescript
-const PERMANENT_PERMALINK_ERRORS = new Set(["message_not_found", "channel_not_found"]);
+// Deletion is the only thing that cannot be undone. channel_not_found is an
+// access problem, and access comes back the moment the bot is re-invited.
+const PERMANENT_PERMALINK_ERRORS = new Set(["message_not_found"]);
 
 async function buildDigestLines(env: Env, rows: ItemRow[]): Promise<string[]> {
   const lines: string[] = [];
@@ -271,9 +298,11 @@ async function buildDigestLines(env: Env, rows: ItemRow[]): Promise<string[]> {
         );
       } catch (err) {
         if (err instanceof SlackApiError && PERMANENT_PERMALINK_ERRORS.has(err.slackError)) {
-          // Deleted message or lost channel access: never resolvable again.
+          // The message itself is gone: no later tick can resolve this row.
           await markPermalinkUnavailable(env, row.id);
         }
+        // Everything else -- channel_not_found, ratelimited, a 5xx -- leaves
+        // the row untouched, so the backfill rotation retries it later.
         // Skip this ONE entry; the digest still goes out with everything else.
         console.warn(`digest: no permalink for ${row.id}, omitting`, err);
         continue;
@@ -301,7 +330,15 @@ Two things quietly defeat this isolation:
   annotate it on the way up. If the enclosing digest function has its own try/catch, check that the
   per-candidate one really sits inside the loop.
 
-Marking the permanently dead candidates matters over time. `message_not_found` and
-`channel_not_found` say the message is gone, unlike a timeout or a `429`, and no number of later
-ticks will bring it back — recording that fact keeps every future tick from spending a Slack call
-to learn the same thing again.
+Marking the permanently dead candidates matters over time. `message_not_found` says the message is
+gone, unlike a timeout or a `429`, and no number of later ticks will bring it back — recording that
+fact keeps every future tick from spending a Slack call to learn the same thing again.
+
+**Reserve that marking for deletion alone.** `channel_not_found` is the tempting one to add to the
+set, because it fails just as reliably and looks just as hopeless from inside the catch block. It
+is not: the usual cause is the bot being removed from a channel, and the usual sequel is somebody
+noticing and inviting it back. A row marked dead on the strength of an access error stays dead
+after the access returns, and the failure mode is a digest that quietly omits an entire channel's
+worth of links with nothing in the logs still complaining about it. Access errors get the same
+treatment as a `429` — leave the row eligible, stamp the attempt, and let the rotation come back
+to it.
