@@ -23,14 +23,17 @@ An admin toggle can disable Lists workspace- or org-wide independent of the plan
 owners only, which would block a bot from ever calling `access.set` on a list it does not own.
 
 :::warning[Unverified]
-How a bot gets write access to a list it did **not** create is genuinely undocumented.
-`slackLists.access.set` accepts only `user_ids` or `channel_ids` — no `app_ids` or other bot
-argument is documented anywhere. Passing the bot's own user ID in `user_ids` *should* work but
-Slack never states it; sharing into a channel the bot belongs to is the fallback, and one
-community report shows `list_not_found` despite a channel share (workflow-token context, not
-conclusive for `xoxb`). The bot-creates-the-list pattern in
-[Creating Lists](./creating-lists.mdx) sidesteps this hole entirely — a list's creator implicitly
-has access, making bot-creates-list the only documented-clean path.
+How a bot gets write access to a list it did **not** create via the API alone is genuinely
+undocumented. `slackLists.access.set` accepts only `user_ids` or `channel_ids` — no `app_ids` or
+other bot argument is documented anywhere — and sharing into a channel the bot belongs to proves
+nothing about the bot's edit access to that List; channel membership and the per-List Share grant
+are separate permission surfaces. The bot-creates-the-list pattern in
+[Creating Lists](./creating-lists.mdx) sidesteps this API gap entirely — a list's creator
+implicitly has access. When the List is already operator-owned instead, the
+production-exercised route is a manual Share-UI edit grant, not `access.set`; see
+[The One-Way Mirror Pattern](./one-way-mirror.mdx#mechanics-checklist-1-how-the-bot-gets-write-access-two-real-routes-and-one-dead-end)
+for both routes side by side, and mandate a live probe — see
+[The Activation-Gate Probe](./verification-probe.mdx) — before enabling writes through either one.
 :::
 
 ## The `access.set` / `access.delete` Contract

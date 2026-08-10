@@ -111,6 +111,8 @@ integration）では、読み取り側の実効的な Retry-After 上限を、�
 増えるだけで何も得られない。1 回の cron ティックが `conversations.history`/
 `conversations.replies` の呼び出しに使ってよい回数の予算を決め、パーマリンクをはじめとした
 読み取りの重い再利用可能なデータはサーバー側でキャッシュし、毎回読み直さないようにすること。
+tick ごとの予算の内訳、二段階のカバレッジパターン、そしてこの上限が形作る replace-on-read
+設計の全体は[チャンネル履歴の読み取り](./reading-channel-history.mdx)を参照。
 :::
 
 :::note[内部アプリの適用除外は一度きりではなく、常に有効な分類]

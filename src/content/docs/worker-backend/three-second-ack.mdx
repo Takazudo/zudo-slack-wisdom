@@ -221,7 +221,11 @@ cancelled by runtime teardown or by the time budget, and its failures are
 invisible to Slack — Slack already has its `200` and will never send the
 event again. An event that is acked but not recorded is simply gone.
 
-The production shape splits the guarantee from the latency.
+The production shape splits the guarantee from the latency. See
+[Events API on Workers](../events/events-api-on-workers.mdx#retries-and-event-dedupe-a-durable-ledger-for-must-eventually-happen-side-effects)
+for the same ledger-plus-cron shape with a second, fact-identity key layered on top — needed once
+the same underlying event can arrive through more than one path (a retried delivery and a polling
+sweep both landing on the same fact).
 
 ### 1. One fast durable transaction, before the ack
 

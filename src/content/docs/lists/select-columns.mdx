@@ -61,17 +61,18 @@ up front. This resolves two problems at once:
 1. **Slug control.** You pick neutral ASCII values (`todo` / `doing` / `done`) under any
    display label, so the label↔ID mapping problem disappears entirely — the slugs are
    compile-time constants in your Worker code.
-2. **Access.** How a bot gets write access to a list it did **not** create is genuinely
-   undocumented: [`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/)
+2. **Access.** How a bot gets write access to a list it did **not** create via the API alone is
+   genuinely undocumented: [`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/)
    accepts only `channel_ids` and `user_ids` — there is no `app_ids`/bot argument anywhere.
    Yet `items.update` clearly enforces access (`access_denied`, `no_permission`,
-   `permission_denied`). Creating the list is the only documented-clean path around this gap:
-   Slack's docs describe a new list as "owned by the acting user," and the acting user for a
-   bot-token `slackLists.create` call is the bot itself. There is a real community report
-   ([slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)) of
-   `list_not_found` from `items.update` despite the list being shared into the bot's channel
-   (pre-GA, workflow-token context). Do not plan around a human creating the list and sharing
-   it with the bot until that path is proven with a throwaway call.
+   `permission_denied`). Creating the list sidesteps this API gap entirely: Slack's docs
+   describe a new list as "owned by the acting user," and the acting user for a bot-token
+   `slackLists.create` call is the bot itself. When the list is already operator-owned instead,
+   the production-exercised route is a manual Share-UI edit grant rather than `access.set` — see
+   [The One-Way Mirror Pattern](./one-way-mirror.mdx#mechanics-checklist-1-how-the-bot-gets-write-access-two-real-routes-and-one-dead-end)
+   for both routes side by side, and mandate a live probe (see
+   [The Activation-Gate Probe](./verification-probe.mdx)) before enabling writes through either
+   one.
 
 :::warning[Unverified]
 That the creator automatically retains write access — i.e., that a bot's own `xoxb` token is

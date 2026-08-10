@@ -565,7 +565,9 @@ A read sweep that pages an upstream API has no natural stopping point, and
 a tick that runs until it finishes is a tick that eventually runs past its
 lease heartbeat. Give the sweep an explicit per-tick budget: a page count, a
 call count, and a soft wall-clock deadline checked between work units rather
-than mid-request.
+than mid-request. [Reading Channel History](../messaging/reading-channel-history.mdx) works
+through this same bulk-plus-tail budget shape in full for a `conversations.history` sweep running
+under the non-Marketplace read ceiling — the two-phase coverage pattern below mirrors it.
 
 ```typescript
 interface SweepBudget {

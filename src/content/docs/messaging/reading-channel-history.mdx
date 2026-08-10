@@ -9,7 +9,8 @@ and `conversations.replies` can be polled on a cron as a **read model**: each ti
 current state of some window of messages, and local storage is rewritten to match what came back.
 A production reference integration runs exactly this way and has sustained it against the reduced
 non-Marketplace ceiling of roughly one request per minute — a constraint that shapes every
-mechanic on this page.
+mechanic on this page. See [Rate Limits](./rate-limits.mdx) for the full non-Marketplace regime,
+its rollout timeline, and how that one-request-per-minute ceiling came about.
 
 Polling here is not a consolation prize for "we couldn't get events working." Under a rate
 ceiling that tight, it is the design that degrades gracefully: a tick that runs out of budget
@@ -45,7 +46,8 @@ would otherwise chase with per-message calls:
 One page of history is therefore a **bulk reaction read**: reaction state for hundreds of
 messages at the cost of a single call. `reactions.get` exists, but it answers for one message at a
 time, and at roughly one request per minute a per-message call pattern is not affordable at any
-useful scale.
+useful scale. See [Reactions](./reactions.mdx) for what this `reactions[]` array does and does not
+tell you — skin-tone variants, alias pairs, and the truncated `users[]` list all apply here too.
 
 A message with no reactions omits the `reactions` key entirely rather than sending an empty array.
 Read that as "zero reactions" — which is exactly the state to write — because it is also how an

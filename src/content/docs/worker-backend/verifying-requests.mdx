@@ -268,7 +268,7 @@ try {
 
 This page's approach — a plain-`fetch` client with no SDK, reading the raw body exactly once before any parsing, the 5-minute timestamp window, and answering `url_verification` synchronously inline — is the shape validated in a production reference integration, not a simplified sketch.
 
-One pattern from that integration is worth naming explicitly: on an otherwise fully auth-gated internal Worker, the events endpoint is deliberately the **one** route that accepts public, unauthenticated-by-session traffic — it trades a session or API key for a valid Slack signature instead. Every other route on the same Worker sits behind whatever auth scheme protects the rest of the deployment. When smoke-testing a deploy of this shape, cover both directions of that boundary plus the boundary itself:
+One pattern from that integration is worth naming explicitly: on an otherwise fully auth-gated internal Worker, the events endpoint is deliberately the **one** route that accepts public, unauthenticated-by-session traffic — it trades a session or API key for a valid Slack signature instead. Every other route on the same Worker sits behind whatever auth scheme protects the rest of the deployment. See [Gated UI and Slack Endpoint](./gated-ui-plus-slack-endpoint.mdx) for the full shape of that Worker — the cookie-gated dashboard, the exact-match exemption for the Slack route, and the static-asset routing quirks that can silently widen the exemption. When smoke-testing a deploy of this shape, cover both directions of that boundary plus the boundary itself:
 
 - A correctly-signed `url_verification` challenge succeeds.
 - An unsigned request to the events route 401s.

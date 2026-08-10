@@ -119,12 +119,14 @@ The cross-post is an ordinary `chat.postMessage` whose `text` contains the perma
 }
 ```
 
-**Set `unfurl_links` explicitly rather than relying on the default.** Slack's unfurling guide
-states that links in messages posted by users and Slack apps are unfurled by default, but the
-`chat.postMessage` argument reference describes the same flag only as something to pass `true` to
-enable, and states no default value anywhere in its argument table. The behavior the entire
-pattern depends on is documented in two places that read differently. An explicit `true` costs one
-line and removes the question — which is what a production reference integration does on every
+**Set `unfurl_links` explicitly rather than relying on the default.** Slack's general unfurling
+guide states that links in messages posted by users and Slack apps are unfurled by default, but
+`chat.postMessage`'s own argument reference describes `unfurl_links` only as something to pass
+`true` to enable — the same enable/disable wording convention that reference page uses elsewhere
+to mark a field off-by-default, which for this specific method and flag reads the opposite of the
+general guide. See [Unfurl Flags](./posting-and-block-kit.mdx#unfurl-flags) for the full
+`unfurl_links`/`unfurl_media` asymmetry this reasoning rests on. An explicit `true` costs one line
+and removes the question — which is what a production reference integration does on every
 cross-post.
 
 `unfurl_media: false` is the other half of the pair. The alert wants the message card, not every

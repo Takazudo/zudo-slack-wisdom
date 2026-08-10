@@ -126,7 +126,7 @@ const res = await fetch("https://slack.com/api/slackLists.items.info", {
 ```
 
 :::note
-`list_limits` の正確な形（`row_count` / `row_count_limit` / `archived_row_count` 以外にどんなフィールドを持つか）は、実際のリストに対するライブプローブではなく Slack ドキュメントを対象とした元調査パスに由来する — このプロジェクトの検証スパイクはスキップされた（テストトークンが用意できなかった）。フィールドリストは「報告されている内容」として扱い、このページが明示していないフィールドに依存する前に、実際の `items.info` レスポンスで確認すること。
+`list_limits` の正確な形（`row_count` / `row_count_limit` / `archived_row_count` 以外にどんなフィールドを持つか）は、実際のリストに対するライブプローブではなく Slack ドキュメントを対象とした元調査パスに由来する — このプロジェクトの検証スパイクはスキップされた（テストトークンが用意できなかった）。フィールドリストは「報告されている内容」として扱い、このページが明示していないフィールドに依存する前に、実際の `items.info` レスポンスで確認すること。このような未決着の問いを本番投入の前に決着させるための、可逆でリストごとのプローブパターンについては[有効化ゲートのプローブ](./verification-probe.mdx)を参照。
 :::
 
 ## `download.start` / `download.get` — 非同期の一括エクスポート
@@ -138,3 +138,5 @@ const res = await fetch("https://slack.com/api/slackLists.items.info", {
 - [イベントなし、冪等性なし](./no-events-no-idempotency.mdx) — なぜ `items.list` が*唯一*の受信シグナルなのか、そして全件スキャンをほとんど不要にする `row_id` の永続化について。
 - [アイテム上限と自動アーカイブ](./item-caps.mdx) — `items.list` の `archived` フラグが何のためにあり、`items.info` の `list_limits` が上限ポリシーにどう組み込まれるか。
 - [ワンウェイミラーパターン](./one-way-mirror.mdx) — センチネル行パターンと照合パスが、完全な同期設計の中でどう噛み合うか。
+- [有効化ゲートのプローブ](./verification-probe.mdx) — このページの未検証事項を、準備済みリスト
+  1 つずつ経験的に決着させる。

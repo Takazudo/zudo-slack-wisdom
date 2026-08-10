@@ -51,7 +51,9 @@ Limits from `slackLists.create`:
 than a human) means you pick ordinary values like `todo` / `doing` / `done` under any display
 label — the label↔ID lookup problem disappears entirely, because the values are compile-time
 constants you already know. If a human created the list instead, the option values are opaque
-(`OptXXXXXXXX`-style) and must be read once via `items.info` and stored.
+(`OptXXXXXXXX`-style) and must be read once via `items.info` and stored. For the write-access
+side of that operator-owned scenario — how the bot gets edit rights on a list it didn't create —
+see [The One-Way Mirror Pattern](./one-way-mirror.mdx#mechanics-checklist-1-how-the-bot-gets-write-access-two-real-routes-and-one-dead-end).
 
 :::warning[Unverified]
 `slackLists.create` schema columns accept an `is_primary_column` flag that marks which column
