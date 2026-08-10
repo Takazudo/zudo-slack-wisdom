@@ -53,6 +53,10 @@ them:
   encoding, and rate limits.
 - **Cron Posting** — the same Worker, driven by a clock instead of a webhook,
   posting on a schedule.
+- **Preview Deploys and D1 Migrations** — why a PR preview shares production's D1 database, and
+  the additive-only DDL rule that follows from it.
+- **Gated UI and Slack Endpoint** — one Worker serving an auth-gated dashboard and a Slack
+  webhook on the same origin.
 
 :::note[Slack surfaces and Lists specifics live elsewhere]
 This section is about the *transport* — how a Worker talks to Slack safely.

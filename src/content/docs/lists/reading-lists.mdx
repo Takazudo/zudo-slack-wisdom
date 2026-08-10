@@ -203,7 +203,8 @@ The exact shape of `list_limits` (which fields it carries beyond `row_count` /
 documentation, not from a live probe against a real list — the verification spike for this
 project was skipped (no test token was available). Treat the field list as reported, and
 confirm it against a real `items.info` response before depending on a field this page does not
-name explicitly.
+name explicitly. See [The Activation-Gate Probe](./verification-probe.mdx) for the reversible,
+per-List probe pattern this kind of open question is meant to be closed with before production.
 :::
 
 ## `download.start` / `download.get` — async bulk export
@@ -224,3 +225,5 @@ instead of ~10 paginated calls per 1,000 rows, and it does not compete with your
   for, and how `list_limits` from `items.info` fits into cap policy.
 - [The One-Way Mirror Pattern](./one-way-mirror.mdx) — where the sentinel-row pattern and the
   reconcile pass come together in a full sync design.
+- [The Activation-Gate Probe](./verification-probe.mdx) — closing this page's unverified reads
+  empirically, one prepared List at a time.

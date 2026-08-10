@@ -110,7 +110,9 @@ something tighter — 1 request/minute is a hard floor, not a target, and a self
 below what the platform actually enforces just adds failed calls without buying anything. Budget
 how many `conversations.history`/`conversations.replies` calls a single cron tick is allowed to
 spend, and cache anything read-heavy and reusable — permalinks in particular — server-side rather
-than re-fetching it on every pass.
+than re-fetching it on every pass. See [Reading Channel History](./reading-channel-history.mdx)
+for the full per-tick budget breakdown, the two-phase coverage pattern, and the replace-on-read
+design this ceiling shapes.
 :::
 
 :::note[The internal-app exemption is live, not one-time]

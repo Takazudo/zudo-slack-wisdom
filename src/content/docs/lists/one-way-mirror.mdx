@@ -65,9 +65,11 @@ real bot token before enabling row writes** — one throwaway `items.create` / `
 against the real list, confirming an `ok: true` response — and keep row registration disabled in
 configuration until that probe passes. Route A's access is implicit and lower-risk; Route B's
 Share grant is a manual UI action a human can get wrong, so the probe is what actually confirms
-it before the cron starts writing. The rest of this checklist (steps 2–7) is written for Route
-A's defaults — on Route B, substitute the operator-supplied `list_id` and the runtime-resolved
-`column_id`s wherever a step assumes the `slackLists.create` response.
+it before the cron starts writing. See [The Activation-Gate Probe](./verification-probe.mdx) for
+the full reversible probe sequence, its output hygiene rules, and exactly which claims a `PASS`
+retires. The rest of this checklist (steps 2–7) is written for Route A's defaults — on Route B,
+substitute the operator-supplied `list_id` and the runtime-resolved `column_id`s wherever a step
+assumes the `slackLists.create` response.
 
 ### 2. Grant read access to the channel
 
@@ -262,3 +264,5 @@ ownership topologies this pattern depends on.
 - [Item Caps and Auto-Archive](./item-caps.mdx)
 - [Permissions and Ownership](./permissions.mdx)
 - [Board Layout](./board-layout.mdx)
+- [The Activation-Gate Probe](./verification-probe.mdx) — the live probe this page's write-access
+  routes both gate on before enabling row writes

@@ -167,6 +167,10 @@ Set `unfurl_media: false` when a message already carries its own Block Kit layou
 an auto-generated media card competing for space underneath. Pass `unfurl_links: true` deliberately
 when a text link's preview is actually wanted — it won't appear otherwise.
 
+See [Permalinks and Cross-Channel Alerts](./permalinks-and-cross-channel-alerts.mdx) for this same
+asymmetry applied to a permalink cross-post, where `unfurl_links: true` has to be passed explicitly
+or the preview card never appears.
+
 ## Posting from a Cron, Safely
 
 A scheduled job that posts a new message per source record (a batch job creating individual Slack
