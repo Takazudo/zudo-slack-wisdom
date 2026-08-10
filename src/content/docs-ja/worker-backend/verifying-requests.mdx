@@ -101,6 +101,151 @@ function timingSafeEqual(a: string, b: string): boolean {
 長さが違う時点で早期リターンしても、ここでは有用な情報は漏れない。正常な運用ではどちらの値も常に固定長の 16 進ダイジェストなので、長さの不一致は「N 文字まで一致した」ではなく「不正な形式の入力」しか意味しないからだ。
 :::
 
+## ハードニングチェックリスト
+
+上記の方式は、Slack のドキュメントが要求するすべてを満たしている。しかし本番のリファレンス実装では、これに加えていくつかのチェックを重ねている。どれもワイヤプロトコル自体を変えるものではないが、それぞれが「基本実装としては正しいのに、実運用では破綻する」経路を塞ぐものだ。
+
+### 1. HMAC の計算に入る前に署名ヘッダーを厳密パースする
+
+`X-Slack-Signature` は `^v0=([0-9a-fA-F]{64})$` に一致しなければならない -- リテラルの `v0=` に続けて、ちょうど 64 桁の 16 進文字（32 バイトの SHA-256 ダイジェストを 16 進エンコードしたもの）が並ぶ形だ。`crypto.subtle` に触れる*前に*、このパターンでヘッダーをパース・検証する。`v1=...`（Slack がまだ出していない将来の署名バージョン、あるいは Slack 以外から来たヘッダー）や、途中で切れた・壊れた 16 進文字列は、HMAC を一切計算せずに即座に弾くべきだ -- 正規表現で無料で弾けるヘッダー形状のために、暗号演算というコストを払う理由はない。
+
+```typescript
+const SIGNATURE_PATTERN = /^v0=([0-9a-fA-F]{64})$/;
+
+function parseSignature(header: string | null): string | null {
+  if (!header) return null;
+  const match = SIGNATURE_PATTERN.exec(header);
+  return match ? match[1] : null; // the 64-char hex digest, "v0=" stripped
+}
+```
+
+### 2. 16 進文字列比較ではなくバイト比較にする
+
+前述のタイミングセーフな比較は、2 つの 16 進「文字列」を比較している。ハードニングされたバリアントでは、計算した側の 16 進エンコード自体を省略する。期待値の 16 進をバイト列にデコードし、`crypto.subtle.sign` が返す生の `ArrayBuffer` と直接比較し、長さの不一致は早期リターンではなくアキュムレータに畳み込む。
+
+```typescript
+function timingSafeEqualBytes(expectedHex: string, actual: ArrayBuffer): boolean {
+  const expectedBytes = expectedHex.match(/.{2}/g)!.map((b) => parseInt(b, 16));
+  const actualBytes = new Uint8Array(actual);
+
+  // Fold the length difference into the accumulator instead of an early
+  // return -- one code path regardless of input shape.
+  let result = expectedBytes.length ^ actualBytes.length;
+  const len = Math.max(expectedBytes.length, actualBytes.length);
+  for (let i = 0; i < len; i++) {
+    result |= (expectedBytes[i] ?? 0) ^ (actualBytes[i] ?? 0);
+  }
+  return result === 0;
+}
+```
+
+### 3. タイムスタンプ検証: 形式・範囲・両方向のスキュー
+
+`Number(timestamp)` は見た目より寛容だ。`Number("1760000000.5")` は有効な有限数を返してしまうため、素朴な `Math.abs(nowSeconds - Number(timestamp)) > 300` というチェックは、本来 Unix 秒の整数としてパースされるべきではない小数点付きのタイムスタンプをあっさり通してしまう。次の 3 層でチェックを固める。
+
+1. 生の文字列に対する数字のみの正規表現 -- `Number()` に渡す前に `"1760000000.5"`、`"1e9"`、`"-5"`、明示的な符号を含むものをすべて弾く。
+2. パース後の値に対する `Number.isSafeInteger()` -- 非常に長い桁の文字列が `Infinity` に丸められてしまうケース（`Number.isSafeInteger(Infinity)` は `false`）や、整数精度が信頼できる範囲の外に出てしまうケースを防ぐ。
+3. 1 つの `Math.abs()` ではなく、2 つの明示的な比較として書かれたウィンドウチェック。有効な入力の集合としては同じだが、明示的な比較を 2 つに分けておくことで、後のリファクタで片方だけ抜け落ちるミス -- 例えば未来方向のスキューだけ厳しくして過去方向を無制限のままにしてしまう変更 -- がコンパイルは通ってしまっても目に見えやすくなる。そのミスが静かに紛れ込まないよう、両方向をテストすること。
+
+```typescript
+const TIMESTAMP_PATTERN = /^\d+$/;
+const WINDOW_SECONDS = 300;
+
+function isTimestampValid(raw: string, nowSeconds: number): boolean {
+  if (!TIMESTAMP_PATTERN.test(raw)) return false;
+
+  const timestamp = Number(raw);
+  if (!Number.isSafeInteger(timestamp)) return false;
+
+  const tooOld = nowSeconds - timestamp > WINDOW_SECONDS;
+  const tooNew = timestamp - nowSeconds > WINDOW_SECONDS;
+  return !tooOld && !tooNew;
+}
+```
+
+### 4. 固定の、独立に計算したダイジェストでテストする
+
+ボディに署名してから自分自身の署名を検証するだけのテストは、ベース文字列の組み立てが間違っていても通ってしまうことがある。テストの両側が同じバグを共有しているからだ -- ベース文字列内で `timestamp` と `rawBody` の順序を入れ替えても、サインしてから検証するラウンドトリップはそのまま成立してしまう。テストスイートには、検証対象のコードとは独立に計算した署名を使うケースが最低 1 つ必要だ。固定の secret・timestamp・body を用意し、期待する `X-Slack-Signature` の値を定数としてハードコードする。
+
+```typescript
+test("verifies a known-good v0 signature (fixed test vector)", async () => {
+  // Secret, timestamp, and body are arbitrary but fixed. The expected
+  // signature was computed once, independently, with Node's crypto module --
+  // not by calling verifySlackSignature and capturing its own output.
+  vi.setSystemTime(new Date(1531420618 * 1000)); // freeze the clock so the
+  // fixed timestamp below doesn't fall outside the 5-minute window
+
+  const env = { SLACK_SIGNING_SECRET: "8f742231b10e8888abcd99yyyzzz85a5" };
+  const rawBody = "token=xyzz0WbapA4vBCDEFasx0q6G&team_id=T1DC2JH3J";
+  const request = new Request("https://example.com/slack/events", {
+    headers: {
+      "x-slack-request-timestamp": "1531420618",
+      "x-slack-signature":
+        "v0=bca5eef5dd737ed259b428b18cd24f679baa18c3fc5f1cb2a6ac9f03e717969a",
+    },
+  });
+
+  expect(await verifySlackSignature(request, rawBody, env)).toBe(true);
+});
+```
+
+### 5. `url_verification` は署名検証を通過した後にのみ
+
+Slack の Events API は、エンドポイント URL を最初に保存したときに一度だけ `{"type": "url_verification", "challenge": "..."}` という POST を送ってきて、`{"challenge": "..."}` を返すことを期待する。この分岐を `verifySlackSignature` より前でチェックしていると、攻撃者は signing secret を一切知らなくても、同じ JSON 形状の未署名 POST を送るだけで challenge を好きなだけ返させられる。エンドポイントは、未認証のエコーオラクル -- Slack から来たものかどうかに関わらず、送られてきた `challenge` の値を誰に対してでもそのまま返し続ける存在 -- になってしまう。修正は順序の問題だ。まず無条件に検証を行い、`isValid` が真になって初めて `payload.type` で分岐する。
+
+```typescript
+const payload = JSON.parse(rawBody);
+
+// url_verification only after the signature has already passed -- an
+// unsigned request must never see its "challenge" echoed back.
+if (payload.type === "url_verification") {
+  return Response.json({ challenge: payload.challenge });
+}
+```
+
+:::tip[専用のテストを書く価値がある]
+「正しく署名された challenge が challenge を返すこと」だけでなく、否定側のケースも直接検証すること。正しい形の `url_verification` ボディを持つ*未署名*の POST は、challenge を echo した 200 ではなく 401 を返さなければならない。
+:::
+
+### 6. signing secret が未設定のときはフェイルクローズする
+
+`env.SLACK_SIGNING_SECRET` が空または未定義であるというのは、シークレットのバインディング漏れや変数名のタイポといったデプロイ上のミスであって、検証をスキップしてよい合図ではない。HMAC の処理に入る前に、シークレットが欠けていることを明示的にチェックし、説明付きの 500 を返すこと。これは実際の署名不一致で返す 401 とは区別されるべきもので、デプロイを監視する側が「設定ミス」なのか「誰かがエンドポイントを探っている」のかを見分けられるようにするためだ。`if (!env.SLACK_SIGNING_SECRET) return true` のような早期リターン -- ローカルテスト用に書かれ、消し忘れたもの -- は、まさにこれが防ごうとしている失敗モードである。シークレットの欠落が「リクエストを信用してよい」と黙って解釈されることは絶対にあってはならない。
+
+```typescript
+async function verifySlackSignature(
+  request: Request,
+  rawBody: string,
+  env: Env,
+): Promise<boolean> {
+  if (!env.SLACK_SIGNING_SECRET) {
+    // Never fall through to "assume valid" -- a missing secret is a
+    // deployment error, not a reason to skip verification.
+    throw new Error("SLACK_SIGNING_SECRET is not configured");
+  }
+  // ... rest of verification, as above
+}
+```
+
+```typescript
+try {
+  const isValid = await verifySlackSignature(request, rawBody, env);
+  if (!isValid) return new Response("Unauthorized", { status: 401 });
+} catch (err) {
+  console.error("Signature verification misconfigured:", err);
+  return new Response("Server misconfigured", { status: 500 });
+}
+```
+
+## 本番検証と「唯一の公開ルート」パターン
+
+このページのアプローチ -- SDK を使わないプレーンな `fetch` クライアント、パースより前に一度だけ生のボディを読むこと、5 分のタイムスタンプウィンドウ、`url_verification` にインラインで同期的に答えること -- は、簡略化した見本ではなく、本番のリファレンス実装で検証済みの形そのものである。
+
+そのリファレンス実装には、明示的に名前を挙げておく価値のあるパターンが 1 つある。他の点ではすべて認証で保護されている内部 Worker において、events エンドポイントだけは意図的に、セッションなしの公開トラフィックを受け付ける唯一のルートとされている -- セッションや API キーの代わりに、有効な Slack 署名をもって認証とする。同じ Worker 上の他のすべてのルートは、デプロイの残り部分を保護しているのと同じ認証方式の内側にある。この形のデプロイをスモークテストする際は、その境界の両方向に加えて境界そのものもカバーすること。
+
+- 正しく署名された `url_verification` challenge が成功すること。
+- events ルートへの未署名リクエストが 401 になること。
+- Worker 上のそれ以外のルートやメソッドが、誤ってこのゲートを迂回していないこと -- events のパスプレフィックスにマッチしてしまうワイルドカードルートが、検証ミドルウェアを経由せずに存在してしまうのが、これが壊れる典型的な原因だ。
+
 ## つまずきどころ
 
 - **署名チェックの前に `request.json()` を呼ぶ**と、検証が黙って壊れる。上の「生ボディの落とし穴」のとおり、必ず先に生の文字列を取ること。
