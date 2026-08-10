@@ -4,6 +4,17 @@ description: Secure Flue 2.0.3 Slack ingress, tenant-aware thread identity, retr
 sidebar_position: 5
 ---
 
+:::note[Source-verified, not execution-verified]
+Every claim on this page is **source-verified** against the tagged `@flue/slack` 2.0.3 source: its
+[README](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/README.md), the
+`createSlackChannel` contract, and the channel blueprint. **None of it is execution-verified**: no
+real Events API delivery, redelivery, interaction payload, or slash command has been driven through
+this path, unlike claims carrying the `Verified fact` label defined in
+[How Claims Are Labeled](./index.mdx#how-claims-are-labeled). Treat delivery-behavior claims here
+(what reaches the agent, what a redelivery converges on) as reconstructions from source, pending an
+execution spike.
+:::
+
 ## The Channel Boundary
 
 `flue add channel slack` fetches a live-registry Markdown blueprint for a coding agent; it is not a
