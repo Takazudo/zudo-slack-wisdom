@@ -83,3 +83,30 @@ inline styles within one paragraph) or when the surface being written to require
 Layout blocks that include a `text` object can set that object's `verbatim` field to `false` to
 enable automatic parsing of mentions and links in content that wasn't hand-authored with the
 bracket syntax above — useful when relaying externally sourced text into a block.
+
+## Escaping in Practice
+
+The three transformations above — truncating to fit a length budget, escaping `&`/`<`/`>`, and
+wrapping a fragment in `mrkdwn` markers like `*bold*` — have to run in a specific order, or each one
+can corrupt what the next one produces.
+
+1. **Truncate the raw text first**, before escaping and before adding any `mrkdwn` wrapper.
+   Truncating after escaping risks cutting an HTML entity in half (`&am` instead of `&amp;`), and
+   truncating after wrapping risks eating the wrapper itself.
+2. **Escape `&`, `<`, `>` second**, on the now-final-length raw text.
+3. **Wrap in `mrkdwn` markers last.** Never truncate a string that already has a wrapper applied —
+   cutting the closing `*` off a `*bold*` span doesn't just un-bold that word, it leaves every
+   character after the cut inside an unclosed formatting span, breaking the rest of the line.
+
+**Never run the escaper over a URL.** Escaping treats `&` as a control character, but many URLs
+legitimately contain `&` (as a query-string separator) — escaping it to `&amp;` inside a link token
+gives Slack a literal `&amp;` in the href instead of `&`, and the link either breaks or stops
+auto-linking entirely. Build the escaped/truncated prose and the raw URL as separate pieces, and
+combine them into the final `<url|text>` token only after both are finished — never pass the
+already-composed string back through the escaper a second time.
+
+**Treat Slack's own error codes as untrusted response data before logging them.** An `error` field
+in a Slack API response can carry attacker-influenced content whenever any part of the request was
+built from external input, so don't interpolate it into logs unexamined. Only echo it if it matches
+a tight allowlist pattern — `^[a-z0-9_]+$` covers every documented Slack error code — and log a
+generic placeholder for anything that doesn't match.

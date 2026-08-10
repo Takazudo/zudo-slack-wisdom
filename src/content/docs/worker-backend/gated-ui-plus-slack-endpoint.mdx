@@ -1,0 +1,317 @@
+---
+title: Gated UI and Slack Endpoint
+description: "One Worker serving an auth-gated dashboard and a Slack webhook: run_worker_first, an exact-match bypass, an HMAC cookie, and the static-asset quirks that break deep links."
+sidebar_position: 8
+---
+
+## Overview
+
+The stance this section takes — every Slack call happens in the Worker,
+nothing Slack-shaped reaches the browser — implies a shape it never
+describes: a single Worker that serves a human-facing dashboard behind a
+login gate **and** receives Slack's webhooks on the same origin. A production
+reference integration ended up exactly there, and the assembly is less
+obvious than it looks, because the two audiences authenticate in completely
+different ways and Cloudflare's static-asset layer sits in front of both.
+
+The dashboard is a browser with a cookie. Slack is a server with a signature
+and no cookie at all. Neither can use the other's credential, so one Worker
+has to run two authentication paths and be precise about where the boundary
+between them falls.
+
+## `run_worker_first` is not optional here
+
+The default routing order silently defeats any gate written in Worker code.
+Per
+[Cloudflare's Worker script routing docs](https://developers.cloudflare.com/workers/static-assets/routing/worker-script/):
+
+> If you have both static assets and a Worker script configured, Cloudflare
+> will first attempt to serve static assets if one matches the incoming
+> request.
+
+Only when no asset matches does Cloudflare invoke the Worker script. So every
+path that resolves to a file in the assets directory — the
+dashboard's `index.html`, its JavaScript bundle, every page shell — is served
+before your Worker runs. The gate is not bypassed by a bug; it is never
+consulted.
+
+It gets broader still. Per
+[Cloudflare's assets binding docs](https://developers.cloudflare.com/workers/static-assets/binding/),
+if you have a Worker script, have configured `assets.not_found_handling`, and
+use a compatibility date of `2025-04-01` or greater (or the
+`assets_navigation_prefers_asset_serving` flag), "navigation requests will
+not invoke the Worker script" — a navigation request being any request
+carrying `Sec-Fetch-Mode: navigate`, which browsers attach automatically when
+someone navigates to a page. That is every URL a logged-out person can type
+into the address bar, including ones that match no file.
+
+The fix is the setting Cloudflare points at for this exact purpose: "If you
+wish to run the Worker script ahead of serving static assets (e.g. to log
+requests, or perform some authentication checks), you can additionally
+configure the `assets.run_worker_first` setting. This will retain your
+`assets.not_found_handling` behavior when no other asset matches, while still
+allowing you to control access to your application with your Worker script."
+
+```toml
+name = "slack-ops-worker"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+
+[assets]
+directory = "./dist/"
+binding = "ASSETS"
+run_worker_first = true
+not_found_handling = "single-page-application"
+```
+
+`run_worker_first` accepts `true` or an array of route patterns, and defaults
+to `false`: "`run_worker_first = false` (default) will serve any static asset
+matching a request, while `run_worker_first = true` will unconditionally
+invoke your Worker script." For a gate, `true` is the only correct value —
+an array is an allowlist of paths that reach the Worker, which is to say an
+enumeration of the holes you have not thought of yet.
+
+## The Worker: gate everything, exempt exactly one route
+
+```typescript
+export interface Env {
+  ASSETS: Fetcher;
+  DASHBOARD_PASSWORD: string;
+  SLACK_BOT_TOKEN: string;
+  SLACK_SIGNING_SECRET: string;
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    // Slack cannot carry the browser's gate cookie, so this one route is
+    // exempt from it -- and authenticates by signature instead.
+    // Exact method + exact path: no prefix match, no method wildcard.
+    if (request.method === "POST" && url.pathname === "/slack/events") {
+      return await handleSlackEvents(request, env, ctx);
+    }
+
+    if (!(await hasValidGateCookie(request, env))) {
+      return renderLoginPage();
+    }
+
+    // Gate passed -- the Worker serves the assets itself from here on.
+    return await env.ASSETS.fetch(request);
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+With `run_worker_first = true`, `env.ASSETS.fetch()` is the only thing that
+serves a file, and it only runs after the gate. That inversion is the entire
+security property: assets stop being a parallel entrance and become something
+the Worker hands out.
+
+:::danger[The Slack route is exempt from the cookie, not from authentication]
+`POST /slack/events` skips the gate because Slack has no cookie to send — not
+because it is public. It must still verify `X-Slack-Signature` against the
+signing secret before acting on the body. Removing one credential check
+without adding the other turns the exemption into an open endpoint that
+anyone who reads your URL can post to.
+:::
+
+### Why the match has to be exact
+
+`url.pathname.startsWith("/slack")` exempts `/slack/admin`, `/slack/debug`,
+and anything else that ever lands under that prefix. Dropping the method
+check exempts `GET /slack/events`, which is how a person browses to your
+handler. Both mistakes read as harmless at review time, because the
+difference between an exact match and a prefix match is one method call.
+
+Pin it with a test that asserts the negative space, not just the happy path:
+
+```typescript
+const MUST_BE_GATED = [
+  ["GET", "/"],
+  ["GET", "/slack"],
+  ["GET", "/slack/events"],
+  ["POST", "/slack/events/"],
+  ["POST", "/slack/events/extra"],
+  ["POST", "/api/runs"],
+] as const;
+
+it("only POST /slack/events bypasses the gate", async () => {
+  for (const [method, path] of MUST_BE_GATED) {
+    const res = await worker.fetch(new Request(`https://example.com${path}`, { method }));
+    expect(res.status, `${method} ${path} should be gated`).toBe(401);
+  }
+
+  const slack = await worker.fetch(signedSlackRequest("/slack/events"));
+  expect(slack.status).toBe(200);
+});
+```
+
+Returning `401` with the login HTML, rather than `200`, is what makes that
+assertion unambiguous — and it keeps crawlers from indexing the shell.
+
+## The gate cookie: HMAC-signed, `crypto.subtle` only
+
+Workers has no Node `crypto` module available by default; the Web Crypto API
+is the built-in path, exposed as
+[`crypto.subtle`](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/).
+That is enough for a signed cookie, which is all this gate needs: a token of
+`issuedAt.nonce.signature`, where the signature is an HMAC the server can
+recompute and nobody else can produce.
+
+```typescript
+const COOKIE_NAME = "dash_gate";
+const MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
+
+async function sign(payload: string, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function issueGateCookie(env: Env): Promise<string> {
+  const payload = `${Math.floor(Date.now() / 1000)}.${crypto.randomUUID()}`;
+  const token = `${payload}.${await sign(payload, env.DASHBOARD_PASSWORD)}`;
+  return `${COOKIE_NAME}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${MAX_AGE_SECONDS}`;
+}
+
+async function hasValidGateCookie(request: Request, env: Env): Promise<boolean> {
+  const token = readCookie(request, COOKIE_NAME);
+  if (!token) return false;
+
+  const parts = token.split(".");
+  if (parts.length !== 3) return false;
+  const [issuedAt, nonce, signature] = parts;
+
+  const age = Math.floor(Date.now() / 1000) - Number(issuedAt);
+  if (!Number.isFinite(age) || age < 0 || age > MAX_AGE_SECONDS) return false;
+
+  // Sign the RAW string parts, never a re-serialized number: "0007" and "7"
+  // parse to the same value but are different bytes to the HMAC.
+  const expected = await sign(`${issuedAt}.${nonce}`, env.DASHBOARD_PASSWORD);
+  return timingSafeEqual(signature, expected);
+}
+```
+
+Three properties fall out of keying the HMAC on the password secret itself:
+
+- **Rotating the password logs everyone out.** Every outstanding cookie was
+  signed with the old key, so every one of them stops verifying the moment
+  the new secret deploys. No session store, no revocation list.
+- **The cookie's name and layout can live in a public repo.** Secrecy is in
+  the key, not in the format. `dash_gate`, the three-part shape, and the
+  seven-day window are all safe to commit; knowing them buys an attacker
+  nothing without the secret.
+- **A forged cookie fails on the signature, not on a guess.** Compare it in
+  constant time, for the same reason Slack's own request verification calls
+  for it.
+
+`SameSite=Lax` rather than `Strict` is deliberate in this setting: people
+reach the dashboard by clicking links posted into Slack, and those arrive as
+top-level navigations. `Strict` would withhold the cookie on exactly that
+click and greet every Slack link with the login page.
+
+## Static-asset quirks that break deep links
+
+Two default behaviors in the assets layer interact badly with URLs that carry
+a runtime identifier — `/runs/<id>`, `/channels/<id>` — the kind of link a
+Slack message is most likely to contain.
+
+### SPA `not_found_handling` only ever serves the root `index.html`
+
+Cloudflare's
+[Single Page Application routing docs](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/)
+are explicit about which file it is: "When an incoming request does not match
+a file in the `assets.directory`, Workers will serve the contents of the
+`/index.html` file with a `200 OK` status."
+
+The root one. Always. For a true single-bundle SPA that is correct. For a
+dashboard built as several directories, each with its own shell —
+`/runs/index.html`, `/channels/index.html` — it is quietly wrong: a request
+for `/runs/abc123` matches no file, so the visitor gets the **root** shell,
+which boots the wrong view and never sees the id.
+
+The fix is a Worker-side rewrite to the shell's canonical URL, done before
+handing the request to the assets binding:
+
+```typescript
+const RUNTIME_ID_ROUTES: Array<[RegExp, string]> = [
+  [/^\/runs\/[^/]+\/?$/, "/runs/"],
+  [/^\/channels\/[^/]+\/?$/, "/channels/"],
+];
+
+function rewriteToShell(url: URL): URL | null {
+  for (const [pattern, shell] of RUNTIME_ID_ROUTES) {
+    if (pattern.test(url.pathname)) {
+      const rewritten = new URL(url);
+      rewritten.pathname = shell;
+      return rewritten;
+    }
+  }
+  return null;
+}
+
+// In fetch(), after the gate passes:
+const shellUrl = rewriteToShell(url);
+return await env.ASSETS.fetch(shellUrl ? new Request(shellUrl, request) : request);
+```
+
+A rewrite, not a redirect. The browser's address bar keeps `/runs/abc123`, so
+the client-side code can still read the id out of `location.pathname` — which
+is the only reason the deep link exists.
+
+### The default `html_handling` redirect reaches the browser
+
+The rewrite target has to be `/runs/`, and the reason is the second quirk.
+`html_handling` defaults to `auto-trailing-slash`, and per
+[Cloudflare's HTML handling docs](https://developers.cloudflare.com/workers/static-assets/routing/advanced/html-handling/)
+that default resolves a directory shell like this:
+
+| Incoming request | Response | Asset served |
+|---|---|---|
+| `/runs/` | 200 | `/dist/runs/index.html` |
+| `/runs` | 307 to `/runs/` | — |
+| `/runs/index.html` | 307 to `/runs` | — |
+| `/runs/index` | 307 to `/runs` | — |
+
+Only the trailing-slash form is served directly. Everything else is a `307`,
+and a `307` is a real HTTP response that travels to the browser and rewrites
+the address bar. Rewriting to `/runs/index.html` therefore does the opposite
+of what it looks like: the browser is bounced to `/runs`, bounced again to
+`/runs/`, and the identifier you were preserving is gone from the URL before
+any client code runs.
+
+Going through the binding does not sidestep this. Cloudflare is explicit that
+requests made through `env.ASSETS.fetch()` "have `html_handling` and
+`not_found_handling` configuration applied to them" — the same rules, just
+invoked from your own code.
+
+## Gotchas
+
+- **`run_worker_first = true` bills an invocation per asset.** The
+  navigation-request optimization exists specifically to "reduce billable
+  invocations of your Worker script," and turning this on gives that up for
+  every request, including every image and bundle. It is the price of having
+  a gate at all; budget for it rather than being surprised by it.
+- **The selective array form needs recent tooling.** `run_worker_first` as an
+  array of route patterns requires Wrangler v4.20.0 or above (Cloudflare Vite
+  plugin v1.7.0 or above). It is also the wrong tool for a gate — noted here
+  only because it is the form most examples show.
+- **`env.ASSETS.fetch()` ignores the hostname.** Cloudflare documents that
+  "only the URL pathname is used to match assets," so a rewritten URL built
+  on any origin resolves the same way. Convenient for constructing rewrites;
+  a trap if you were expecting host-based routing to mean anything there.
+- **Test the gate against a logged-out browser, not curl.** The
+  navigation-request behavior keys off `Sec-Fetch-Mode: navigate`, a header
+  browsers send and command-line clients do not. A gate that passes a `curl`
+  check can still be wide open to someone typing the URL.
+- **`Secure` cookies work on `localhost`.** Browsers treat `localhost` as a
+  secure context, so the production cookie attributes need no local variant —
+  don't weaken them for `wrangler dev` and forget to put them back.

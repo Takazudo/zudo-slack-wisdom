@@ -1,0 +1,346 @@
+---
+title: パーマリンクとチャンネル横断アラート
+description: chat.getPermalink、パーマリンク + unfurl によるクロスポスト、パーマリンクのサーバー側キャッシュ、そして 1 本の不良リンクをダイジェスト全体から切り離す方法
+sidebar_position: 8
+---
+
+## 別のチャンネルにメッセージを引用する、最も安上がりな方法
+
+あるチャンネルにあるメッセージを、別のチャンネルにも見せたい — アラートフィード、日次
+ダイジェスト、インシデントチャンネルへのエスカレーション。真っ先に思いつく実装は、メッセージを
+組み立て直すことだ。投稿者、本文、タイムスタンプを読み取り、Block Kit でそれらしく再現する。
+この方針は、時間が経つほど悪化する形で間違っている。元の場所で編集も削除もされうる内容を複製して
+しまうし、投稿者の名前を出すだけのためにユーザープロフィールの参照が要るし、元のメッセージが
+持っていた書式は落ちてしまう。
+
+もう一方の選択肢は、メッセージ本文 1 行で済む。元メッセージのパーマリンクを取得して投稿するだけ
+だ。Slack はそのリンクを、投稿者と本文、そして元メッセージへ飛ぶリンクを備えたプレビューカードに
+展開してくれる。組み立て直しも、プロフィール参照も不要で、しかもそのカードが読み取るのは
+「ダイジェストを実行した時点のメッセージ」ではなく「現時点のメッセージ」だ。
+
+## `chat.getPermalink` — URL を自前で組み立ててはいけない
+
+[`chat.getPermalink`](https://docs.slack.dev/reference/methods/chat.getPermalink/) がトークン以外
+に取る引数はちょうど 2 つで、どちらも必須だ。
+
+| 引数 | 値 |
+|---|---|
+| `channel` | 対象メッセージが存在する会話またはチャンネルの ID |
+| `message_ts` | メッセージ自身の `ts` 値。そのチャンネル内でメッセージを一意に識別する |
+
+タイムスタンプの引数名は `message_ts` であって **`ts` ではない**。隣接する書き込み系メソッド
+（`chat.update`、`chat.delete`）が同じ値を `ts` と綴るため、実際のコードと突き合わせて確認する
+価値がある。間違えれば返ってくるのは引数エラーであって、パーマリンクではない。
+
+このメソッドの Facts セクションには、必要なスコープはないこと、そしてレート制限が `special`
+ティアであることが書かれている。毎分数百リクエストが許容され、固定のクォータではなく `HTTP 429`
+と `Retry-After` に従うよう指示されている。成功時のレスポンスが返すのは 3 つのフィールドだ。
+
+```json
+{
+  "ok": true,
+  "channel": "C123ABC456",
+  "permalink": "https://ghostbusters.slack.com/archives/C1H9RESGA/p135854651500008"
+}
+```
+
+スレッド返信へのパーマリンクには、チャンネルの先頭ではなくスレッド内で開くためのクエリ
+パラメータが 2 つ追加される。
+
+```
+https://ghostbusters.slack.com/archives/C1H9RESGL/p135854651700023?thread_ts=1358546515.000008&cid=C1H9RESGL
+```
+
+上の 2 つの形はいずれも、メソッドのリファレンスページ自身に載っているサンプルだ。これを読むだけ
+でも、この文字列を自前でテンプレート化するのが割に合わないことは見て取れる。
+
+- **ワークスペースのサブドメインはアプリが所有する定数ではない。** ワークスペース名の変更で変わる
+  し、自分のホーム以外にアプリをインストールした時点でワークスペースごとに異なる。
+- **同じタイムスタンプが 1 つの URL の中で 2 通りにエンコードされている。** パス部分は `ts` から
+  小数点を取り除いたもの（`1358546515.000008` が `p135854651500008` になる）である一方、
+  `thread_ts` クエリパラメータは小数点を保ったままだ。
+- **スレッド返信は `thread_ts` と `cid` がなければ解決しない。** これらを欠いたリンクは、読み手を
+  メッセージではなくチャンネルに着地させる — 一見すると機能しているように見える失敗だ。
+
+:::warning[未検証]
+Slack はこの URL の文法を文章として書き下してはいない。上のルールはリファレンスページのレスポンス
+サンプルから読み取ったものだ。そしてそれこそが、文字列を組み立てるのではなくメソッドを呼ぶべき
+理由になる。ドキュメント化されていない形式は changelog なしに変わりうる類のものであり、そのとき
+手組みのパーマリンクは音もなく壊れる。
+:::
+
+```typescript
+const SLACK_API_BASE_URL = "https://slack.com/api";
+
+class SlackApiError extends Error {
+  constructor(readonly slackError: string) {
+    super(`chat.getPermalink rejected: ${slackError}`);
+  }
+}
+
+async function getMessagePermalink(
+  botToken: string,
+  channelId: string,
+  messageTs: string,
+): Promise<string> {
+  const res = await fetch(`${SLACK_API_BASE_URL}/chat.getPermalink`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${botToken}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    // message_ts, not ts -- chat.update and chat.delete spell it differently.
+    body: JSON.stringify({ channel: channelId, message_ts: messageTs }),
+  });
+
+  const body = (await res.json()) as { ok?: boolean; error?: string; permalink?: string };
+  if (body.ok !== true || !body.permalink) {
+    throw new SlackApiError(body.error ?? "unknown_error");
+  }
+  return body.permalink;
+}
+```
+
+以降のパターンで効いてくるドキュメント化済みのエラーは 2 つあり、この 2 つは同じだけ最終的な
+ものではない。
+
+- **`message_not_found`** — `message_ts` で指定されたメッセージが見つからない。Slack では削除を
+  取り消せないので、こちらはそのメッセージについて本当に恒久的だ。
+- **`channel_not_found`** — `channel` に渡された値が、このトークンから見えるチャンネルでは
+  なかった。これは存在についてではなく**現時点のアクセス権**についての言明だ。チャンネルから
+  外された bot はその中の全メッセージについてこのエラーを受け取るが、bot を招待し直せば同じ
+  呼び出しが再び成功するようになる。リトライ可能なものとして扱うこと。
+
+この区別が、ティックがどの行を恒久的に諦めてよいかを決める。そして間違えたときのコストは片側に
+だけ偏っている。生きているチャンネルを死んだものと印を付けてしまうと、誰かがメンバーシップを
+直したあともダイジェストは黙ってそのリンクを出さなくなり、しかもその判断をあとから見直す仕組み
+はどこにもない。
+
+## 投稿する: `unfurl_links: true` と `unfurl_media: false`
+
+クロスポスト自体は、`text` にパーマリンクを含めた普通の `chat.postMessage` だ。
+
+```json
+{
+  "channel": "C0ALERTSXYZ",
+  "text": "Needs a second pair of eyes: https://ghostbusters.slack.com/archives/C1H9RESGA/p135854651500008",
+  "unfurl_links": true,
+  "unfurl_media": false
+}
+```
+
+**既定値に頼らず、`unfurl_links` は明示的に指定すること。** Slack の一般的な unfurl ガイドには、
+ユーザーおよび Slack アプリが投稿したメッセージ中のリンクは既定で unfurl される、と書かれている。
+一方で `chat.postMessage` 自身の引数リファレンスは `unfurl_links` を「有効にするには `true` を
+渡すもの」としてしか説明していない — このリファレンスページが他の項目で、あるフィールドを
+既定オフと示すために使っているのと同じ enable/disable の言い回しの慣習であり、このメソッドの
+このフラグに限っては一般ガイドとは逆の結論になる。この推論の土台になっている `unfurl_links` と
+`unfurl_media` の非対称性の全体は[unfurl フラグ](./posting-and-block-kit.mdx#unfurl-フラグ)を
+参照。明示的な `true` は 1 行で済み、その疑問を消し去る。ある実運用のリファレンス統合が
+すべてのクロスポストでそうしているのも、まさにこれが理由だ。
+
+`unfurl_media: false` はその対になる半分だ。アラートが欲しいのはメッセージのカードであって、
+引用元メッセージがたまたまリンクしていた画像や動画、外部プレビューのすべてではない。1 行の
+アラートを画面いっぱいに膨らませるのは、メディアの unfurl だ。
+
+:::warning[未検証]
+Slack の開発者ドキュメントは classic な link unfurling 一般については説明しているが、メッセージ
+パーマリンクのカードについては何も書いていない。フィールドもレイアウトも、引用元チャンネルへの
+アクセス権をもたない閲覧者に何が見えるのかも記載がない。Slack のヘルプセンターには、貼り付けた
+メッセージリンクがプレビューに展開されること、そしてプライベートチャンネルへのリンクの場合は
+メッセージを表示するかリンクのみを表示するかを共有者が選べることが書かれているが、開発者向け
+リファレンスは沈黙している。カードの内容は契約ではなく観測された挙動として扱い、カードが
+描画されなくてもアラートとして意味が通るように周囲の `text` を書いておくこと。
+:::
+
+:::caution[裸の URL として投稿する]
+パーマリンクはメッセージ中に裸の URL として置くこと。`mrkdwn` のリンク記法（`<url|label>`）で
+包むと URL は表示テキストの背後に隠れ、その形では unfurl が安定して生成されない。Slack の
+リファレンスページはどちらとも明言していないので、カードが出ることを前提に読みやすさを
+組み立てたダイジェストを出す前に、自分のワークスペースで確認しておくこと。
+:::
+
+## パーマリンクはキャッシュする。導出し直さない
+
+パーマリンクは `(channel, ts)` の純粋な関数であり、その入力はどちらも不変だ — 値がメッセージの
+生存期間中に変わることはない。レンダリングのたびに行ごとに `chat.getPermalink` を呼ぶ
+ダイジェストは、すでに持っていた答えに何度も支払っていることになる。
+
+ここで制約になっているのは `chat.getPermalink` 自身ではない。前述のとおり `special` ティアで
+毎分数百リクエストが許される。制約はティックそのもの、そしてその周辺にある。Worker の cron 実行
+には実時間と CPU の予算があり、Slack への N 回の逐次ラウンドトリップは、その予算を仕事のうち
+最もつまらない部分に使ってしまう。さらに悪いことに、保存されなかったパーマリンクはメッセージ
+自体から導出し直すほかなく、メッセージを再発見するということは `conversations.history` を使う
+ということだ。Marketplace 承認済みでもなく単一ワークスペースの内部アプリでもないアプリにとって、
+このメソッドは毎分 1 リクエスト・1 回あたり最大 15 オブジェクトに制限されている。保存済みの
+パーマリンクを失うこと自体は安いが、それが指していたメッセージを再発見するのは安くない。
+
+だから、メッセージを作成した時点 — `chat.postMessage` のレスポンスが `ts` を返してきた、
+まさにその瞬間 — に保存する。
+
+```typescript
+const posted = await callSlackApi<{ ts: string }>(
+  "chat.postMessage",
+  { channel: sourceChannelId, text: bodyText },
+  env.SLACK_BOT_TOKEN,
+);
+
+const permalink = await getMessagePermalink(env.SLACK_BOT_TOKEN, sourceChannelId, posted.ts);
+
+await env.DB.prepare(
+  "UPDATE items SET slack_channel_id = ?, slack_ts = ?, slack_permalink = ? WHERE id = ?",
+)
+  .bind(sourceChannelId, posted.ts, permalink, itemId)
+  .run();
+```
+
+### 上限を切ったバッチでバックフィルする
+
+パーマリンク列より前からある行や、書き込みに失敗した行は、あとから埋める必要がある。それは
+cron のティックから、一度に数行ずつ行う — テーブル全体を舐めてはいけない。
+
+```typescript
+const BACKFILL_PER_TICK = 20;
+
+async function backfillPermalinks(env: Env): Promise<void> {
+  const { results } = await env.DB.prepare(
+    `SELECT id, slack_channel_id, slack_ts FROM items
+     WHERE slack_ts IS NOT NULL AND slack_permalink IS NULL
+     ORDER BY permalink_attempted_at ASC NULLS FIRST
+     LIMIT ?`,
+  )
+    .bind(BACKFILL_PER_TICK)
+    .all<{ id: string; slack_channel_id: string; slack_ts: string }>();
+
+  for (const row of results) {
+    let permalink: string;
+    try {
+      permalink = await getMessagePermalink(
+        env.SLACK_BOT_TOKEN,
+        row.slack_channel_id,
+        row.slack_ts,
+      );
+    } catch (err) {
+      // Stamp the attempt BEFORE moving on: an unstamped failure keeps this row
+      // at the front of every future batch and starves the rows behind it.
+      await env.DB.prepare("UPDATE items SET permalink_attempted_at = ? WHERE id = ?")
+        .bind(Date.now(), row.id)
+        .run();
+      // One unreachable message must not end the batch.
+      console.warn(`permalink backfill skipped ${row.id}`, err);
+      continue;
+    }
+
+    // Guarded write: this applies only if the row still holds the state the
+    // SELECT read, so a concurrent tick that already filled the column (or
+    // repointed the row at a different message) is not clobbered.
+    await env.DB.prepare(
+      `UPDATE items SET slack_permalink = ?
+       WHERE id = ? AND slack_ts = ? AND slack_permalink IS NULL`,
+    )
+      .bind(permalink, row.id, row.slack_ts)
+      .run();
+  }
+}
+```
+
+このループで肝心なのは次の 4 点だ。
+
+- **バッチに上限がある。** `LIMIT 20` はティックの実行時間と、そこから発行しうる Slack 呼び出しの
+  回数の両方を抑える。1000 行の滞留は 1 ティックの予算を吹き飛ばすのではなく、50 ティックかけて
+  さばかれる。バックフィルは日和見的な仕事であり、ティック本来の仕事を押しのけてはならない。
+- **バッチがローテーションする。** `ORDER BY permalink_attempted_at ASC NULLS FIRST` と、失敗の
+  たびに書き込む試行時刻のスタンプ。この 2 つが、上限を罠に変えないための仕掛けだ。これがないと
+  `SELECT` には順序がまったくなく、失敗した行は `NULL` のまま対象であり続ける — つまり恒久的に
+  壊れた 20 行が毎ティック同じ 20 枠を取り続け、その後ろに並んだ正常な行は一度も試行されない。
+  これは「遅いバックフィル」ではなく「止まったバックフィル」であり、外から見ると健全なティックと
+  見分けがつかない。先にスタンプを押し、古いものから処理することで、バッチはすべての行に順番が
+  回るローテーションになる。これは[チャンネル履歴の読み取り](./reading-channel-history.mdx)の
+  末尾ローテーションが従っているのと同じ公平性のルールで、理由も同じだ。*最後に試したのはいつか*
+  で並べたキューは動き続けるが、*まだ何が残っているか*で並べたキューは詰まりうる。
+- **書き込みにガードがある。** `WHERE id = ? AND slack_ts = ? AND slack_permalink IS NULL` は
+  compare-and-swap であり、この反復が読んだ状態を行がまだ保っている場合にのみ適用される。複数の
+  ティックが同じ行を選ぶのは正常な事態で — cron の重なり、手動での再実行、リトライ — ガードは
+  2 番目の書き込みを上書きではなく無害な no-op に変える。`IS NULL` と同じくらい `slack_ts` の項も
+  意味がある。`SELECT` 以降にその行が別のメッセージを指すよう付け替えられていたなら、この
+  パーマリンクはもうその行にとって正しい答えではない。どちらが起きたのかを呼び出し側が知る必要が
+  あるときは、ドライバが返す影響行数で判別できる。
+- **失敗が行単位に閉じている。** `throw` ではなく `continue` — 次のセクションの主題だ。
+
+## 不良リンク 1 本が飛ばすのは 1 行だけ
+
+メッセージは削除される。bot はチャンネルから外される。アプリがもう読めないチャンネルの `ts` が
+行に書き込まれることもある。そのいずれも、1 回の `chat.getPermalink` 呼び出しを
+`message_not_found` か `channel_not_found` に変える。そしてそのどれ一つとして、ダイジェストごと
+失敗させる理由にはならない。
+
+設計で防ぐべき失敗は、40 件の候補のうち 1 件が削除済みメッセージを指していたせいで、ダイジェスト
+が何も描画されないという事態だ。まず保存済みの値を読み、欠けているときにだけライブ呼び出しに
+フォールバックし、失敗はそれを起こした候補 1 件に閉じ込める。
+
+```typescript
+// Deletion is the only thing that cannot be undone. channel_not_found is an
+// access problem, and access comes back the moment the bot is re-invited.
+const PERMANENT_PERMALINK_ERRORS = new Set(["message_not_found"]);
+
+async function buildDigestLines(env: Env, rows: ItemRow[]): Promise<string[]> {
+  const lines: string[] = [];
+
+  for (const row of rows) {
+    // Stored value first; the live call is the exception path, not the design.
+    let permalink = row.slack_permalink;
+
+    if (!permalink && row.slack_ts) {
+      try {
+        permalink = await getMessagePermalink(
+          env.SLACK_BOT_TOKEN,
+          row.slack_channel_id,
+          row.slack_ts,
+        );
+      } catch (err) {
+        if (err instanceof SlackApiError && PERMANENT_PERMALINK_ERRORS.has(err.slackError)) {
+          // The message itself is gone: no later tick can resolve this row.
+          await markPermalinkUnavailable(env, row.id);
+        }
+        // Everything else -- channel_not_found, ratelimited, a 5xx -- leaves
+        // the row untouched, so the backfill rotation retries it later.
+        // Skip this ONE entry; the digest still goes out with everything else.
+        console.warn(`digest: no permalink for ${row.id}, omitting`, err);
+        continue;
+      }
+    }
+
+    if (!permalink) continue;
+    lines.push(`- ${row.title}: ${permalink}`);
+  }
+
+  return lines;
+}
+```
+
+ダイジェストの大半の行でライブフォールバックが発火しているなら、投稿時の書き込みが壊れていて、
+バックフィルも追いついていない。それは毎ティック吸収すべきコストではなく、発生源で直すべき
+バグだ。
+
+この切り分けを静かに台無しにするものが 2 つある。
+
+- **`Promise.all` は最初の reject で reject する。** `Promise.all` でパーマリンクを並行に解決
+  すると、このセクションが取り除いたはずの結合がそのまま戻ってくる。`message_not_found` が
+  1 件出れば配列全体が reject し、ダイジェストを道連れにする。`Promise.allSettled` を使って
+  絞り込むか、上のように逐次ループにすること。
+- **ログを出して再 throw する `catch` は切り分けではない。** `catch` は失敗を上に伝える途中で
+  注釈するのではなく、そこで終わらせなければならない。外側のダイジェスト関数に独自の try/catch が
+  あるなら、候補ごとの `catch` が本当にループの内側にあるかを確認すること。
+
+恒久的に死んだ候補に印を付けておくことは、時間が経つほど効いてくる。`message_not_found` は、
+タイムアウトや `429` とは違ってメッセージが失われたことを意味し、何ティック待とうと戻っては
+こない。その事実を記録しておけば、以後のティックが同じことを学ぶために Slack 呼び出しを費やさずに
+済む。
+
+**この印付けは削除だけに限ること。** この集合に加えたくなるのが `channel_not_found` だ。同じ
+くらい確実に失敗し、catch ブロックの中から見れば同じくらい絶望的に見えるからだ。だが実際には
+違う。よくある原因は bot がチャンネルから外されたことで、よくあるその後は誰かが気づいて招待し
+直すことだ。アクセス由来のエラーを根拠に死んだと印を付けられた行は、アクセスが戻ったあとも死んだ
+ままになる。そして症状は、チャンネル 1 つ分のリンクをダイジェストが黙って落とし続け、しかも
+ログにはもう何も文句が出ていない、という形で現れる。アクセスのエラーは `429` と同じ扱いにする —
+行は対象のまま残し、試行のスタンプを押し、ローテーションが再び回ってくるのを待つ。

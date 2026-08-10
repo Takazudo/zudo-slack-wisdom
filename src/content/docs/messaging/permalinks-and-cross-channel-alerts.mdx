@@ -1,0 +1,344 @@
+---
+title: Permalinks and Cross-Channel Alerts
+description: chat.getPermalink, the permalink-plus-unfurl cross-post pattern, caching permalinks server-side, and isolating one bad link from the whole digest
+sidebar_position: 8
+---
+
+## The Cheapest Way to Quote a Message Elsewhere
+
+A message lives in one channel and a second channel needs to see it — an alert feed, a daily
+digest, an escalation into an incident channel. The obvious implementation is to rebuild the
+message: read its author, text, and timestamp, then render an approximation in Block Kit. That
+approach is wrong in a way that gets worse over time. It duplicates content that can be edited or
+deleted at the source, it needs a user-profile lookup just to name the author, and it drops
+whatever formatting the original carried.
+
+The alternative is one line of message text: fetch the original's permalink and post it. Slack
+expands the link into a preview card carrying the author and the message text, with a jump link
+back to the original — no reconstruction, no profile lookups, and a card that reads from the
+message as it stands rather than as it was when the digest ran.
+
+## `chat.getPermalink` — Never Hand-Build the URL
+
+[`chat.getPermalink`](https://docs.slack.dev/reference/methods/chat.getPermalink/) takes exactly
+two arguments beyond the token, both required:
+
+| Argument | Value |
+|---|---|
+| `channel` | The ID of the conversation or channel containing the message |
+| `message_ts` | The message's own `ts` value, which identifies it uniquely within that channel |
+
+The timestamp argument is `message_ts`, **not** `ts` — worth checking against real code, because
+the neighboring write methods (`chat.update`, `chat.delete`) spell the same value `ts`. Getting
+it wrong produces an argument error, not a permalink.
+
+The method's Facts section states that no scopes are required, and puts it in the `special`
+rate-limit tier: it allows hundreds of requests per minute, with the usual instruction to obey
+`HTTP 429` and `Retry-After` rather than a fixed quota. A successful call returns three fields:
+
+```json
+{
+  "ok": true,
+  "channel": "C123ABC456",
+  "permalink": "https://ghostbusters.slack.com/archives/C1H9RESGA/p135854651500008"
+}
+```
+
+A permalink to a threaded reply carries two extra query parameters so the link opens inside its
+thread rather than at the top of the channel:
+
+```
+https://ghostbusters.slack.com/archives/C1H9RESGL/p135854651700023?thread_ts=1358546515.000008&cid=C1H9RESGL
+```
+
+Both shapes above are the samples printed on the method's own reference page. Reading them is
+enough to see why templating this string yourself is a bad trade:
+
+- **The workspace subdomain is not a constant the app owns.** It changes when a workspace is
+  renamed, and it differs per workspace the moment the app is installed anywhere but its home.
+- **The same timestamp is encoded two different ways in one URL.** The path segment is the `ts`
+  with its decimal point removed (`1358546515.000008` becomes `p135854651500008`), while the
+  `thread_ts` query parameter keeps the decimal intact.
+- **A threaded reply needs `thread_ts` and `cid` to resolve.** Without them the link lands the
+  reader in the channel rather than on the message — a failure that looks like a working link.
+
+:::warning[Unverified]
+Slack never writes this URL grammar out in prose; the rules above are read off the reference
+page's response samples. That is precisely the argument for calling the method instead of
+building the string — an undocumented format is the kind of thing that can change without a
+changelog entry, and a hand-built permalink fails silently when it does.
+:::
+
+```typescript
+const SLACK_API_BASE_URL = "https://slack.com/api";
+
+class SlackApiError extends Error {
+  constructor(readonly slackError: string) {
+    super(`chat.getPermalink rejected: ${slackError}`);
+  }
+}
+
+async function getMessagePermalink(
+  botToken: string,
+  channelId: string,
+  messageTs: string,
+): Promise<string> {
+  const res = await fetch(`${SLACK_API_BASE_URL}/chat.getPermalink`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${botToken}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    // message_ts, not ts -- chat.update and chat.delete spell it differently.
+    body: JSON.stringify({ channel: channelId, message_ts: messageTs }),
+  });
+
+  const body = (await res.json()) as { ok?: boolean; error?: string; permalink?: string };
+  if (body.ok !== true || !body.permalink) {
+    throw new SlackApiError(body.error ?? "unknown_error");
+  }
+  return body.permalink;
+}
+```
+
+Two documented errors matter for the patterns below, and they are not equally final:
+
+- **`message_not_found`** — the message identified by `message_ts` cannot be found. Deletion is
+  irreversible in Slack, so this one is genuinely permanent for that message.
+- **`channel_not_found`** — the value passed for `channel` was not a channel this token can see.
+  That is a statement about **access right now**, not about existence. A bot removed from a channel
+  gets this error for every message in it; re-invite the bot and the same call starts succeeding
+  again. Treat it as retryable.
+
+The distinction decides which rows a tick may permanently give up on, and getting it wrong is
+expensive in one direction only: marking a live channel dead means the digest silently stops
+linking to it long after somebody fixed the membership, and nothing in the system ever revisits
+that decision.
+
+## Posting It: `unfurl_links: true`, `unfurl_media: false`
+
+The cross-post is an ordinary `chat.postMessage` whose `text` contains the permalink:
+
+```json
+{
+  "channel": "C0ALERTSXYZ",
+  "text": "Needs a second pair of eyes: https://ghostbusters.slack.com/archives/C1H9RESGA/p135854651500008",
+  "unfurl_links": true,
+  "unfurl_media": false
+}
+```
+
+**Set `unfurl_links` explicitly rather than relying on the default.** Slack's general unfurling
+guide states that links in messages posted by users and Slack apps are unfurled by default, but
+`chat.postMessage`'s own argument reference describes `unfurl_links` only as something to pass
+`true` to enable — the same enable/disable wording convention that reference page uses elsewhere
+to mark a field off-by-default, which for this specific method and flag reads the opposite of the
+general guide. See [Unfurl Flags](./posting-and-block-kit.mdx#unfurl-flags) for the full
+`unfurl_links`/`unfurl_media` asymmetry this reasoning rests on. An explicit `true` costs one line
+and removes the question — which is what a production reference integration does on every
+cross-post.
+
+`unfurl_media: false` is the other half of the pair. The alert wants the message card, not every
+image, video, and external preview the quoted message happened to link to; media unfurls are what
+turn a one-line alert into a screenful.
+
+:::warning[Unverified]
+Slack's developer documentation describes classic link unfurling in general but never documents
+the message-permalink card specifically — not its fields, not its layout, and not what a viewer
+without access to the source channel sees. Slack's Help Center confirms that a pasted message link
+expands into a preview, and that a link into a private channel prompts the sharer to choose
+between showing the message and showing only the link, but the developer reference is silent.
+Treat the card's contents as observed behavior rather than contract, and write the surrounding
+`text` so the alert still makes sense if the card does not render.
+:::
+
+:::caution[Post the bare URL]
+Put the permalink into the message as a bare URL. Wrapping it in `mrkdwn` link syntax
+(`<url|label>`) hides the URL behind display text, and the unfurl is not reliably produced in that
+form. No Slack reference page states a rule either way, so confirm it in your own workspace before
+shipping a digest whose readability depends on the card appearing.
+:::
+
+## Cache the Permalink; Don't Re-Derive It
+
+A permalink is a pure function of `(channel, ts)`, and both inputs are immutable — the value never
+changes for the life of the message. A digest that calls `chat.getPermalink` once per row on every
+render is paying repeatedly for an answer it already had.
+
+`chat.getPermalink` is not itself the constrained method here; as noted above, it sits in the
+`special` tier at hundreds of requests per minute. The constraint is the tick, and its neighbors.
+A Worker's cron invocation has a wall-clock and CPU budget, and N sequential round-trips to Slack
+spend it on the least interesting part of the job. Worse, a permalink that was never stored has to
+be re-derived from the message itself — and re-finding a message means `conversations.history`,
+which for an app that is neither Marketplace-approved nor an internal single-workspace app is
+capped at one request per minute returning at most 15 objects. Losing a stored permalink is cheap;
+re-discovering the message it pointed at is not.
+
+So store it when the message is created, at the moment the `chat.postMessage` response has just
+handed over the `ts`:
+
+```typescript
+const posted = await callSlackApi<{ ts: string }>(
+  "chat.postMessage",
+  { channel: sourceChannelId, text: bodyText },
+  env.SLACK_BOT_TOKEN,
+);
+
+const permalink = await getMessagePermalink(env.SLACK_BOT_TOKEN, sourceChannelId, posted.ts);
+
+await env.DB.prepare(
+  "UPDATE items SET slack_channel_id = ?, slack_ts = ?, slack_permalink = ? WHERE id = ?",
+)
+  .bind(sourceChannelId, posted.ts, permalink, itemId)
+  .run();
+```
+
+### Backfill in Bounded Batches
+
+Rows that predate the permalink column, or whose write failed, need filling in. Do that from the
+cron tick a few rows at a time — never as a full-table sweep:
+
+```typescript
+const BACKFILL_PER_TICK = 20;
+
+async function backfillPermalinks(env: Env): Promise<void> {
+  const { results } = await env.DB.prepare(
+    `SELECT id, slack_channel_id, slack_ts FROM items
+     WHERE slack_ts IS NOT NULL AND slack_permalink IS NULL
+     ORDER BY permalink_attempted_at ASC NULLS FIRST
+     LIMIT ?`,
+  )
+    .bind(BACKFILL_PER_TICK)
+    .all<{ id: string; slack_channel_id: string; slack_ts: string }>();
+
+  for (const row of results) {
+    let permalink: string;
+    try {
+      permalink = await getMessagePermalink(
+        env.SLACK_BOT_TOKEN,
+        row.slack_channel_id,
+        row.slack_ts,
+      );
+    } catch (err) {
+      // Stamp the attempt BEFORE moving on: an unstamped failure keeps this row
+      // at the front of every future batch and starves the rows behind it.
+      await env.DB.prepare("UPDATE items SET permalink_attempted_at = ? WHERE id = ?")
+        .bind(Date.now(), row.id)
+        .run();
+      // One unreachable message must not end the batch.
+      console.warn(`permalink backfill skipped ${row.id}`, err);
+      continue;
+    }
+
+    // Guarded write: this applies only if the row still holds the state the
+    // SELECT read, so a concurrent tick that already filled the column (or
+    // repointed the row at a different message) is not clobbered.
+    await env.DB.prepare(
+      `UPDATE items SET slack_permalink = ?
+       WHERE id = ? AND slack_ts = ? AND slack_permalink IS NULL`,
+    )
+      .bind(permalink, row.id, row.slack_ts)
+      .run();
+  }
+}
+```
+
+Four properties of that loop are the whole point:
+
+- **The batch is capped.** `LIMIT 20` bounds both the tick's runtime and the number of Slack calls
+  it can make, so a backlog of a thousand rows drains over fifty ticks instead of blowing one
+  tick's budget. Backfill is opportunistic work and must never crowd out the tick's real job.
+- **The batch rotates.** `ORDER BY permalink_attempted_at ASC NULLS FIRST`, plus a stamp written on
+  every failure, is what keeps the cap from becoming a trap. Without it the `SELECT` has no
+  ordering at all, and rows that fail stay `NULL` and stay eligible — so twenty permanently broken
+  rows can win the same twenty slots on every tick forever, and a valid row queued behind them is
+  never attempted at all. It is not a slow backfill; it is a stalled one, and it looks identical to
+  a healthy tick from the outside. Stamping first, oldest first, turns the batch into a rotation
+  where every row gets its turn. This is the same fairness rule the tail rotation in
+  [Reading Channel History](./reading-channel-history.mdx) runs on, for the same reason: a queue
+  ordered by *when we last tried* keeps moving, and a queue ordered by *what still needs doing*
+  can wedge.
+- **The write is guarded.** `WHERE id = ? AND slack_ts = ? AND slack_permalink IS NULL` is a
+  compare-and-swap: it applies only if the row still holds the state this iteration read.
+  Overlapping ticks selecting the same row is normal — cron overlap, a manual re-run, a retry —
+  and the guard turns the second write into a harmless no-op instead of a clobber. The `slack_ts`
+  term earns its place as much as the `IS NULL` one: if the row has been repointed at a different
+  message since the `SELECT`, this permalink is now the wrong answer for it. When the caller needs
+  to know which of the two happened, the rows-affected count the driver returns is the signal.
+- **The failure is per-row.** `continue`, not `throw` — the subject of the next section.
+
+## One Bad Link Skips One Line
+
+Messages get deleted. Bots get removed from channels. Rows get written with a `ts` from a channel
+the app can no longer read. Each of those turns a single `chat.getPermalink` call into
+`message_not_found` or `channel_not_found`, and not one of them is a reason to fail the digest.
+
+The failure to design against is a digest that renders nothing because one of its forty candidates
+pointed at a deleted message. Read the stored value first, fall back to a live call only when it is
+missing, and isolate the failure to the one candidate that caused it:
+
+```typescript
+// Deletion is the only thing that cannot be undone. channel_not_found is an
+// access problem, and access comes back the moment the bot is re-invited.
+const PERMANENT_PERMALINK_ERRORS = new Set(["message_not_found"]);
+
+async function buildDigestLines(env: Env, rows: ItemRow[]): Promise<string[]> {
+  const lines: string[] = [];
+
+  for (const row of rows) {
+    // Stored value first; the live call is the exception path, not the design.
+    let permalink = row.slack_permalink;
+
+    if (!permalink && row.slack_ts) {
+      try {
+        permalink = await getMessagePermalink(
+          env.SLACK_BOT_TOKEN,
+          row.slack_channel_id,
+          row.slack_ts,
+        );
+      } catch (err) {
+        if (err instanceof SlackApiError && PERMANENT_PERMALINK_ERRORS.has(err.slackError)) {
+          // The message itself is gone: no later tick can resolve this row.
+          await markPermalinkUnavailable(env, row.id);
+        }
+        // Everything else -- channel_not_found, ratelimited, a 5xx -- leaves
+        // the row untouched, so the backfill rotation retries it later.
+        // Skip this ONE entry; the digest still goes out with everything else.
+        console.warn(`digest: no permalink for ${row.id}, omitting`, err);
+        continue;
+      }
+    }
+
+    if (!permalink) continue;
+    lines.push(`- ${row.title}: ${permalink}`);
+  }
+
+  return lines;
+}
+```
+
+If the live fallback is firing for most rows in a digest, the write at post time is broken and the
+backfill is not keeping up. That is a bug to fix at the source, not a cost to absorb on every tick.
+
+Two things quietly defeat this isolation:
+
+- **`Promise.all` rejects on the first rejection.** Resolving permalinks concurrently with
+  `Promise.all` reintroduces exactly the coupling this section removes: one `message_not_found` and
+  the entire array rejects, taking the digest with it. Use `Promise.allSettled` and filter, or a
+  sequential loop as above.
+- **A `catch` that logs and rethrows is not isolation.** The `catch` has to end the failure, not
+  annotate it on the way up. If the enclosing digest function has its own try/catch, check that the
+  per-candidate one really sits inside the loop.
+
+Marking the permanently dead candidates matters over time. `message_not_found` says the message is
+gone, unlike a timeout or a `429`, and no number of later ticks will bring it back — recording that
+fact keeps every future tick from spending a Slack call to learn the same thing again.
+
+**Reserve that marking for deletion alone.** `channel_not_found` is the tempting one to add to the
+set, because it fails just as reliably and looks just as hopeless from inside the catch block. It
+is not: the usual cause is the bot being removed from a channel, and the usual sequel is somebody
+noticing and inviting it back. A row marked dead on the strength of an access error stays dead
+after the access returns, and the failure mode is a digest that quietly omits an entire channel's
+worth of links with nothing in the logs still complaining about it. Access errors get the same
+treatment as a `429` — leave the row eligible, stamp the attempt, and let the rotation come back
+to it.

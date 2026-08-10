@@ -50,28 +50,62 @@ available here: a row your own database still points at silently disappears from
 no event and no error — until a later `items.update` against that `row_id` fails. Nothing about
 that failure is loud until it is too late to be a minor issue.
 
-## Mitigation: self-cap well under the limit, evict explicitly
+## The primary pattern: cap the desired-state projection
 
 The source research's bottom line, and the design this whole section leans on: **never let a
-list be the system of record for a growing table.** Concretely:
+list be the system of record for a growing table.** The most robust way to enforce that is not
+a bolted-on "check and evict" step — it's baking the cap into the query that produces your
+desired state in the first place:
 
 - **Mirror only a bounded active working set** — e.g. non-archived or currently-relevant source
   rows — never a full history.
-- **Hard-cap your own mirror well under 1,000** (300–500 is the suggested range from the source
-  research). This leaves headroom for growth without ever depending on how the platform behaves
-  at the actual ceiling.
-- **When over your own ceiling, remove the oldest rows yourself with `items.deleteMultiple`**
-  (Tier 2, 20+/min) rather than relying on whatever Slack's own auto-archive does. Explicit
-  deletion means you choose the victims and keep your `row_id` map clean and accurate — it does
-  not silently disagree with what your database thinks is still in the list.
+- **Cap the desired-state query itself: select the newest N rows by a business timestamp** (not
+  insertion order), with a stable id as a tiebreak for rows sharing a timestamp. Keep N well
+  under 1,000 — 300–500 is the suggested range from the source research — leaving headroom for
+  growth without ever depending on how the platform behaves at the actual ceiling.
+- **Rows that fall outside the window are not a special case.** They simply stop appearing in
+  the desired-state set your reconcile pass diffs against the list, so they become ordinary
+  `desired_operation = delete` work in the SAME reconcile machinery that already turns "desired
+  but missing from the list" into creates. There is no separate eviction code path to keep in
+  sync with the rest of the sync logic — the shape of the query IS the capacity policy.
+- **Order deletes before creates within each reconcile batch.** A batch that both drops
+  fallen-off rows and adds new ones should free capacity before it consumes it, so you don't
+  manufacture a spurious `over_row_maximum` at the boundary between "right at the cap" and
+  "about to exceed it."
 - **Avoid subtasks (`parent_item_id`) entirely** if the row budget is tight — they share the
   same cap with no separate allowance, so a parent/child shape effectively halves your usable
   budget for a given self-imposed ceiling.
 
+One consequence worth stating plainly: with the desired-state cap doing the enforcement, you
+never need to consult `list_limits`/`row_count` from `items.info` to decide whether you're at
+capacity — your own bounded projection query IS the capacity policy. `items.info`'s
+`list_limits` is still worth reading periodically as a health-check signal (see "Reading how
+full the list is" below); it just drops out of the write-path decision entirely.
+
+## Bulk-cleanup fallback: `items.deleteMultiple`
+
+The primary pattern above should mean you rarely, if ever, need an explicit bulk-delete pass —
+the desired-state projection already keeps you under the ceiling every cycle. Keep
+`items.deleteMultiple` (Tier 2, 20+/min) as a fallback for what the projection doesn't cover on
+its own: a one-time backfill cleanup, a ceiling lowered after the fact, or clearing a backlog
+that accumulated before this pattern was in place.
+
+[Slack's method reference for `slackLists.items.deleteMultiple`](https://docs.slack.dev/reference/methods/slackLists.items.deleteMultiple/)
+documents the request body as `{list_id, ids}` — the parameter is **`ids`, not `row_ids`.**
+There's a naming asymmetry worth knowing across the delete-shaped methods: `items.delete` takes
+a singular `id`, `deleteMultiple` takes a plural `ids` array, and `items.info` takes `id` for
+the one row it fetches. No method has a top-level `row_id` parameter — that name only appears
+nested, inside `items.update`'s `cells[]` entries, where each cell carries its own `row_id` (or
+`row_id_to_create`) to say which row it targets.
+
+A well-behaved wrapper around `deleteMultiple` treats a 0-length id array as a no-op (skip the
+call — there's no reason to round-trip an empty `ids` array) and routes a 1-length array to
+`items.delete` instead, since that's a genuinely singular delete:
+
 ```typescript
-// Self-imposed ceiling, well under Slack's 1,000-row cap. Evict the
-// oldest rows explicitly rather than depending on Slack's own
-// (reported, unverified) auto-archive behavior.
+// Bulk-cleanup fallback — the primary desired-state cap (above) should mean
+// this rarely fires. Request body is {list_id, ids}, not row_ids; see
+// https://docs.slack.dev/reference/methods/slackLists.items.deleteMultiple/
 const MIRROR_ROW_CEILING = 400;
 
 async function evictOldestIfOverCeiling(
@@ -81,22 +115,27 @@ async function evictOldestIfOverCeiling(
 ): Promise<void> {
   if (currentRowIds.length <= MIRROR_ROW_CEILING) return;
   const toEvict = currentRowIds.slice(0, currentRowIds.length - MIRROR_ROW_CEILING);
-  const res = await fetch("https://slack.com/api/slackLists.items.deleteMultiple", {
+  // A 1-length array is a genuinely singular delete — route it to items.delete's
+  // `id` rather than paying for the deleteMultiple round trip.
+  const method = toEvict.length === 1 ? "slackLists.items.delete" : "slackLists.items.deleteMultiple";
+  const payload =
+    toEvict.length === 1 ? { list_id: listId, id: toEvict[0] } : { list_id: listId, ids: toEvict };
+  const res = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${botToken}`,
       "content-type": "application/json; charset=utf-8",
     },
-    body: JSON.stringify({ list_id: listId, row_ids: toEvict }),
+    body: JSON.stringify(payload),
   });
   // Slack's Web API returns HTTP 200 even on failure — {"ok": false, "error": "..."}.
   // Only remove rows from your own mapping table AFTER confirming ok: true; removing
   // them unconditionally would desync your mapping from Slack on a rejected call.
   const body = (await res.json()) as { ok: boolean; error?: string };
   if (!body.ok) {
-    throw new Error(`slackLists.items.deleteMultiple rejected: ${body.error}`);
+    throw new Error(`${method} rejected: ${body.error}`);
   }
-  // Remove the same row_ids from your own mapping table in the same
+  // Remove the same row ids from your own mapping table in the same
   // operation — do not let the two stores drift apart.
 }
 ```
@@ -106,9 +145,14 @@ async function evictOldestIfOverCeiling(
 `items.list` returns no counts at all. The only place capacity numbers surface is
 `list_limits` on an `items.info` response (`row_count`, `row_count_limit`, `archived_row_count`)
 — see the sentinel-row pattern in [Reading Lists](./reading-lists.mdx) for how to read this
-without spending one of your mirrored rows on the lookup. Check it periodically rather than only
-reacting to `over_row_maximum` after the fact — proactive eviction against your own ceiling
-should keep you far enough from the real cap that the error never fires in normal operation.
+without spending one of your mirrored rows on the lookup.
+
+With the desired-state projection cap as the primary pattern (above), you don't need
+`list_limits` to decide whether a write is safe — the projection query already keeps you under
+the ceiling every cycle. Read it periodically anyway as a health check: a `row_count` that
+drifts toward `row_count_limit` despite your own ceiling being lower is a signal that something
+else is writing to the list, or that your ceiling needs reconsidering — not something to react
+to only after `over_row_maximum` has already fired.
 
 ## Related
 

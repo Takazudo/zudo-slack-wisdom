@@ -51,6 +51,48 @@ option with the strongest read-only guarantee. It trades away real layout modes 
 no per-row threads); reach for a heavier surface only after the team has actually asked for those.
 :::
 
+## Reconciling a Fleet of Messages
+
+The pattern above assumes a single dashboard message living at one `channel`/`ts`. A bot that
+maintains many previously-posted messages instead — one per record, one per team, one per open
+item — needs a reconciliation pass rather than a single fixed target.
+
+Store a **version-salted content hash** alongside each message's `channel`/`ts` (a SHA-256 digest
+over `[renderVersion, parentPayload, replyPayload]` works well). Each reconciliation pass rebuilds
+the payload from current data, computes the hash, and compares it against the stored value;
+`chat.update` is called only when the hashes differ, so an unchanged record costs zero API calls.
+
+Write the new hash to storage **only after every Slack call for that row succeeds** — the hash is
+the commit marker for a completed write, not a record of "we attempted an update." If the parent
+update succeeds but a dependent reply update throws, the stored hash stays at its old value, so the
+row still reads as dirty and is retried on the next pass instead of being silently marked done
+against a Slack state that doesn't actually match it.
+
+Bumping the `renderVersion` salt is how a template redesign forces every previously-posted message
+to rewrite itself: the hash changes for every row even though the underlying data didn't, so the
+next pass treats the whole fleet as dirty and rewrites each message exactly once.
+
+Cap how many updates a single pass performs, and order candidates deliberately — rows that have
+never been hashed first (new records with no Slack presence yet), then the newest rows — so a large
+backlog drains gradually across many cron ticks instead of bursting through the per-channel posting
+ceiling in one pass (see [Rate Limits](./rate-limits.mdx)).
+
+## Sharing a Payload Builder Between Post and Update
+
+Reusing one function to build the Block Kit payload for both `chat.postMessage` and `chat.update`
+keeps the two call sites from drifting apart, but a few fields are **post-only** and must be
+stripped before the payload is sent to `chat.update`: `thread_ts`, `unfurl_links`, and
+`unfurl_media`. Threading is fixed at post time — `chat.update` has no `thread_ts` parameter to
+begin with, and passing unfurl flags on an update call is a no-op at best; treat the builder's
+output as needing a strip step for the update path, not as directly reusable.
+
+If a bot's thread replies might ever need to be re-discovered — the reply's `ts` was never
+persisted, or the row that tracked it was lost — give those replies a stable, machine-recognizable
+text prefix (e.g. a fixed marker string at the start of the reply text). A later pass can then
+re-find its own reply by calling `conversations.replies` on the parent `ts` and scanning results
+for the bot's own `bot_id` plus that prefix, recovering the `ts` needed to resume idempotent
+`chat.update` calls without ever having stored it.
+
 ## Table Block Limits
 
 Block Kit's Table block is the highest-fidelity structured layout available inside a

@@ -23,6 +23,14 @@ bot がチャンネルに送り込むもの — 単発の通知、スレッド�
   リンク、日付トークン、そして素の `mrkdwn` がブロックに勝る場面
 - [レート制限](./rate-limits.mdx) — Tier 1〜4 のモデル、`Retry-After` の扱い、チャンネル
   単位のメッセージ投稿制限、そして 2025〜2026 年の非 Marketplace アプリ向けレート制限変更
+- [チャンネル履歴の読み取り](./reading-channel-history.mdx) — `conversations.history` と
+  `conversations.replies` を読み取りモデルとしてポーリングする。tick ごとの予算と
+  読み取り時の全置換による冪等性
+- [リアクション](./reactions.mdx) — 冪等な状態マーカーとしての `reactions.add`、そして
+  スキントーンの派生・エイリアス・切り詰められたユーザー配列を踏まえたリアクション状態の読み取り
+- [パーマリンクとチャンネル横断アラート](./permalinks-and-cross-channel-alerts.mdx) —
+  `chat.getPermalink`、パーマリンク + unfurl によるクロスポストのパターン、そしてパーマリンクの
+  サーバー側キャッシュ
 
 ## 2 つのメソッド、それぞれの制約
 

@@ -61,17 +61,18 @@ up front. This resolves two problems at once:
 1. **Slug control.** You pick neutral ASCII values (`todo` / `doing` / `done`) under any
    display label, so the label↔ID mapping problem disappears entirely — the slugs are
    compile-time constants in your Worker code.
-2. **Access.** How a bot gets write access to a list it did **not** create is genuinely
-   undocumented: [`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/)
+2. **Access.** How a bot gets write access to a list it did **not** create via the API alone is
+   genuinely undocumented: [`slackLists.access.set`](https://docs.slack.dev/reference/methods/slackLists.access.set/)
    accepts only `channel_ids` and `user_ids` — there is no `app_ids`/bot argument anywhere.
    Yet `items.update` clearly enforces access (`access_denied`, `no_permission`,
-   `permission_denied`). Creating the list is the only documented-clean path around this gap:
-   Slack's docs describe a new list as "owned by the acting user," and the acting user for a
-   bot-token `slackLists.create` call is the bot itself. There is a real community report
-   ([slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)) of
-   `list_not_found` from `items.update` despite the list being shared into the bot's channel
-   (pre-GA, workflow-token context). Do not plan around a human creating the list and sharing
-   it with the bot until that path is proven with a throwaway call.
+   `permission_denied`). Creating the list sidesteps this API gap entirely: Slack's docs
+   describe a new list as "owned by the acting user," and the acting user for a bot-token
+   `slackLists.create` call is the bot itself. When the list is already operator-owned instead,
+   the production-exercised route is a manual Share-UI edit grant rather than `access.set` — see
+   [The One-Way Mirror Pattern](./one-way-mirror.mdx#mechanics-checklist-1-how-the-bot-gets-write-access-two-real-routes-and-one-dead-end)
+   for both routes side by side, and mandate a live probe (see
+   [The Activation-Gate Probe](./verification-probe.mdx)) before enabling writes through either
+   one.
 
 :::warning[Unverified]
 That the creator automatically retains write access — i.e., that a bot's own `xoxb` token is
@@ -87,6 +88,29 @@ If a human already made the list, there is no `slackLists.info` and no `slackLis
 discover it by. Discovery is `slackLists.items.info` (needs `lists:read`), which returns the
 whole list object including `list.list_metadata.schema[]` — every select column with its `id`
 and `options.choices[]`. Call it once by hand, then hardcode the values.
+
+## Matching Emoji Labels: Unicode vs. `:shortcode:`
+
+A select option authored in the Slack UI can carry an emoji in its `label` — a manager typing
+"👍 Approved" as a chip's display text, for example. The API does not guarantee that comes back
+the same way it was typed: the same label can round-trip as the Unicode character
+(`👍 Approved`) on one read and as its colon-shortcode form (`:+1: Approved`) on another. This
+matters specifically for **label-based resolution** — matching a known label string against
+`options.choices[].label` to find the corresponding `value` — which is the only route available
+on a list a human created by hand (see
+[The Bot-Creates-the-List Pattern](#the-bot-creates-the-list-pattern) above): there is no `id`
+key to key off of, and the `value` slugs cannot be assumed to be anything predictable.
+
+Match both representations, not just the one you happened to see when you wrote the resolver —
+normalize (or check both) the Unicode emoji and its shortcode alias before comparing against a
+stored label. If a column's `options.choices[]` ever contains the Unicode form and the shortcode
+form as two *separate* options — rather than one option whose label merely renders differently
+across reads — treat that as a configuration error: it is an ambiguous schema, not a resolution
+problem your code can solve, since both options exist to mean the same status.
+
+This reinforces the page's core advice: persist the opaque `value`, not the `label`, from the
+moment you first resolve it. Label-matching should only ever run once, at setup time, to bridge a
+human-created list into your stored slugs — never on every write.
 
 ## Single- and Multi-Select Are Written Identically
 

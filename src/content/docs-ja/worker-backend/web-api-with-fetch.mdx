@@ -37,6 +37,58 @@ async function callSlackApi<T>(
 }
 ```
 
+## クラスベースのクライアントと workerd のレシーバー問題
+
+上の呼び出しを小さなクライアントクラスにラップするのは、多くの場合テスト用に `fetch` を差し替え可能にするための、自然な次の一手だ。
+
+```typescript
+class SlackClient {
+  constructor(
+    private readonly botToken: string,
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {}
+
+  async call<T>(method: string, body: Record<string, unknown>): Promise<T> {
+    const res = await this.fetchImpl(`${SLACK_API_BASE_URL}/${method}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${this.botToken}`,
+        "content-type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(body),
+    });
+    const json = (await res.json()) as { ok: boolean; error?: string } & T;
+    if (!json.ok) {
+      throw new Error(`${method} rejected: ${json.error}`);
+    }
+    return json;
+  }
+}
+```
+
+これは本番環境では壊れる。`this.fetchImpl(url, init)` は、格納された関数を*クラスインスタンスをレシーバーとして*呼び出す。そして workerd はこれを拒否する。ネイティブの `fetch` 実装はレシーバーなし（あるいは `undefined`/`globalThis` を伴う形）での呼び出しを要求しており、メソッドとして呼び出すと、リクエストが送られる前に illegal-invocation 相当のエラーが発生する。
+
+```typescript
+// Fix: read fetchImpl into a local binding first, so the call site has
+// no receiver at all.
+async call<T>(method: string, body: Record<string, unknown>): Promise<T> {
+  const fetchImpl = this.fetchImpl;
+  const res = await fetchImpl(`${SLACK_API_BASE_URL}/${method}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${this.botToken}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(body),
+  });
+  // ...
+}
+```
+
+:::danger[これは Workers 上でのみ壊れる -- Node ベースのテストでは壊れない]
+Node の `fetch` は同じレシーバーチェックを行わないため、素の Node テストランナーの下で動くテストスイートは `this.fetchImpl(...)` を何の文句もなく呼び出し、このバグはそのまま本番に出荷される。これは Workers（workerd）上の実行時にしか表面化しない。修正は、Cloudflare の [Workers Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/) のような Workers 相当のランタイム上でクライアントを動かす専用のユニットテストで固定すること。汎用の Node テストランナーではリグレッションを検知するテストが存在しないことになる。
+:::
+
 ## JSON とフォームエンコーディング -- 常に JSON を使う
 
 Web API は `application/x-www-form-urlencoded` と `application/json` のどちらのボディも受け付ける。フォームエンコーディングは古いほうの経路で、引数が構造化データになった途端に破綻する。オブジェクトの配列にはきれいなフォームエンコード表現が存在せず、まさにこの理由から Slack 自身も JSON エンコードされたボディを使うよう案内している。
@@ -57,18 +109,43 @@ await callSlackApi("slackLists.items.update", {
 }, botToken);
 ```
 
+:::note[読み取り系メソッドは慣例として GET + クエリ文字列]
+上のルールは**POST ボディ**をどうエンコードするかについての話である。`conversations.history` や `users.info` のような読み取り系メソッドは、慣例として `GET` に引数をクエリ文字列として載せて呼び出すもので、JSON ボディとして送るものではない。そもそもボディがないのだから、エンコーディングの選択の余地もない。
+:::
+
 ## `Retry-After` を尊重する
 
-Web API のメソッドはレート制限のティア（Tier 1 から Tier 4、ワークスペースごと・メソッドごとにおよそ毎分 1 回以上から 100 回以上）に分類され、加えて `chat.postMessage` のようなトラフィックの多いいくつかのメソッド向けに特別なティアがある。レート制限にかかると、Slack は `429 Too Many Requests` を返し、`Retry-After` ヘッダーで、そのメソッドをそのワークスペースに対して再試行するまで待つべき秒数を示してくる。
+Web API のメソッドはレート制限のティア（Tier 1 から Tier 4、ワークスペースごと・メソッドごとにおよそ毎分 1 回以上から 100 回以上）に分類され、加えて `chat.postMessage` のようなトラフィックの多いいくつかのメソッド向けに特別なティアがある。より高いスループットの承認を受けていない非 Marketplace アプリは、それとは別に、はるかに粗いワークスペース単位のスロットルにも突き当たる -- メソッドによっては毎分およそ 1 回程度まで落ちることがある。正当な `Retry-After` が約 60 秒にもなりうるのはこのためであり、「数秒程度」を想定して組んだリトライ戦略は、Slack が本当に意図した待ち時間を切り詰めたり諦めたりしてしまう。レート制限にかかると、Slack は `429 Too Many Requests` を返し、理想的には `Retry-After` ヘッダーで、そのメソッドをそのワークスペースに対して再試行するまで待つべき秒数を示してくる。
+
+とはいえ `Retry-After` は必ず存在するわけでも、必ずパースできるわけでもない。`5xx` レスポンスにはそもそも一切付かないし、`429` であっても、Worker と Slack の間に何が挟まっているかによってはヘッダーが欠けていたり数値でなかったりする。`Number(header ?? "1")` は、不正な形式のヘッダーに対して黙って `NaN` を生成し、`NaN` ミリ秒の待機をスケジュールしてしまう。ヘッダーが欠けているかパースできない場合は指数バックオフ（1 秒を基準に、試行のたびに倍化）にフォールバックし、そして*あらゆる*待機時間 -- サーバー由来であれバックオフ由来であれ -- を経路ごとの上限にクランプすること。行儀の悪い中継や、想定外の Slack のレスポンスが巨大な `Retry-After` を送ってこないとは限らず、クランプしていない待機はアイソレート自身の実行時間予算やバックグラウンド処理の予算を吹き飛ばしかねない（下の `ctx.waitUntil()` に関する警告を参照）。
+
+適切な上限は何をリトライしているかによって変わるので、あらゆる箇所で同じ数値を使い回すのではなく、呼び出しの種類ごとに予算を分けるべきだ。
 
 ```typescript
+interface RetryBudget {
+  maxRetries: number;
+  ceilingMs: number;
+  retryOn5xx: boolean;
+}
+
+// Fail-fast: a single item write inside a request handler. If it's still
+// failing after a couple of quick retries, persist "retry this" state and
+// let the next cron tick pick it up instead of blocking the handler.
+const WRITE_BUDGET: RetryBudget = { maxRetries: 2, ceilingMs: 2_000, retryOn5xx: false };
+
+// Patient: a once-per-tick cron read that can afford to wait out the
+// ~1 req/min non-Marketplace throttle rather than skip the tick entirely.
+const READ_BUDGET: RetryBudget = { maxRetries: 5, ceilingMs: 60_000, retryOn5xx: true };
+
 async function callSlackApiWithRetry<T>(
   method: string,
   body: Record<string, unknown>,
   botToken: string,
-  maxRetries = 3,
+  budget: RetryBudget,
 ): Promise<T> {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  let backoffMs = 1_000;
+
+  for (let attempt = 0; attempt <= budget.maxRetries; attempt++) {
     const res = await fetch(`${SLACK_API_BASE_URL}/${method}`, {
       method: "POST",
       headers: {
@@ -78,12 +155,17 @@ async function callSlackApiWithRetry<T>(
       body: JSON.stringify(body),
     });
 
-    if (res.status === 429) {
-      const retryAfterSeconds = Number(res.headers.get("retry-after") ?? "1");
-      if (attempt === maxRetries) {
-        throw new Error(`${method} rate-limited after ${maxRetries} retries`);
+    const isRateLimited = res.status === 429;
+    const isRetryable5xx = budget.retryOn5xx && res.status >= 500;
+
+    if (isRateLimited || isRetryable5xx) {
+      if (attempt === budget.maxRetries) {
+        throw new Error(`${method} failed after ${budget.maxRetries} retries (status ${res.status})`);
       }
-      await new Promise((resolve) => setTimeout(resolve, retryAfterSeconds * 1000));
+      const header = isRateLimited ? Number(res.headers.get("retry-after")) : NaN;
+      const waitMs = Number.isFinite(header) && header > 0 ? header * 1000 : backoffMs;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(waitMs, budget.ceilingMs)));
+      backoffMs *= 2;
       continue;
     }
 
@@ -97,17 +179,19 @@ async function callSlackApiWithRetry<T>(
 }
 ```
 
+`5xx` のリトライは経路ごとのオプトイン（`retryOn5xx`）であり、既定では有効にしない。一過性の Slack 側のエラーは、余裕のある読み取り系呼び出しなら 1 回リトライする価値があることが多いが、fail-fast な書き込み系の予算は、本物の障害と見分けがつかない `5xx` に貴重な 2 回のリトライを使うべきではないことが多い。素早く諦めて、永続化されたリトライのフォールバックに任せたほうがよい。
+
 :::tip[レート制限はメソッド単位・ワークスペース単位]
 `chat.postMessage` が `429` を返したからといって、`slackLists.items.update` も制限されているとは限らない。適用すべきグローバルなバックオフは存在しない。`429` を返した当のメソッドだけを後退させ、ほかの呼び出しは普段どおり進めればよい。
 :::
 
-:::warning[長い Retry-After は ctx.waitUntil() の予算を超えうる]
-Slack が通常返してくる程度の短い遅延なら、アイソレート内で待つのは問題ない。ただし `Retry-After` に上限は明記されておらず、`ctx.waitUntil()` で登録したバックグラウンド処理に与えられるのはレスポンス送信後およそ 30 秒だけである（[3 秒 ack](./three-second-ack.mdx) を参照）。このリトライがそのバックグラウンド処理の内側で走り、`Retry-After` が予算を吹き飛ばすほど長ければ、ランタイムは待機中の Promise を途中でキャンセルする。それが問題になる呼び出しでは、Worker のなかで数回を超えてループしながら待たないこと。「あとでリトライする」という状態を（KV、D1、キューに）永続化し、次の cron の実行や専用のリトライ経路に拾わせるほうがよい。
+:::warning[長い待機時間は ctx.waitUntil() の予算を超えうる]
+アイソレート内で待つこと自体は、書き込み系の狭い上限が許す程度の短い遅延であれば問題ない。しかし `ctx.waitUntil()` で登録したバックグラウンド処理に与えられるのはレスポンス送信後およそ 30 秒だけである（[3 秒 ack](./three-second-ack.mdx) を参照）。このリトライループがそのバックグラウンド処理の内側で走り、その上限がその予算に近い、あるいは超えていれば、ランタイムは待機中の Promise を途中でキャンセルする。これこそが、書き込み系の予算の上限を（上の例のように）2 秒程度の小さな値に保ち、読み取り系の 60 秒という上限をあらゆる場面で使い回さない理由である。数回の素早いリトライを超える分については、「あとでリトライする」という状態を（KV、D1、キューに）永続化し、Worker のなかでループしながら待つのではなく、次の cron の実行や専用のリトライ経路に拾わせるほうがよい。
 :::
 
 ## つまずきどころ
 
 - **配列を取る引数をフォームエンコードするのが、分かりにくい `invalid_array_arg` の最大の原因。** メソッドの引数にオブジェクトの配列（Block Kit の `blocks`、Lists の `cells` など）が含まれるなら `application/json` で送ること。そもそも Worker から Web API を呼ぶうえで、フォームエンコーディングを使う理由はどこにもない。
-- **`200` は成功を意味しないし、すべてのレスポンスが `200` でもない。** Web API のレスポンスは多くの場合 `200` で、本当の結果は JSON ボディの `ok` フィールドに入っている。見るべきは `res.ok` ではなく `json.ok` だ。とはいえ `429` や一過性の HTTP レベルのエラー（タイムアウト、`5xx`）も実際に起きるので、上のリトライヘルパーが `429` に対して行っているように、それぞれの処理が要る。
-- **`Retry-After` が正であり、自前のバックオフを当て推量しない。** 待つべき時間は Slack が正確に教えてくれる。それより短い遅延を自分で決めても、もう一度 `429` を食らうだけである。
+- **`200` は成功を意味しないし、すべてのレスポンスが `200` でもない。** Web API のレスポンスは多くの場合 `200` で、本当の結果は JSON ボディの `ok` フィールドに入っている。見るべきは `res.ok` ではなく `json.ok` だ。とはいえ `429` や一過性の HTTP レベルのエラー（タイムアウト、`5xx`）も実際に起きるので、上のリトライヘルパーが行っているように、それぞれの処理が要る。
+- **`Retry-After` は正しいシグナルだが、上限なしで信用してはいけない。** Slack が教えてくれる待機時間はたいてい正しい。とはいえ、それに従って眠る前に経路ごとの上限にクランプすること。欠落・不正形式・想定外に巨大な値のいずれであっても、アイソレートの予算を吹き飛ばせてはならない。
 - **一括操作はループで呼ばずにバッチにまとめる。** `slackLists.items.update` のようなメソッドは 1 回の呼び出しで複数のエントリを受け付ける（ドキュメント化された上限まで）。多数の行をミラーする cron なら、1 行につき 1 回 Web API を呼ぶのではなく、1 ティックにつき 1 回のバッチ呼び出しを組み立てるべきだ。[Cron による定期投稿](./cron-posting.mdx)を参照。
