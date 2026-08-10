@@ -88,6 +88,29 @@ discover it by. Discovery is `slackLists.items.info` (needs `lists:read`), which
 whole list object including `list.list_metadata.schema[]` — every select column with its `id`
 and `options.choices[]`. Call it once by hand, then hardcode the values.
 
+## Matching Emoji Labels: Unicode vs. `:shortcode:`
+
+A select option authored in the Slack UI can carry an emoji in its `label` — a manager typing
+"👍 Approved" as a chip's display text, for example. The API does not guarantee that comes back
+the same way it was typed: the same label can round-trip as the Unicode character
+(`👍 Approved`) on one read and as its colon-shortcode form (`:+1: Approved`) on another. This
+matters specifically for **label-based resolution** — matching a known label string against
+`options.choices[].label` to find the corresponding `value` — which is the only route available
+on a list a human created by hand (see
+[The Bot-Creates-the-List Pattern](#the-bot-creates-the-list-pattern) above): there is no `id`
+key to key off of, and the `value` slugs cannot be assumed to be anything predictable.
+
+Match both representations, not just the one you happened to see when you wrote the resolver —
+normalize (or check both) the Unicode emoji and its shortcode alias before comparing against a
+stored label. If a column's `options.choices[]` ever contains the Unicode form and the shortcode
+form as two *separate* options — rather than one option whose label merely renders differently
+across reads — treat that as a configuration error: it is an ambiguous schema, not a resolution
+problem your code can solve, since both options exist to mean the same status.
+
+This reinforces the page's core advice: persist the opaque `value`, not the `label`, from the
+moment you first resolve it. Label-matching should only ever run once, at setup time, to bridge a
+human-created list into your stored slugs — never on every write.
+
 ## Single- and Multi-Select Are Written Identically
 
 There is no separate `multi_select` cell key. Both single-select and multi-select columns are

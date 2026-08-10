@@ -10,7 +10,7 @@ questions:
 | Method | Answers | Needs | Rate tier |
 |---|---|---|---|
 | [`items.list`](https://docs.slack.dev/reference/methods/slackLists.items.list/) | "What rows exist?" | `list_id` | Tier 2 (20+/min) |
-| [`items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/) | "What is the schema, and what are the limits?" | `list_id` + an existing `row_id` | not stated in the source research |
+| [`items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/) | "What is the schema, and what are the limits?" | `list_id` + an existing row's `id` | not stated in the source research |
 | [`download.start`](https://docs.slack.dev/reference/methods/) / `download.get` | "Give me everything as a file" | `list_id` | not stated in the source research |
 
 There is no fifth option. `slackLists.list` (enumerate a workspace's lists) and `slackLists.info`
@@ -29,13 +29,17 @@ Pagination follows the standard Slack cursor shape: pass `limit`, read
 empty.
 
 ```typescript
+const MAX_PAGES = 100;
+
 export async function listAllItems(
   botToken: string,
   listId: string,
   archived = false,
 ): Promise<ListItem[]> {
   const items: ListItem[] = [];
+  const seenCursors = new Set<string>();
   let cursor: string | undefined;
+  let pageCount = 0;
 
   do {
     const res = await fetch("https://slack.com/api/slackLists.items.list", {
@@ -48,17 +52,44 @@ export async function listAllItems(
     });
     const body = (await res.json()) as {
       ok: boolean;
-      items?: ListItem[];
+      items?: unknown;
       response_metadata?: { next_cursor?: string };
     };
     if (!body.ok) throw new Error("slackLists.items.list failed");
-    items.push(...(body.items ?? []));
-    cursor = body.response_metadata?.next_cursor || undefined;
+    if (!Array.isArray(body.items)) {
+      throw new Error("slackLists.items.list: items is not an array");
+    }
+    items.push(...(body.items as ListItem[]));
+
+    pageCount += 1;
+    if (pageCount > MAX_PAGES) {
+      throw new Error(`slackLists.items.list exceeded ${MAX_PAGES} pages`);
+    }
+
+    const next = body.response_metadata?.next_cursor ?? "";
+    if (next === "") {
+      cursor = undefined; // explicit end-of-list, not merely a missing field
+    } else if (seenCursors.has(next)) {
+      throw new Error("slackLists.items.list: repeated cursor");
+    } else {
+      seenCursors.add(next);
+      cursor = next;
+    }
   } while (cursor);
 
   return items;
 }
 ```
+
+:::note[Bounding response size inside a Worker]
+`MAX_PAGES` and the per-page `limit: 100` together cap this at 10,000 rows accumulated in
+memory. That cap is deliberate, not a nicety — a Cloudflare Worker isolate has a fixed memory
+ceiling per request, and an unbounded `items.push(...)` loop against a list that keeps growing
+(or a server bug that never returns an empty cursor) turns into an out-of-memory kill rather
+than a clean error. If a list can legitimately exceed the page ceiling, process pages
+incrementally in the caller instead of accumulating everything into one array, or use
+`download.start` / `download.get` (below) for a full-file export instead of an in-memory sweep.
+:::
 
 A full sweep of 1,000 rows is roughly 10 paginated calls at a `limit` of 100 — comfortably
 inside Tier 2 (20+/min) for a once-per-cron-tick reconcile pass. `items.list` also returns
@@ -92,32 +123,78 @@ There is no faster path — no filter, no search, no query parameter exists to n
 
 `items.info` returns one row **plus** the full list metadata: name, schema (every column and its
 type), views, and limits. It is the only place to read the schema back after creation — besides
-the response of `slackLists.create` itself — and the catch is baked into its argument list: it
-takes a `row_id`, not just a `list_id`. You cannot ask "what does this list look like" without
-already holding a row to ask about.
+the response of `slackLists.create` itself — and the catch is baked into its argument list:
+besides `list_id`, it takes an existing row's `id`. You cannot ask "what does this list look
+like" without already holding a row to ask about.
 
 That makes `items.info` a *recovery* tool, not a discovery tool. The intended flow is:
 
 1. **Persist `list_id` and every `column_id` at `slackLists.create` time.** The creation response
    is the only place these ever come back without needing a row first.
 2. If that persistence is ever lost, `items.info` against any known row rebuilds the schema —
-   but you still need one row id to start from.
+   but you still need one row id to start from. The lifecycle below is how you keep one on hand
+   without pinning a permanent row.
 
 ### The sentinel-row pattern
 
 Two things only `items.info` can tell you — the schema, and `list_limits` (`row_count`,
 `row_count_limit`, `archived_row_count`) — both require a row id as the price of admission.
-Spending one of your mirrored data rows on this is wasteful and fragile (that row could get
-deleted by your own cap-eviction logic, taking your only handle on the list with it). The
-practical fix, drawn from the source research: create one throwaway **sentinel row** at list
-creation time, never delete it, and always call `items.info` against that fixed row id whenever
-you need schema or limits — a permanent, cheap anchor that never competes with your actual
-mirrored working set.
+Spending one of your mirrored data rows on this works but is fragile on its own: that row could
+get deleted by your own cap-eviction logic, taking your handle on the list with it. That risk is
+not an argument for pinning one permanent throwaway row and never deleting it, though — it is an
+argument for resolving the anchor row *dynamically*, on every run, with a fall-through chain.
+Losing any individual row then costs one extra `items.list` call, not the handle.
+
+A permanent, never-deleted sentinel is also the wrong shape for a List that operators actually
+look at: a blank row that sits there forever is operator-visible junk. Operators delete it by
+hand, your recovery logic recreates it on the next tick, and the integration looks like it is
+spawning junk rows. It is unnecessary besides — the schema `items.info` returns is **list-level**
+(`list.list_metadata.schema`), so any row, including an archived one, is an equally valid handle.
+The lifecycle below treats the sentinel as a last resort, not a fixture.
+
+1. **Anchor order.** Resolve the row to call `items.info` against, trying each of these in turn
+   and stopping at the first one that resolves: the stored sentinel row id, if one is recorded;
+   otherwise any row from `items.list` (active rows first, then `archived: true` rows); and only
+   if both come up empty, create a blank row and record its id as the new sentinel.
+2. **Missing-row race fall-through.** A row can be deleted between an `items.list` call and the
+   `items.info` call that follows it. `items.info` surfaces that as `record_deleted`,
+   `record_not_found`, `row_not_found`, or `invalid_row_id` — not as a schema-read failure. Catch
+   that family specifically and walk to the next candidate in the anchor order, bounded to a
+   small number of probes (~5) so a pathological run cannot loop forever. These four codes are
+   distinct from `list_not_found`, which stays fail-closed: that means access to the List itself
+   is gone, and no amount of retrying a different row id fixes it.
+3. **Eviction.** Once the List carries any real row, the sentinel has served its purpose: delete
+   it and clear its stored id. Order matters — **persist-first**: leave the sentinel id recorded
+   while you delete the row in Slack, and clear the stored id only after that delete call
+   succeeds. Clearing the id first and then failing the delete orphans a blank row whose id you
+   no longer know, forever. Persist-first recovers in both failure directions on the next tick —
+   a failed delete simply retries against the same known id, and a failed id-clear simply
+   re-deletes a row that is already gone (a `record_deleted` you can treat as success).
+4. **Don't recreate what an operator removed by hand.** If an operator deletes the sentinel while
+   real rows remain, leave it deleted — anchor order already falls through to a real row on the
+   next run. A List that later empties out re-creates a sentinel on its own, via step 1 above, on
+   the next tick that needs one. The blank row then exists only for as long as nobody is looking
+   at an empty List.
+5. **Name the argument correctly.** `items.info` takes the row id as `id`, alongside `list_id` —
+   not `row_id`, which is what `items.update`'s `cells[]` entries use for the same concept.
+   Mixing the two up silently drops the argument in some client shapes rather than raising a type
+   error, so it is worth getting right the first time.
 
 ```typescript
-// Created once, alongside the list, and never touched again except as
-// the fixed target for items.info schema/limit reads.
-const SENTINEL_ROW_ID = "Rec0SENTINEL01"; // persisted at list-creation time
+// Stored per list. Recorded when a sentinel is created (step 1), cleared once
+// the List carries a real row (step 3), and re-created on demand if the List
+// empties out again (step 4) — never a fixed, permanent id.
+let sentinelRowId: string | null = await loadSentinelRowId(listId);
+
+// items.info takes the row id as `id`, not `row_id` — see step 5 above.
+const res = await fetch("https://slack.com/api/slackLists.items.info", {
+  method: "POST",
+  headers: {
+    authorization: `Bearer ${botToken}`,
+    "content-type": "application/json; charset=utf-8",
+  },
+  body: JSON.stringify({ list_id: listId, id: sentinelRowId }),
+});
 ```
 
 :::note
