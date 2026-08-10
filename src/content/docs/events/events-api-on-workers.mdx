@@ -82,11 +82,83 @@ check on that (a short-TTL KV or D1 row is enough) and return 2xx for an
 `event_id` you've already handled instead of erroring, since an error just
 spends another retry without changing the outcome.
 
-:::tip[Also skip your own bot's messages]
-Message events fired by your own bot user come back through the same
-subscription. Check `event.bot_id` (or compare against your bot's user ID)
-before acting, or a bot that posts in response to messages can end up
-triggering itself in a loop.
+### Delivery Identity vs. Domain Identity
+
+The `event_id` dedupe above suppresses one thing: the same *delivery
+envelope* landing on your endpoint twice. It says nothing about the
+underlying *fact* the envelope describes. A user removing and re-adding
+the same reaction mints a fresh `event_id` for each `reaction_added`
+event -- two envelopes, one action worth reacting to once. And in a
+hybrid push-plus-poll design, the same fact can show up a third way: a
+polling sweep that reads current state observes it with no event at all.
+
+Layer a second key underneath the envelope key. A UNIQUE constraint on
+`event_id` suppresses redelivery of one envelope; a second UNIQUE
+constraint on the fact itself -- e.g. `(channel, message_ts, reaction,
+user)` for a reaction -- collapses distinct envelopes *and* poll-path
+observations into a single side effect:
+
+```sql
+CREATE TABLE reaction_dedupe (
+  event_id TEXT PRIMARY KEY,
+  channel TEXT NOT NULL,
+  message_ts TEXT NOT NULL,
+  reaction TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  UNIQUE (channel, message_ts, reaction, user_id)
+);
+```
+
+An `INSERT ... ON CONFLICT DO NOTHING` against this table only succeeds
+once per `(channel, message_ts, reaction, user_id)` tuple, regardless of
+which `event_id` it arrived under -- or whether it arrived under an event
+at all.
+
+### A Durable Ledger for Must-Eventually-Happen Side Effects
+
+Dedupe-and-skip is enough when losing a duplicate is harmless. Some side
+effects are the opposite: dropping the *first* attempt is the failure you
+can't tolerate, because the work has to happen eventually even if the
+immediate delivery attempt fails outright.
+
+Upgrade to a durable ledger: in one D1 insert, atomically record the
+`event_id` *and* the work to be done (`INSERT ... ON CONFLICT (event_id)
+DO NOTHING`), ack 200, then attempt the delivery as background work. A
+failed or interrupted attempt leaves that ledger row undelivered -- it
+doesn't vanish -- and a cron sweep reconciles the table on a schedule,
+retrying whatever is still marked undelivered. The immediate
+`waitUntil()` attempt is an optimization for the common case; the cron is
+the correctness backstop for the case where it doesn't land. The
+fact-identity key from above still applies here, so a cron retry that
+fires alongside a fresh event for the same underlying fact collapses into
+the one ledger row instead of doing the work twice.
+
+Be honest about what this does and doesn't close: the external call
+succeeding and the ledger row being marked delivered are two separate
+operations, not one atomic one. A crash between them leaves the row
+looking undelivered when the side effect actually already happened, and
+the cron retries it -- so this is an *at-least-once* guarantee for the
+outbound side effect, not exactly-once. Design the side effect itself to
+tolerate a duplicate call (or dedupe it downstream) rather than assuming
+the ledger alone makes it safe to run once. See
+[The 3-Second Ack](../worker-backend/three-second-ack.mdx) for the fuller
+outbox-pattern treatment of this same ledger-plus-cron shape.
+
+:::tip[Filter your bot's own events by `bot_id`, not `subtype`]
+A bot installed with granular (modern `xoxb`) permissions posts messages
+that carry `bot_id` but **no `subtype` at all** -- a filter that only
+checks `subtype === "bot_message"` lets those posts straight through, and
+a bot that reads the channel it writes to ends up triggering itself in a
+loop. Treat `bot_id` presence as the primary signal that a message is the
+bot's own; keep the `subtype` check only as a fallback for classic-token
+apps that still set it. Apply the same rule when reading messages back
+through `conversations.history` or `conversations.replies`, not just on
+the live event stream.
+
+The bot's own `reactions.add` calls come back too, through the same
+`reaction_added` subscription, but reaction events carry no `bot_id` to
+filter on -- keep the bot's own user ID in config (separate from the
+token) and compare it against the event's `user` field instead.
 :::
 
 ## Subscription Scopes vs. Event Types
