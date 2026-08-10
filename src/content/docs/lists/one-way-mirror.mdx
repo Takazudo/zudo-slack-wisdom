@@ -26,29 +26,48 @@ graph LR
 
 ## Mechanics checklist
 
-### 1. The bot creates the list itself
+### 1. How the bot gets write access: two real routes, and one dead end
 
-Have the bot call `slackLists.create` rather than having a human create the list and share it
-with the bot afterward. This resolves two problems at once:
+**Route A — the bot creates the list itself** (the simpler default). Have the bot call
+`slackLists.create` rather than having a human create the list and share it with the bot
+afterward. This resolves two problems at once:
 
 - **You choose the option slugs.** Neutral ASCII values (e.g. `todo` / `doing` / `done`) under
   whatever display label you want — the value/label mismatch problem (chasing opaque
   `Opt…`-style slugs a human assigned) disappears entirely.
-- **Access is implicit for the creator.** How a bot gets write access to a list it did **not**
-  create is genuinely undocumented — `slackLists.access.set` accepts only `user_ids` or
-  `channel_ids`, with no `app_ids` or bot argument anywhere in its signature. A creator has
-  access to what it created; that is the only access route with no open question attached.
+- **Access is implicit for the creator.** A creator has access to what it created, with no
+  extra grant call required.
 
-:::warning[Unverified]
-Whether a bot can be granted write access to a list a *human* created — by passing the bot's
-own user ID into `access.set`'s `user_ids`, or by sharing into a channel the bot belongs to — is
-undocumented. One community report shows `list_not_found` from `items.update` despite a
-channel share (a pre-GA, workflow-token context, so not fully conclusive for a modern `xoxb`
-bot token). This project's verification spike, which would have settled it against a live
-workspace, was skipped. **Do not plan around "human creates it, shares it with the bot" until
-you have proven that path yourself with a throwaway call** — bot-creates-the-list sidesteps the
-question entirely.
-:::
+**Route B — the operator owns the List and grants the bot EDIT access through the List's own
+Share UI.** This route is production-exercised: the operator creates and configures the List by
+hand — views, board layout, group-by, and localized labels all stay under human ownership, see
+[Permissions and Ownership](./permissions.mdx) for the full ownership-topology tradeoffs — then
+opens that specific List's Share dialog and grants the bot's user **edit** access directly. This
+grant is a distinct mechanism from both `slackLists.access.set` (the API route — its `user_ids` /
+`channel_ids` arguments have no `app_ids` equivalent for handing a bot access to a list it did
+not create) and from sharing the List into a channel the bot happens to belong to. **State this
+plainly: a List being shared into a channel that contains the bot proves NOTHING about the bot's
+edit access to that List** — channel membership and the per-List Share grant are separate
+permission surfaces, and conflating them is the most common way this setup silently fails.
+Scopes alone are insufficient either way: a bot holding `lists:write` that was never granted
+through the Share UI still gets `list_not_found` or an access error the moment it calls
+`items.create` / `items.update` against that List.
+
+Corollary for Route B: because the operator, not the bot, chose every column and option slug
+when creating the List, **the bot must resolve every column ID and option ID at runtime from
+`items.info`** — anchored on any known row, per [Reading Lists](./reading-lists.mdx) — **and
+register them in its own configuration**, never assuming a slug it would have picked itself at
+create time. This is the direct cost of not being the creator, and the mirror image of Route A's
+"you choose the option slugs" property.
+
+Keep Route A as the simpler default. Whichever route you use, **mandate a live probe with the
+real bot token before enabling row writes** — one throwaway `items.create` / `items.update` call
+against the real list, confirming an `ok: true` response — and keep row registration disabled in
+configuration until that probe passes. Route A's access is implicit and lower-risk; Route B's
+Share grant is a manual UI action a human can get wrong, so the probe is what actually confirms
+it before the cron starts writing. The rest of this checklist (steps 2–7) is written for Route
+A's defaults — on Route B, substitute the operator-supplied `list_id` and the runtime-resolved
+`column_id`s wherever a step assumes the `slackLists.create` response.
 
 ### 2. Grant read access to the channel
 
@@ -59,8 +78,9 @@ matters, and for the "Only you can share" setting to enable right after.
 ### 3. Persist `list_id`, every `column_id`, and every `row_id`
 
 Nothing here is rediscoverable without an extra call — see
-[Reading Lists](./reading-lists.mdx) for the `items.info` sentinel-row pattern that recovers
-this mapping if it is ever lost:
+[Reading Lists](./reading-lists.mdx) for how to recover this mapping if it is ever lost: any
+known row anchors an `items.info` schema/limits read, and a one-time sentinel row is only a
+bootstrap-only fallback for before any real row exists — it gets evicted once real rows arrive:
 
 - `list_id` and each written `column_id`, from the `slackLists.create` response.
 - `row_id` per mirrored source row, from `slackLists.items.create` — persisted to your own
@@ -176,6 +196,31 @@ Separately, `items.create`'s rate tier is itself contested between two Slack-off
 (docs say Tier 2, the Java SDK's machine-readable rate-limit metadata says Tier 3) — assume the
 stricter Tier 2 when sizing a backfill, as the table above does.
 :::
+
+## Rate limits inside a cron tick
+
+"Honor `Retry-After`" is the standard advice for a rate-limited call, but a Worker cron tick
+cannot sleep for an arbitrary server-chosen duration — a tick has a fixed execution budget, and
+blocking it on Slack's clock either blows that budget or delays every other list the same tick
+was meant to service.
+
+**Deferral, not sleep, is the pattern.** The moment one row in a batch comes back rate-limited,
+stop processing the rest of that batch immediately — do not keep working through the remaining
+rows at a slower pace. Compute `next_attempt_at` as the max of your own backoff ladder and the
+`Retry-After` value, and persist it in two places: on the specific work row that was
+rate-limited, and on the list's own registration record. The next cron tick checks the
+list-level timestamp first and skips the entire list until it passes — a single rate-limited
+call defers the whole list, not just the one row.
+
+Reserve small, bounded in-call retries for interactive and probe paths only — a human waiting on
+a UI action, or the live-access probe from the section above — and only when `Retry-After` is
+short (roughly ≤60s) and capped at ~2 attempts. **The scheduled cron path runs with zero
+in-call retries**; it always defers instead.
+
+Ordinary (non-rate-limit) failures get their own persisted backoff ladder — for example
+1 minute → 5 minutes → 30 minutes — rather than the rate-limit deferral above. After N attempts
+on that ladder, dead-letter the row: give it a far-future sentinel `next_attempt_at` so it stops
+consuming tick budget, but leave it queryable and inspectable rather than silently dropping it.
 
 ## What read-only does not give you
 
