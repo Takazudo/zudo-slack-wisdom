@@ -1,12 +1,12 @@
 ---
 title: エラーリファレンス
-description: slackLists.items.update の分岐に使えるエラーコードと、その原因および背景
+description: Lists API 全体にまたがる、カテゴリ駆動で分岐できるエラーコードと、その原因・背景・本番運用ハンドリング方針
 sidebar_position: 9
 ---
 
 ## 概要
 
-`slackLists.items.update` は失敗時に `{"ok": false, "error": "<code>"}` を返す。このページはドキュメント化されたエラーコードを原因ごとにまとめる。これにより Worker は、`ok` でないレスポンスをすべて同じように扱うのではなく `body.error` で分岐できる。
+`slackLists.items.update` をはじめとする Lists の他の書き込み・読み取りメソッドは、いずれも失敗時に `{"ok": false, "error": "<code>"}` を返す。このページは、`items.update` だけでなくこの節で扱うすべての `slackLists.*` メソッドにまたがって、ドキュメント化されたエラーコードを原因ごとにまとめる。これにより Worker は、`ok` でないレスポンスをすべて同じように扱うのではなく `body.error` で分岐できる。その分岐を実際のリトライ／停止／アラートの方針に落とし込む方法は、後述の[「本番運用のエラーハンドリング」](#本番運用のエラーハンドリング-コードではなくカテゴリで分岐する)を参照。
 
 ## 全一覧
 
@@ -16,16 +16,23 @@ sidebar_position: 9
 | `invalid_input_type` | カラムの型に対して値キーが違うか、配列が必要な場所に裸のスカラーを渡した |
 | `invalid_array_arg` | 配列の引数が壊れている — たいていは JSON ではなくフォームエンコードのボディを送っている |
 | `invalid_column_id` / `column_not_found` | 永続化した `column_id` が古い |
-| `invalid_row_id` / `row_not_found` | 永続化した `row_id` が古い |
+| `invalid_row_id` / `row_not_found` | 永続化した `row_id` が古い（`items.update` から） |
+| `record_not_found` / `record_deleted` | `items.info` における行欠落のスペリング — `row_not_found` / `invalid_row_id` と同じ意味だが、メソッドも表記も異なる |
+| `duplicated_item_not_found` | `items.create` の複製元の行が見つからない |
 | `column_id_not_provided` | セルに `column_id` がない（かつ、ドキュメント化されていない `column_id_to_create` も渡していない） |
 | `uneditable_column` | 対象が計算列（`created_by`、`last_edited_by`、`created_time`、`last_edited_time`）である |
 | `over_cell_fields_limit` | 1 回の呼び出しに含まれるセルが多すぎる（ドキュメント JSON では `maxItems: 100`） |
 | `over_row_maximum` | リストあたりのアイテム数の上限に達した（create 経路。この上限を示す唯一の権威あるシグナル） |
+| `list_item_limit_exceeded` / `list_row_limit_exceeded` / `too_many_items` / `too_many_records` | 元調査が挙げた容量エラーの別スペリング。**未確認** — 下記のタクソノミーの注記を参照 |
 | `list_not_found` | `list_id` が不正 — アクセス失敗の場合にも返る、後述 |
 | `no_permission` / `access_denied` / `permission_denied` | bot トークンがこのリストへのアクセス権を持っていない |
+| `team_access_not_granted` | トークンが必要なワークスペースアクセス権を持っていない — `items.update` に限らずほとんどの `slackLists.*` メソッドに現れる |
 | `paid_teams_only` | ワークスペースが無料プランである — リストは有料プランの機能 |
 | `lists_disabled_user_team` | 管理者がそのワークスペースでリストを無効化している（上のプランゲートとは別物） |
+| `archive_not_supported` | `items.list` のアーカイブ済みアイテムクエリに関するプラン段階のエラー — 呼び出し元のプランではアーカイブフィルタが使えない |
 | `missing_scope` | トークンに `lists:write` スコープがない |
+| `not_allowed_token_type` | このメソッドに対してトークンの種類が違う（bot トークンが必要なところにユーザートークンを使った、あるいはその逆） |
+| `not_authed` / `invalid_auth` / `token_expired` / `token_revoked` | `not_allowed_token_type` と並ぶ、より広いトークン認証系のエラー群 — トークンがない、検証に失敗する、期限切れ、失効済みのいずれか |
 | `invalid_blocks` / `invalid_text_block` | text / notes カラムに対する `rich_text` セルの形が不正 |
 | `ratelimited` | レート制限に達した — `Retry-After` ヘッダーに従うこと |
 
@@ -40,21 +47,26 @@ sidebar_position: 9
 
 ## 古い ID に起因するエラー
 
-`invalid_column_id` / `column_not_found` と `invalid_row_id` / `row_not_found` は、いずれも永続化した ID がもはや解決できないことを意味する。リストの構造を再発見する `slackLists.info` も `slackLists.list` も存在せず、「外部キーで行を探す」エンドポイントもないため、古い `row_id` からの唯一の復旧手段は、リストをページネーションで全件読み出し、自分の主キーを格納している場所（たとえばソース行の ID を写しているテキストカラム）からマッピングを再構築することだ。古い `column_id` は、リストのスキーマが自分の知らないところで変わったことを意味する — `items.info` 経由で `list_metadata.schema` を読み直すこと。
+`invalid_column_id` / `column_not_found` と `invalid_row_id` / `row_not_found` は、いずれも永続化した ID がもはや解決できないことを意味する。`items.info` は同じ行欠落の状態を独自のスペリング、`record_not_found` と `record_deleted` で報告する — 原因は同じでもメソッドと表記が違うため、どちらのメソッドで表面化したかにかかわらず古い row id を捕まえるには、コードマッチングの分岐は両方のファミリーをチェックする必要がある。`items.create` の `duplicated_item_not_found` は、一段階手前で起きる同じ種類の問題だ — 複製元として指定した行そのものが既にない。
+
+リストの構造を再発見する `slackLists.info` も `slackLists.list` も存在せず、「外部キーで行を探す」エンドポイントもないため、古い row id からの唯一の復旧手段は、リストをページネーションで全件読み出し、自分の主キーを格納している場所（たとえばソース行の ID を写しているテキストカラム）からマッピングを再構築することだ。古い `column_id` は、リストのスキーマが自分の知らないところで変わったことを意味する — `items.info` 経由で `list_metadata.schema` を読み直すこと。
 
 ## 権限とアクセスのエラー
 
 `list_not_found` は多義的だ：汎用的な「`list_id` が不正」というエラーであると同時に、トークンの保持者が正当なリストへのアクセス権を欠いているときに `items.update` が返すものでもある — リストが bot のチャンネルへ共有されていたにもかかわらずまさにこれが起きたという、コミュニティの報告（[slackapi/deno-slack-sdk#472](https://github.com/slackapi/deno-slack-sdk/issues/472)）がある。`list_not_found` が常に ID の打ち間違いや削除を意味すると決めつけないこと。アクセスの問題である可能性もある。このエラーを判別しにいく代わりに、bot がリストを作ることでアクセスの問題そのものを回避できる理由は [select カラム](./select-columns.mdx#bot-がリストを作るパターン)を参照。
 
-`no_permission`、`access_denied`、`permission_denied` はより直接的なアクセス拒否のファミリーであり、後述のプランゲートやスコープのエラーとは別物だ。
+`no_permission`、`access_denied`、`permission_denied` はより直接的なアクセス拒否のファミリーであり、後述のプランゲートやスコープのエラーとは別物だ。`team_access_not_granted` は名前こそ違うが同じファミリーで、トークンのワークスペースレベルのアクセスがそのリストをカバーしていないとき、`items.update` に限らずほとんどの `slackLists.*` メソッドで現れる。
+
+`list_not_found` は「ID が不正」と「アクセスの問題」のどちらの意味にもなり得て、ワイヤー上ではどちらか判別できないため、[下記のカテゴリタクソノミー](#本番運用のエラーハンドリング-コードではなくカテゴリで分岐する)ではこれを独自のカテゴリ `access_or_stale_id` として扱い、上の古い ID のグループにも、ここのアクセス拒否ファミリーにも押し込めない。
 
 ## プランとスコープのエラー
 
-ゲートの対象が異なる 3 つのエラーがあり、これらは混同しやすい：
+ゲートの対象が異なる 4 つのエラーがあり、これらは混同しやすい：
 
 - `paid_teams_only` — ワークスペース自体が無料プランである。リストには有料プランが必要だ。
 - `lists_disabled_user_team` — ワークスペースは有料だが、ワークスペースの管理者がリストをオフにしている。これは課金の状態ではなく管理者トグルであり、Worker のエラーハンドリングの分岐から見ると、明示的に両方をチェックしない限り 2 つのエラーは同じに見えてしまう。
-- `missing_scope` — トークン自体に `lists:write` がない。上の 2 つと違い、これはワークスペース管理者が制御する何かではなく、正しいスコープでアプリを再インストールすれば解決する。
+- `archive_not_supported` — `items.list` のアーカイブ済みアイテムクエリが呼び出し元のプランでは使えない。上の 2 つとは別の、より狭いプランゲートだ。
+- `missing_scope` — トークン自体に `lists:write` がない。上のエラーと違い、これはワークスペース管理者やプラン段階が制御する何かではなく、正しいスコープでアプリを再インストールすれば解決する。
 
 ## リッチテキストのエラー
 
@@ -64,6 +76,33 @@ sidebar_position: 9
 
 `slackLists.items.update` は **Tier 3（50+ リクエスト/分）** に位置し、これはドキュメントと Java SDK の機械可読な [`rate_limit_tiers.json`](https://github.com/slackapi/java-slack-sdk/blob/main/metadata/web-api/rate_limit_tiers.json) の両方が示すところで、このメソッドについては 2 つのソースが一致している。`ratelimited` は再試行までに何秒待つべきかを示す `Retry-After` ヘッダーを伴う。即座に再試行したり固定間隔で再試行したりせず、これに従うこと。
 
+## 本番運用のエラーハンドリング — コードではなくカテゴリで分岐する
+
+エラーの文字列そのもので分岐する Worker は、コード 1 つにつき同じ一握りの方針を何度も再導出する羽目になる。すべてのコードをまず小さなカテゴリタクソノミーへマッピングし、リトライ／停止／アラートの方針をその *カテゴリ* で駆動するほうが堅牢だ — Slack が後から追加する新しいコードも、デフォルト扱いに落ちるのではなく既存のバケットに収まる。
+
+| カテゴリ | コード | 方針 |
+|---|---|---|
+| `scope` | `missing_scope` | 恒久的な設定エラー |
+| `auth` | `not_allowed_token_type`、`not_authed`、`invalid_auth`、`token_expired`、`token_revoked` | 恒久的な設定エラー |
+| `access` | `no_permission`、`access_denied`、`permission_denied`、`team_access_not_granted` | 恒久的な設定エラー |
+| `access_or_stale_id` | `list_not_found` | 恒久的な設定エラー |
+| `schema` | `invalid_option_id`、`invalid_column_id` / `column_not_found`、`uneditable_column`、`column_id_not_provided`、`invalid_input_type`、`invalid_array_arg`、`invalid_blocks` / `invalid_text_block` | 恒久的な設定エラー |
+| `plan` | `paid_teams_only`、`lists_disabled_user_team`、`archive_not_supported` | 恒久的な設定エラー |
+| `capacity` | `over_row_maximum`、`over_cell_fields_limit`、および未確認の `list_item_limit_exceeded` / `list_row_limit_exceeded` / `too_many_items` / `too_many_records` のスペリング | 恒久的な設定エラー（リトライではなく上限・設計側の修正が必要 — [アイテム上限と自動アーカイブ](./item-caps.mdx)を参照） |
+| `stale_id` | `invalid_row_id` / `row_not_found`、`record_not_found` / `record_deleted`、`duplicated_item_not_found` | 照合（reconciliation）に回す |
+| `transient` | `internal_error`、`fatal_error`、`service_unavailable`、`request_timeout` | バックオフ |
+| `rate_limit` | `ratelimited` | バックオフ |
+
+最初の 6 行 — `scope`、`auth`、`access`、`access_or_stale_id`、`schema`、`plan` — に `capacity` を加えたものはすべて **恒久的な設定エラー** だ。次の試行でリクエストの何かが変わるわけではないので、リトライでは直らない。これらのカテゴリのいずれかのコードを受け取ったら、その List の登録を unhealthy とマークし、そのリストへの同期を止め、アラートを上げること — 人間（あるいはスキーマドリフトの再デプロイ、[スキーマの可変性](./schema-mutability.mdx#ドリフトを能動的に検知する)を参照）が何かを変えない限り、同期を安全に再開できない。
+
+`transient` と `rate_limit` はその逆で、バックオフしてリトライする。`ratelimited` はどれだけ待つべきかを示す `Retry-After` ヘッダーを伴うが、汎用のサーバーエラー系（`internal_error`、`fatal_error`、`service_unavailable`、`request_timeout`）にはそれがないので、上限付きの指数バックオフを使うこと。
+
+`stale_id` はそのどちらでもない — 止めるべき設定の問題でもなければ、ただリトライで押し通せばいいノイズでもない。ローカルに永続化した ID がもう解決しなくなったことを意味しており、これはまさに[照合パス](./no-events-no-idempotency.mdx)が正すべきシグナルだ。同期全体を止めたり同じ古い ID を闇雲にリトライしたりするのではなく、次の照合サイクルにフィードしてマッピングを再構築すること。
+
+:::warning[ログや応答に出す前にエラーコードをサニタイズする]
+`body.error` はこちらが送ったリクエストを反映したレスポンスデータであり、信頼できる enum ではなく攻撃者が影響を与えられるものとして扱うこと — 特にログ行やアラートのペイロード、オペレーターがエスケープなしで見る可能性のある場所へ書き込む前に。ログや応答に出す前に `^[a-z0-9_]{1,80}$` に対して検証し、これに一致しないものは生の文字列をそのまま通すのではなく、汎用の「未知のエラー」ラベルにフォールバックすること。
+:::
+
 ## 関連
 
-これらのエラーが適用されるリクエスト／レスポンスの契約は[リストアイテムへの書き込み](./writing-cells.mdx)を参照。`invalid_option_id` の背後にある select の値のルールは [select カラム](./select-columns.mdx)を参照。スキーマ自体が API 由来の変更のほとんどに対して閉じている理由は[スキーマの可変性](./schema-mutability.mdx)を参照。
+これらのエラーが適用されるリクエスト／レスポンスの契約は[リストアイテムへの書き込み](./writing-cells.mdx)を参照。`invalid_option_id` の背後にある select の値のルールは [select カラム](./select-columns.mdx)を参照。スキーマ自体が API 由来の変更のほとんどに対して閉じている理由は[スキーマの可変性](./schema-mutability.mdx)を参照。容量エラー `over_row_maximum` が何を意味し、通常運用でこれを発火させない方法については[アイテム上限と自動アーカイブ](./item-caps.mdx)を参照。
