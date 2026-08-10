@@ -1,0 +1,410 @@
+---
+title: 有効化ゲートのプローブ
+description: 準備済みリスト 1 つにつき 1 本の、可逆で依存ゼロのプローブ。その無害化された PASS 出力が本番書き込みの解禁を判定する
+sidebar_position: 10
+---
+
+このセクションのどのページも、最後には同じ壁に突き当たり、同じ指示を出す — 依存する前に経験的に確認すること。すでに値が入っている select セルに 2 つ目の値を書いたとき、置き換わるのか追記されるのか。bot トークンが、自分で作ったわけではないリストに対して本当に書き込み権限を持っているのか。テキストカラムに書き込んだ https リンクが、読み戻したときにそもそもリンクのまま残るのか。どれもドキュメントを読み込めば決着する話ではない。そもそもドキュメントから抜け落ちているのが、これらだからだ。
+
+ある本番リファレンス実装は、これらすべてを同じやり方で決着させている。準備したリスト 1 つにつき小さなプローブスクリプトを 1 本用意し、オペレーターが実際のワークスペースに対して一度だけ実行する。そして、そのスクリプトが出力した判定こそが機能を解禁する鍵になる。このページはそのパターンそのものだ — 手順の並び、可逆性のルール、出力の衛生管理、そして PASS した実行がどの未検証の主張を退役させてよいのか。
+
+## ゲート
+
+仕組みは習慣ではなくフラグだ。
+
+- アプリのリスト書き込みは**デフォルトオフ**で出荷する — 本番を含むすべての環境でオフの設定フラグ。
+- フラグを立てられるのは、その特定のリストに対するライブ実行が `PASS` **と**クリーンアップ確認マーカーの両方を出力したあとだけ。
+- プローブの出力はそのまま変更記録に貼り付ける。証拠は出力そのものであって、「自分の環境では動いた」という誰かの記憶ではない。
+
+「無害化されている」とは、貼り付ける前に誰かが施す工程のことではない。後述の衛生ルールにより、トークンもセルの中身もそもそも出力に到達しない。共有する前に手で編集しなければ安全にならない出力は、いずれ編集されないまま貼り付けられる。
+
+## プローブの形
+
+性質は 4 つ。どれも効いている。
+
+**準備済みリスト 1 つにつき 1 回の実行。** 証拠が及ぶ範囲は、1 つのリスト ID、1 つのトークン、1 つのスキーマだけだ。ステージングのリストに対する PASS は本番のリストについて何も語らない。両者は別の ID を持ち、オプション集合も別々に編集される別物のリストだ。
+
+**依存ゼロで、ゲート対象のアプリからは何ひとつ import しない。** `slack.com/api` に `fetch` だけで話しかける 1 ファイル — SDK なし、ビルドステップなし、共有ヘルパーモジュールなし。プローブがアプリ自身の Slack レイヤーを経由していたら、そのレイヤーのバグはプローブとアプリを「両方とも間違ったまま一致」させてしまう。しかもプローブは、アプリが信頼される*前*に走らせるものだ。
+
+**オペレーターが実行し、トークンはその作業かぎり。** CI でもなければ、アプリの保管済み認証情報でもない。オペレーターが実行中だけトークンを保持し、終わったら破棄する。プローブを CI に組み込むということは、リストの生涯で数回しか走らないチェックのために、長命な `lists:write` トークンをシークレットストアに置き続けるということだ。
+
+**構造として可逆。** プローブが触るのは、その実行中に自分で作った行だけだ。既存の行を read-modify-write することはなく、リストのメタデータも編集せず、`access.set` も呼ばない。最悪の結果は「行が 1 つ取り残される」ことであって、リストが壊れることではない — しかもその取り残しは、静かにではなく大きな声で表面化する。
+
+## ステップの並び
+
+| # | 呼び出し | それが立証すること |
+|---|---|---|
+| 1 | `items.list` | そもそもこのトークンでこのリストに到達できること — 読み取り権限もリスト ID も実在する |
+| 2 | `items.create`、`initial_fields` なし | 空行の挿入が通ること、そして次のステップが要求する行 ID が手に入ること |
+| 3 | `items.info` | 実際のスキーマ — カラム ID、型、各 select カラムのオプション集合 |
+| 4 | *(ローカル)* ラベルをオプション値に解決 | この環境が設定しているラベルが、実際のオプション集合に存在すること |
+| 5 | `items.update` — 3 セル、1 行、1 回の呼び出し | 1 行に対する複数セルの書き込みが 1 回の呼び出しとして受理されること |
+| 6 | `items.info` + アサート | 3 つの値がすべて着地し、リンクがリンクのままであること |
+| 7 | `items.update` — select を切り替え | 次のアサーションの前提を作る。それ以外は何も変えない |
+| 8 | `items.info` + ちょうど 1 つの値をアサート | select の書き込みは**置換**であって追記ではないこと |
+| 9 | `finally` の中の `items.delete`、そして確認 | 行が「削除したと報告された」ではなく、実際に消えていること |
+
+1〜8 が実験そのもので、9 はその実験を実ワークスペースに対して行うことを許容可能にするための手順だ。
+
+### なぜ空行を最初に作るのか
+
+[`items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/) はスキーマを読み戻す唯一の手段でありながら `row_id` を要求する — 尋ねるための行をすでに持っていないかぎり、「このリストはどんな形か」とは訊けない。準備したばかりのリストには、名指しできる行がない。そこでプローブが自分で 1 つ作る。[`items.create`](https://docs.slack.dev/reference/methods/slackLists.items.create/) に `list_id` だけを渡す。この空行が `items.info` の入場料であり、同時に以降のすべてのステップが書き込む行であり、クリーンアップが削除する行でもある。
+
+ステップ 2 がそのまま拒否された場合は、`initial_fields` にタイトルセルを 1 つだけ載せて行を作る方法にフォールバックする — そしてその拒否を記録すること。「空の create が通る」は、この実行が退役させるはずだった 4 つの主張のうちの 1 つだからだ。
+
+### 3 つのセル、なぜその 3 つなのか
+
+ステップ 5 は、同じ行に対するちょうど 3 つのセルを 1 つの `cells[]` 配列で書き込む。
+
+- **タイトルカラム** — リストの主テキストカラムへの `rich_text` 書き込み。実際の同期処理が使うのとまったく同じ形だ。
+- **テキスト / notes カラム** — その実行の識別マーカーに続けて https の `link` 要素を置く。リンクはアサーションそのものだ。読み戻したときにリンク要素として残るのか、それともプレーンテキストに潰されるのか。マーカーのほうは運用上の安全網で、万一クリーンアップが失敗したとき、取り残された行が「自分が何で、いつ作られたのか」を、見つけた人の目に見える形で名乗ってくれる。
+- **select カラム** — 設定された 1 つ目のオプションを入れておく。ステップ 7 に上書き対象を与えるためだ。
+
+1 つではなく 3 つのセルにするのは意図的だ。1 行に対する複数セル書き込みそのものが検証対象の主張の 1 つであり、同じ呼び出しに畳み込んでしまえば追加コストはゼロで済む。
+
+## トランスポートヘルパー
+
+Slack と話すのは 1 つの関数だけ。ここはトークンを扱う唯一の場所でもあり、それが「トークンを絶対に出力しない」を、人が守るルールではなくコードの性質にしている。
+
+```ts
+const SLACK_API_BASE_URL = "https://slack.com/api";
+
+type SlackResult = { ok: boolean; error?: string; [key: string]: unknown };
+
+// Slack echoes the token's ACTUAL granted scopes on every Web API response.
+// That is a different question from what the app manifest requests -- adding a
+// scope takes an OAuth reinstall -- and it is the first thing you want when
+// step 1 comes back missing_scope.
+let grantedScopes: string | null = null;
+
+async function callSlack(
+  method: string,
+  token: string,
+  args: Record<string, unknown>,
+  opts: { allowNotOk?: boolean } = {},
+): Promise<SlackResult> {
+  const res = await fetch(`${SLACK_API_BASE_URL}/${method}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(args),
+  });
+  grantedScopes = res.headers.get("x-oauth-scopes") ?? grantedScopes;
+
+  // Slack answers HTTP 200 with {"ok": false} on failure.
+  const body = (await res.json()) as SlackResult;
+  // Method name and verdict only: never the arguments, never the response body.
+  console.log(`${method}: ${body.ok ? "ok" : `error=${body.error}`}`);
+
+  if (!body.ok && opts.allowNotOk !== true) {
+    throw new Error(
+      `${method} failed: ${body.error} (token grants: ${grantedScopes ?? "unknown"})`,
+    );
+  }
+  return body;
+}
+```
+
+## 読み戻しのフィールド名を 1 か所に集める
+
+プローブが依存する読み取り側のフィールド名は、すべて 1 つのブロックに置く。これは几帳面さではなく、意図的な封じ込めだ。
+
+:::warning[未検証]
+Slack のドキュメントが確定させているのはセルの**書き込み**の形であって、`items.info` の行のエンベロープをフィールド単位で明示してはいない。以下のアクセサは書き込み側の名前に倣ったものであり、実際にそれを裏づけるのは最初のライブ実行だ。1 か所に集めておけば、名前の食い違いは「明らかな 1 か所の修正」として現れる — アサーション全体に散らばった `undefined` チェックにはならない。
+:::
+
+```ts
+type RichTextElement = { type: string; text?: string; url?: string };
+type RichTextBlock = { elements: { elements: RichTextElement[] }[] };
+type Cell = { column_id: string; select?: string[]; rich_text?: RichTextBlock[] };
+type Column = {
+  id: string;
+  name: string;
+  options?: { choices?: { value: string; label: string }[] };
+};
+
+const schemaOf = (res: SlackResult): Column[] =>
+  (res.list as { list_metadata?: { schema?: Column[] } })?.list_metadata?.schema ?? [];
+
+const cellOf = (res: SlackResult, columnId: string): Cell | undefined =>
+  ((res.item as { fields?: Cell[] })?.fields ?? []).find((c) => c.column_id === columnId);
+
+const selectValuesOf = (res: SlackResult, columnId: string): string[] =>
+  cellOf(res, columnId)?.select ?? [];
+
+const elementsOf = (res: SlackResult, columnId: string): RichTextElement[] =>
+  (cellOf(res, columnId)?.rich_text ?? [])
+    .flatMap((block) => block.elements)
+    .flatMap((section) => section.elements);
+
+const textOf = (res: SlackResult, columnId: string): string =>
+  elementsOf(res, columnId)
+    .filter((el) => el.type === "text")
+    .map((el) => el.text ?? "")
+    .join("");
+
+const linkUrlsOf = (res: SlackResult, columnId: string): string[] =>
+  elementsOf(res, columnId)
+    .filter((el) => el.type === "link")
+    .map((el) => el.url ?? "");
+
+function columnIdByName(schema: Column[], name: string): string {
+  const column = schema.find((c) => c.name === name);
+  if (!column) throw new Error(`no column named "${name}" in the live schema`);
+  return column.id;
+}
+
+// The write path takes choices[].value -- the machine slug -- never the label
+// a human reads off the chip. This resolution is the whole reason step 4 runs
+// before any write: a stale label in config fails here, not as invalid_option_id
+// on a cron tick three weeks later.
+function optionValueByLabel(schema: Column[], columnId: string, label: string): string {
+  const choice = schema
+    .find((c) => c.id === columnId)
+    ?.options?.choices?.find((c) => c.label === label);
+  if (!choice) throw new Error(`no option labelled "${label}" on column ${columnId}`);
+  return choice.value;
+}
+```
+
+## プローブ本体
+
+エントリポイントが受け持つのは 3 つ。空行の作成、クリーンアップの実行を保証する `try`/`finally`、そしてゲートの証拠となる 2 つのマーカーだ。
+
+```ts
+interface ProbeConfig {
+  titleColumnName: string;
+  notesColumnName: string;
+  statusColumnName: string;
+  firstStatusLabel: string;
+  secondStatusLabel: string;
+}
+
+const PROBE_MARKER = `list-probe ${new Date().toISOString()}`;
+const PROBE_LINK_URL = "https://example.com/list-probe";
+
+const PLAN = [
+  "slackLists.items.list        -- read access",
+  "slackLists.items.create      -- blank row (items.info needs a row id)",
+  "slackLists.items.info        -- live schema",
+  "resolve configured labels    -- local, no network",
+  "slackLists.items.update      -- 3 cells, 1 row, 1 call",
+  "slackLists.items.info        -- read back and assert",
+  "slackLists.items.update      -- flip the select",
+  "slackLists.items.info        -- assert EXACTLY one value",
+  "slackLists.items.delete      -- finally, then confirm",
+];
+
+export async function runProbe(
+  token: string,
+  listId: string,
+  config: ProbeConfig,
+  opts: { dryRun: boolean },
+): Promise<void> {
+  if (opts.dryRun) {
+    // The dry run returns before the transport is ever reached, so "makes no
+    // network calls" is a property of the control flow rather than of a flag
+    // check somewhere inside the request helper.
+    console.log(`[dry-run] list ${listId}`);
+    console.log(`[dry-run] status: ${config.firstStatusLabel} -> ${config.secondStatusLabel}`);
+    for (const step of PLAN) console.log(`[dry-run] ${step}`);
+    return;
+  }
+
+  // 1. Read access, and proof this list id is reachable with this token.
+  await callSlack("slackLists.items.list", token, { list_id: listId, limit: 1 });
+
+  // 2. The blank row -- items.info's price of admission on an empty List.
+  const created = await callSlack("slackLists.items.create", token, { list_id: listId });
+  const rowId = (created.item as { id: string }).id;
+  console.log(`probe row: ${rowId}`);
+
+  let cleanupConfirmed = false;
+  try {
+    await exerciseRow(token, listId, rowId, config);
+  } finally {
+    cleanupConfirmed = await deleteProbeRow(token, listId, rowId);
+  }
+
+  // Only reachable when every assertion held: a failure inside exerciseRow runs
+  // the finally block and then propagates, so PASS never prints on a red run.
+  if (!cleanupConfirmed) throw new Error("cleanup unconfirmed");
+  console.log(`CLEANUP CONFIRMED ${rowId}`);
+  console.log("PASS");
+}
+```
+
+ステップ 3 から 8 は 1 つの関数にまとまる。この関数が扱う行は、自分で作ったものでも自分で削除するものでもない — 可逆性の保証は、まるごと呼び出し側にある。
+
+```ts
+// Static labels, so nothing from the workspace can reach the probe's output
+// through an assertion message.
+function assert(held: boolean, label: string): void {
+  console.log(`${held ? "ok  " : "FAIL"} ${label}`);
+  if (!held) throw new Error(`assertion failed: ${label}`);
+}
+
+const richText = (elements: RichTextElement[]) => [
+  { type: "rich_text", elements: [{ type: "rich_text_section", elements }] },
+];
+
+async function exerciseRow(
+  token: string,
+  listId: string,
+  rowId: string,
+  config: ProbeConfig,
+): Promise<void> {
+  // 3. The schema read-back that the blank row just made legal.
+  const info = await callSlack("slackLists.items.info", token, {
+    list_id: listId,
+    row_id: rowId,
+  });
+  const schema = schemaOf(info);
+
+  // 4. Resolve this deployment's configured labels against the live option set.
+  const title = columnIdByName(schema, config.titleColumnName);
+  const notes = columnIdByName(schema, config.notesColumnName);
+  const status = columnIdByName(schema, config.statusColumnName);
+  const firstValue = optionValueByLabel(schema, status, config.firstStatusLabel);
+  const secondValue = optionValueByLabel(schema, status, config.secondStatusLabel);
+
+  // 5. Three cells, ONE row, ONE call.
+  await callSlack("slackLists.items.update", token, {
+    list_id: listId,
+    cells: [
+      {
+        row_id: rowId,
+        column_id: title,
+        rich_text: richText([{ type: "text", text: PROBE_MARKER }]),
+      },
+      {
+        row_id: rowId,
+        column_id: notes,
+        rich_text: richText([
+          { type: "text", text: `${PROBE_MARKER} ` },
+          { type: "link", url: PROBE_LINK_URL },
+        ]),
+      },
+      { row_id: rowId, column_id: status, select: [firstValue] },
+    ],
+  });
+
+  // 6. Read back and assert -- {"ok": true} is not evidence that a value landed.
+  const first = await callSlack("slackLists.items.info", token, {
+    list_id: listId,
+    row_id: rowId,
+  });
+  assert(textOf(first, title) === PROBE_MARKER, "title cell round-trips");
+  assert(
+    linkUrlsOf(first, notes).includes(PROBE_LINK_URL),
+    "https link survives read-back as a link element",
+  );
+  assert(
+    selectValuesOf(first, status).join() === firstValue,
+    "select cell holds the first configured option",
+  );
+
+  // 7. Flip the select to a second option, touching nothing else.
+  await callSlack("slackLists.items.update", token, {
+    list_id: listId,
+    cells: [{ row_id: rowId, column_id: status, select: [secondValue] }],
+  });
+
+  // 8. The replace-vs-append test: EXACTLY one value, and it is the new one.
+  const second = await callSlack("slackLists.items.info", token, {
+    list_id: listId,
+    row_id: rowId,
+  });
+  const values = selectValuesOf(second, status);
+  assert(values.length === 1, "select write replaces rather than appends");
+  assert(values[0] === secondValue, "the surviving value is the one just written");
+}
+```
+
+## `finally` でのクリーンアップ、そして削除の失敗はハードエラー
+
+クリーンアップは、アサーションが通ったときも最初の読み戻しで吹き飛んだときも実行される。それを信頼できるものにしているルールが 2 つある。
+
+**決して throw しない。** `finally` の中から throw すると、そこにたどり着く原因になったアサーションのエラーを上書きしてしまう — 本来の発見が二次的な失敗に食われることになる。だからエスカレーションはここで*出力*し、呼び出し側にはブール値を返す。
+
+**`ok` が返ってきたことは、行が消えた証拠ではない。** 失敗することを期待した読み取りで確認する。「静かに生き残る」は、このスクリプト全体が捕まえるために存在する種類の驚きそのものだ。クリーンアップの段でそれを仮定で済ませてしまえば、プローブが API の言い分をそのまま信じる唯一の場所になってしまう。
+
+```ts
+async function deleteProbeRow(
+  token: string,
+  listId: string,
+  rowId: string,
+): Promise<boolean> {
+  try {
+    await callSlack("slackLists.items.delete", token, { list_id: listId, row_id: rowId });
+
+    // Confirm, do not assume: this read is expected to FAIL, and an ok here
+    // means the row outlived its own delete.
+    const check = await callSlack(
+      "slackLists.items.info",
+      token,
+      { list_id: listId, row_id: rowId },
+      { allowNotOk: true },
+    );
+    if (check.ok) throw new Error("probe row survived items.delete");
+    return true;
+  } catch {
+    console.error(`CLEANUP FAILED -- delete row ${rowId} from list ${listId} by hand.`);
+    console.error("Leave production List writes disabled until that row is gone.");
+    return false;
+  }
+}
+```
+
+エスカレーションの行が行 ID をそのまま出しているのは、人間が後始末を終えるのに必要なものがその ID だけだからだ — しかもプローブ行にはステップ 5 で書いた識別マーカーが載っているので、リストを開いた人はどれが孤児なのかひと目で判断できる。
+
+:::danger[クリーンアップに失敗したプローブは、全アサーションが通っていても失敗だ]
+クリーンアップを確認できなかった実行で `PASS` を出力してはいけないし、その実行を根拠に機能フラグを立ててもいけない。状態を残して終わった実行は、その時点で「オペレーターの API 理解には穴がある」ことを実証してしまっている。それこそがゲートの確認しようとしていた当のものだ。これを握りつぶすのは、出力の中で唯一アクションを要する行を読み飛ばす習慣をオペレーターに植えつけることでもある。
+:::
+
+## PASS が退役させるもの
+
+PASS した実行は、4 つの推論を観測結果に変える — ただし**その**リスト、そのトークン、そのスキーマについてのみ。
+
+| 主張 | それまでの位置づけ | 実行が何をアサートするか |
+|---|---|---|
+| すでに値が入っている select セルへの書き込みは、追記ではなく**置換**である | 推論。単一選択カラムにとって唯一整合する意味論だが、そう明言したページはない | ステップ 8 が、2 つ目のオプションと等しい値をちょうど 1 つだけ読み戻す |
+| 1 回の `items.update` が、同じ行に対する複数のセルを運べる | `cells[]` の形の上では可能。ただしドキュメントのサンプルはどれも 1 セルだけ | ステップ 5 が 1 回の呼び出しで 3 セルを送り、ステップ 6 がその 3 つすべてを見つける |
+| `items.create` は `initial_fields` なしの空行を受理する | 引数リスト上 `initial_fields` は任意。だが空の行が作られるのか拒否されるのかは書かれていない | ステップ 2 が `ok` を返し、使える行 ID を渡す |
+| `rich_text` の link 要素として書いた https リンクは、テキストに潰されずリンクのまま読み戻せる | 読み取り側は未文書 | ステップ 6 が、同じ URL を持つ `link` 要素を見つける |
+
+実行結果は、この 4 つの主張に対して明示的に記録すること。「プローブは通った」はやがて言い伝えになるが、「この実行は、スキーマ第 n 版のリスト `F0…` に対して置換であって追記でないことをアサートした」は言い伝えにならない。
+
+## PASS が退役させないもの
+
+ゲートが及ぶのは、その実行が実際にアサートした範囲だけだ。この手順は、隣接するいくつかの疑問を意図的に手つかずのまま残している。
+
+- **1 回の呼び出しでの複数行バッチ。** プローブが 1 行しか書かないのは意図的で、取り残しが起きても 1 行で済むようにするためだ。1 回の `items.update` が複数の `row_id` にまたがれるかどうかは、後始末の負担も含めて別の実験になる。
+- **`multi_select` の置換の意味論。** ステップ 8 が証明するのは、向けられたカラムについての「追記ではなく置換」だけだ。そのカラムが `single_select` なら、`multi_select` カラムは依然として未解決のまま残る — 2 つの形式が違う挙動をする可能性はあり、しかも追記か置換かがユーザーの目に見える差になるのは後者のほうだ。
+- **1 回の呼び出しあたりの `cells[]` の上限。** 3 セルは 100 セルについて何も語らない。
+- **`select: []` が値の入ったセルをクリアするかどうか。** 経路に含めていないので未検証だ。
+
+実行が検証していない主張を退役させることこそ、プローブが形骸化していく道筋だ。上のそれぞれは、何かが実際にアサートするまで、それぞれの警告の後ろに置いたままにしておく。
+
+## 衛生ルール
+
+**ドライランはネットワーク呼び出しを一切行わない。** 「書き込みだけスキップする」ではなく、呼び出しそのものをしない。`--dry-run` の経路はトランスポートヘルパーに到達する前に return し、実行計画と解決済みの設定を出力して終わる。最初に走らせるモードであり、実ワークスペースに書き込み可能なトークンを向ける前に、レビュアーが「本番の実行が何をするのか」を確かめるためのモードでもある。
+
+**トークンは決して出力しない。** 切り詰めた形でも、フィンガープリントでも、「末尾 4 文字だけ」でもだめだ。トークンを保持するのはトランスポートヘルパーだけで、そこがトークンを置く場所はちょうど 1 か所、`authorization` ヘッダーだけになる。
+
+**セルの中身や行のタイトルも決して出力しない。** プローブの出力はチケットやチャットのスレッドに貼られる。出力してよいのはメソッド名、`ok` とエラーコード、プローブ行の ID、そして固定文言のアサーションラベルだけで、ワークスペースの内容を運ぶものは何ひとつ含めない。これが、編集の工程なしに出力を共有可能にしている。
+
+**付与されたスコープは `x-oauth-scopes` から読む。** Slack はどの Web API 呼び出しでも、そのトークンに実際に付与されたスコープをこのレスポンスヘッダーで返し、エンドポイントが受け付けるスコープを `x-accepted-oauth-scopes` で示す。ステップ 1 が `missing_scope` や `not_authed` で落ちたとき、このヘッダーが「マニフェストが `lists:write` を要求している」と「このトークンがそれを持っている」の差を教えてくれる。スコープの追加には OAuth の再インストールが必要で、それが行われていない可能性がある以上、この 2 つは別の問いだ。
+
+## いつ再実行するか
+
+証拠が及ぶ範囲は 1 つのリスト、1 つのトークン、1 つのスキーマだ。そのいずれかが動いたら、再実行して出力を記録し直すこと。
+
+- リストを作り直した、あるいは差し替えた（新しい `list_id` はまるごと別の対象だ）。
+- トークンを別のアプリに移した、あるいは別のスコープ構成で再インストールした。
+- スキーマが変わった — カラムの追加、UI でのオプション集合の編集、ラベルのリネーム。
+- ワークスペースのプランが変わった、または Lists の管理者トグルが切り替わった。
+
+古い PASS は PASS がないより悪い。証明として読まれてしまうからだ。

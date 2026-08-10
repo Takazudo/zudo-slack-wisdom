@@ -1,0 +1,490 @@
+---
+title: The Activation-Gate Probe
+description: One reversible, dependency-free probe per prepared List, whose sanitized PASS output is what gates enabling production writes
+sidebar_position: 10
+---
+
+Every page in this section eventually hits the same wall and gives the same instruction:
+confirm it empirically before you depend on it. Whether writing a second value to a select
+cell replaces the first or appends to it. Whether a bot token really holds write access on a
+List it did not create. Whether an https link written into a text column survives a read-back
+as a link at all. None of these are settled by reading more documentation, because the
+documentation is where they went missing.
+
+A production reference integration settles all of them the same way: one small probe script
+per prepared List, run once by an operator against the real workspace, whose printed verdict
+is what unlocks the feature. This page is that pattern — the sequence, the reversibility
+rules, the output hygiene, and exactly which unverified claims a green run is allowed to
+retire.
+
+## The Gate
+
+The mechanism is a flag, not a habit:
+
+- The app's List writes ship **default-off** — a config flag, off in every environment,
+  production included.
+- The flag is flipped only after a live probe run against that specific List prints `PASS`
+  **and** a confirmed-cleanup marker.
+- The probe's output is pasted into the change record as-is. The evidence is the output, not
+  someone's recollection that it worked on their machine.
+
+"Sanitized" is not a step someone performs on that output before pasting it — tokens and cell
+contents never reach it in the first place, per the hygiene rules below. An operator who has
+to edit probe output before it is safe to share will eventually paste it unedited.
+
+## The Probe's Shape
+
+Four properties, each load-bearing:
+
+**One run per prepared List.** The evidence is scoped to one list id, one token, and one
+schema. A PASS against the staging List says nothing about the production one; they are
+different lists with different ids and independently edited option sets.
+
+**Dependency-free, and it imports nothing from the app it gates.** A single file that talks to
+`slack.com/api` with `fetch` and nothing else — no SDK, no build step, no shared helper
+module. If the probe went through the app's own Slack layer, a bug in that layer would make
+the probe and the app agree while both were wrong, and the probe has to run *before* the app
+is trusted.
+
+**Operator-run, with a task-local token.** Not CI, not the app's stored credentials. The
+operator holds a token for the length of the run and discards it. Wiring the probe into CI
+would mean parking a long-lived `lists:write` token in a secret store for a check that runs a
+handful of times in a List's entire lifetime.
+
+**Reversible by construction.** The probe only ever touches a row it created itself during
+this run. It never read-modify-writes an existing row, never edits list metadata, never calls
+`access.set`. The worst outcome is a stranded row, not a damaged List — and the stranded case
+is loud rather than silent.
+
+## The Step Sequence
+
+| # | Call | What it establishes |
+|---|---|---|
+| 1 | `items.list` | The token can reach this List at all — read access and the list id are both real |
+| 2 | `items.create`, no `initial_fields` | A blank row insert works, and yields the row id the next step demands |
+| 3 | `items.info` | The live schema: column ids, types, and each select column's option set |
+| 4 | *(local)* resolve labels to option values | The labels this deployment is configured with exist in the live option set |
+| 5 | `items.update` — 3 cells, one row, one call | A multi-cell single-row write is accepted as a single call |
+| 6 | `items.info` + assert | All three values landed, and the link is still a link |
+| 7 | `items.update` — flip the select | Sets up the assertion below; changes nothing else |
+| 8 | `items.info` + assert exactly one value | A select write **replaces**; it does not append |
+| 9 | `items.delete` in `finally`, then confirm | The row is provably gone, not just reported deleted |
+
+Steps 1–8 are the experiment; step 9 is what makes running the experiment against a real
+workspace acceptable.
+
+### Why the blank row comes first
+
+[`items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/) is the only
+schema read-back there is, and it takes a `row_id` — you cannot ask a List what shape it is
+without already holding a row to ask about. A freshly prepared List has no row to name. So the
+probe makes one: [`items.create`](https://docs.slack.dev/reference/methods/slackLists.items.create/)
+with `list_id` and nothing else. That blank row is `items.info`'s price of admission, and it
+doubles as the row every later step writes to and the row cleanup deletes.
+
+If step 2 is rejected outright, fall back to creating the row with a single title cell in
+`initial_fields` — and record the rejection, because "blank create works" is one of the four
+claims this run was supposed to retire.
+
+### The three cells, and why those three
+
+Step 5 writes exactly three cells, all for the same row, in one `cells[]` array:
+
+- **The title column** — a `rich_text` write to the List's primary text column, the same shape
+  every real sync uses.
+- **A text/notes column** — the run's identity marker followed by an https `link` element. The
+  link is the assertion: does a link survive read-back as a link element, or is it flattened
+  into plain text? The marker is the operational safety net — if cleanup ever fails, the
+  stranded row says what it is and when it was made, in plain view of whoever finds it.
+- **The select column** — set to the first configured option, so step 7 has something to
+  overwrite.
+
+Three cells rather than one is deliberate: the multi-cell single-row write is itself one of
+the claims under test, and folding it into the same call costs nothing.
+
+## The Transport Helper
+
+One function talks to Slack. It is also the only place a token is ever handled, which is what
+makes "never print a token" a property of the code rather than a rule people follow.
+
+```ts
+const SLACK_API_BASE_URL = "https://slack.com/api";
+
+type SlackResult = { ok: boolean; error?: string; [key: string]: unknown };
+
+// Slack echoes the token's ACTUAL granted scopes on every Web API response.
+// That is a different question from what the app manifest requests -- adding a
+// scope takes an OAuth reinstall -- and it is the first thing you want when
+// step 1 comes back missing_scope.
+let grantedScopes: string | null = null;
+
+async function callSlack(
+  method: string,
+  token: string,
+  args: Record<string, unknown>,
+  opts: { allowNotOk?: boolean } = {},
+): Promise<SlackResult> {
+  const res = await fetch(`${SLACK_API_BASE_URL}/${method}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(args),
+  });
+  grantedScopes = res.headers.get("x-oauth-scopes") ?? grantedScopes;
+
+  // Slack answers HTTP 200 with {"ok": false} on failure.
+  const body = (await res.json()) as SlackResult;
+  // Method name and verdict only: never the arguments, never the response body.
+  console.log(`${method}: ${body.ok ? "ok" : `error=${body.error}`}`);
+
+  if (!body.ok && opts.allowNotOk !== true) {
+    throw new Error(
+      `${method} failed: ${body.error} (token grants: ${grantedScopes ?? "unknown"})`,
+    );
+  }
+  return body;
+}
+```
+
+## Naming the Read-Back Fields Once
+
+Every read-side field name the probe depends on lives in one block. That is a deliberate
+containment choice, not tidiness:
+
+:::warning[Unverified]
+Slack's docs pin the **write** shape of a cell; they never spell out the `items.info` row
+envelope field by field. The accessors below follow the write-side names, and the first live
+run is what actually confirms them. Keeping them in one place means a mismatch surfaces as one
+obvious edit instead of scattered `undefined` checks through the assertions.
+:::
+
+```ts
+type RichTextElement = { type: string; text?: string; url?: string };
+type RichTextBlock = { elements: { elements: RichTextElement[] }[] };
+type Cell = { column_id: string; select?: string[]; rich_text?: RichTextBlock[] };
+type Column = {
+  id: string;
+  name: string;
+  options?: { choices?: { value: string; label: string }[] };
+};
+
+const schemaOf = (res: SlackResult): Column[] =>
+  (res.list as { list_metadata?: { schema?: Column[] } })?.list_metadata?.schema ?? [];
+
+const cellOf = (res: SlackResult, columnId: string): Cell | undefined =>
+  ((res.item as { fields?: Cell[] })?.fields ?? []).find((c) => c.column_id === columnId);
+
+const selectValuesOf = (res: SlackResult, columnId: string): string[] =>
+  cellOf(res, columnId)?.select ?? [];
+
+const elementsOf = (res: SlackResult, columnId: string): RichTextElement[] =>
+  (cellOf(res, columnId)?.rich_text ?? [])
+    .flatMap((block) => block.elements)
+    .flatMap((section) => section.elements);
+
+const textOf = (res: SlackResult, columnId: string): string =>
+  elementsOf(res, columnId)
+    .filter((el) => el.type === "text")
+    .map((el) => el.text ?? "")
+    .join("");
+
+const linkUrlsOf = (res: SlackResult, columnId: string): string[] =>
+  elementsOf(res, columnId)
+    .filter((el) => el.type === "link")
+    .map((el) => el.url ?? "");
+
+function columnIdByName(schema: Column[], name: string): string {
+  const column = schema.find((c) => c.name === name);
+  if (!column) throw new Error(`no column named "${name}" in the live schema`);
+  return column.id;
+}
+
+// The write path takes choices[].value -- the machine slug -- never the label
+// a human reads off the chip. This resolution is the whole reason step 4 runs
+// before any write: a stale label in config fails here, not as invalid_option_id
+// on a cron tick three weeks later.
+function optionValueByLabel(schema: Column[], columnId: string, label: string): string {
+  const choice = schema
+    .find((c) => c.id === columnId)
+    ?.options?.choices?.find((c) => c.label === label);
+  if (!choice) throw new Error(`no option labelled "${label}" on column ${columnId}`);
+  return choice.value;
+}
+```
+
+## The Probe Body
+
+The entry point owns three things: the blank row, the `try`/`finally` that guarantees cleanup
+runs, and the two markers that constitute the gate's evidence.
+
+```ts
+interface ProbeConfig {
+  titleColumnName: string;
+  notesColumnName: string;
+  statusColumnName: string;
+  firstStatusLabel: string;
+  secondStatusLabel: string;
+}
+
+const PROBE_MARKER = `list-probe ${new Date().toISOString()}`;
+const PROBE_LINK_URL = "https://example.com/list-probe";
+
+const PLAN = [
+  "slackLists.items.list        -- read access",
+  "slackLists.items.create      -- blank row (items.info needs a row id)",
+  "slackLists.items.info        -- live schema",
+  "resolve configured labels    -- local, no network",
+  "slackLists.items.update      -- 3 cells, 1 row, 1 call",
+  "slackLists.items.info        -- read back and assert",
+  "slackLists.items.update      -- flip the select",
+  "slackLists.items.info        -- assert EXACTLY one value",
+  "slackLists.items.delete      -- finally, then confirm",
+];
+
+export async function runProbe(
+  token: string,
+  listId: string,
+  config: ProbeConfig,
+  opts: { dryRun: boolean },
+): Promise<void> {
+  if (opts.dryRun) {
+    // The dry run returns before the transport is ever reached, so "makes no
+    // network calls" is a property of the control flow rather than of a flag
+    // check somewhere inside the request helper.
+    console.log(`[dry-run] list ${listId}`);
+    console.log(`[dry-run] status: ${config.firstStatusLabel} -> ${config.secondStatusLabel}`);
+    for (const step of PLAN) console.log(`[dry-run] ${step}`);
+    return;
+  }
+
+  // 1. Read access, and proof this list id is reachable with this token.
+  await callSlack("slackLists.items.list", token, { list_id: listId, limit: 1 });
+
+  // 2. The blank row -- items.info's price of admission on an empty List.
+  const created = await callSlack("slackLists.items.create", token, { list_id: listId });
+  const rowId = (created.item as { id: string }).id;
+  console.log(`probe row: ${rowId}`);
+
+  let cleanupConfirmed = false;
+  try {
+    await exerciseRow(token, listId, rowId, config);
+  } finally {
+    cleanupConfirmed = await deleteProbeRow(token, listId, rowId);
+  }
+
+  // Only reachable when every assertion held: a failure inside exerciseRow runs
+  // the finally block and then propagates, so PASS never prints on a red run.
+  if (!cleanupConfirmed) throw new Error("cleanup unconfirmed");
+  console.log(`CLEANUP CONFIRMED ${rowId}`);
+  console.log("PASS");
+}
+```
+
+Steps 3 through 8 are one function, operating on one row it did not create and does not
+delete — the reversibility guarantee lives entirely in its caller.
+
+```ts
+// Static labels, so nothing from the workspace can reach the probe's output
+// through an assertion message.
+function assert(held: boolean, label: string): void {
+  console.log(`${held ? "ok  " : "FAIL"} ${label}`);
+  if (!held) throw new Error(`assertion failed: ${label}`);
+}
+
+const richText = (elements: RichTextElement[]) => [
+  { type: "rich_text", elements: [{ type: "rich_text_section", elements }] },
+];
+
+async function exerciseRow(
+  token: string,
+  listId: string,
+  rowId: string,
+  config: ProbeConfig,
+): Promise<void> {
+  // 3. The schema read-back that the blank row just made legal.
+  const info = await callSlack("slackLists.items.info", token, {
+    list_id: listId,
+    row_id: rowId,
+  });
+  const schema = schemaOf(info);
+
+  // 4. Resolve this deployment's configured labels against the live option set.
+  const title = columnIdByName(schema, config.titleColumnName);
+  const notes = columnIdByName(schema, config.notesColumnName);
+  const status = columnIdByName(schema, config.statusColumnName);
+  const firstValue = optionValueByLabel(schema, status, config.firstStatusLabel);
+  const secondValue = optionValueByLabel(schema, status, config.secondStatusLabel);
+
+  // 5. Three cells, ONE row, ONE call.
+  await callSlack("slackLists.items.update", token, {
+    list_id: listId,
+    cells: [
+      {
+        row_id: rowId,
+        column_id: title,
+        rich_text: richText([{ type: "text", text: PROBE_MARKER }]),
+      },
+      {
+        row_id: rowId,
+        column_id: notes,
+        rich_text: richText([
+          { type: "text", text: `${PROBE_MARKER} ` },
+          { type: "link", url: PROBE_LINK_URL },
+        ]),
+      },
+      { row_id: rowId, column_id: status, select: [firstValue] },
+    ],
+  });
+
+  // 6. Read back and assert -- {"ok": true} is not evidence that a value landed.
+  const first = await callSlack("slackLists.items.info", token, {
+    list_id: listId,
+    row_id: rowId,
+  });
+  assert(textOf(first, title) === PROBE_MARKER, "title cell round-trips");
+  assert(
+    linkUrlsOf(first, notes).includes(PROBE_LINK_URL),
+    "https link survives read-back as a link element",
+  );
+  assert(
+    selectValuesOf(first, status).join() === firstValue,
+    "select cell holds the first configured option",
+  );
+
+  // 7. Flip the select to a second option, touching nothing else.
+  await callSlack("slackLists.items.update", token, {
+    list_id: listId,
+    cells: [{ row_id: rowId, column_id: status, select: [secondValue] }],
+  });
+
+  // 8. The replace-vs-append test: EXACTLY one value, and it is the new one.
+  const second = await callSlack("slackLists.items.info", token, {
+    list_id: listId,
+    row_id: rowId,
+  });
+  const values = selectValuesOf(second, status);
+  assert(values.length === 1, "select write replaces rather than appends");
+  assert(values[0] === secondValue, "the surviving value is the one just written");
+}
+```
+
+## Cleanup in `finally`, and a Failed Delete Is a Hard Failure
+
+Cleanup runs whether the assertions passed or blew up on the first read-back. Two rules make
+it trustworthy:
+
+**It never throws.** A throw from inside a `finally` block replaces whichever assertion error
+got you there — you would lose the actual finding to a secondary failure. So the escalation is
+*printed* here and the caller receives a boolean.
+
+**A delete that returns `ok` is not proof the row is gone.** Confirm it with a follow-up read
+that expects to fail. A silent survival is precisely the class of surprise this whole script
+exists to catch; assuming it away in the cleanup step would be the one place the probe took
+the API's word for something.
+
+```ts
+async function deleteProbeRow(
+  token: string,
+  listId: string,
+  rowId: string,
+): Promise<boolean> {
+  try {
+    await callSlack("slackLists.items.delete", token, { list_id: listId, row_id: rowId });
+
+    // Confirm, do not assume: this read is expected to FAIL, and an ok here
+    // means the row outlived its own delete.
+    const check = await callSlack(
+      "slackLists.items.info",
+      token,
+      { list_id: listId, row_id: rowId },
+      { allowNotOk: true },
+    );
+    if (check.ok) throw new Error("probe row survived items.delete");
+    return true;
+  } catch {
+    console.error(`CLEANUP FAILED -- delete row ${rowId} from list ${listId} by hand.`);
+    console.error("Leave production List writes disabled until that row is gone.");
+    return false;
+  }
+}
+```
+
+The escalation line names the row id, in the clear, because that id is the only thing a human
+needs to finish the job — and the probe row carries the identity marker written in step 5, so
+whoever opens the List can tell at a glance which row is the orphan.
+
+:::danger[A green probe with a failed cleanup is a failed probe]
+Do not print `PASS` when the cleanup could not be confirmed, and do not flip the feature flag
+on that run. A run that leaves state behind has already demonstrated that the operator's model
+of the API is incomplete, which is the exact thing the gate is checking for. Swallowing it
+also trains operators to skim past the one line in the output that ever needs action.
+:::
+
+## What a PASS Retires
+
+A green run converts four inferences into observations — for **that** List, token, and schema:
+
+| Claim | Where it stood before | What the run asserts |
+|---|---|---|
+| Writing a select value to a cell that already holds one **replaces** it rather than appending | Inference. It is the only coherent semantics for a single-select column, but no page states it | Step 8 reads back exactly one value, equal to the second option |
+| One `items.update` can carry several cells for the same row in a single call | Structurally allowed by `cells[]`; every documented sample writes exactly one cell | Step 5 sends three cells in one call, and step 6 finds all three |
+| `items.create` accepts a blank row with no `initial_fields` | `initial_fields` is optional in the argument list; nothing says an empty row is created rather than rejected | Step 2 returns `ok` and yields a usable row id |
+| An https link written as a `rich_text` link element survives read-back as a link, not flattened to text | Undocumented on the read side | Step 6 finds a `link` element carrying the same URL |
+
+Record the run against those four claims explicitly. "The probe passed" ages into folklore;
+"this run asserted replace-not-append on list `F0…` under schema version *n*" does not.
+
+## What a PASS Does Not Retire
+
+The gate is scoped to exactly what the run asserted, and this sequence deliberately leaves
+several neighboring questions untouched:
+
+- **Multi-row batching in one call.** The probe writes one row on purpose, so that a stranded
+  row is a single stranded row. Whether one `items.update` may span several `row_id`s is a
+  separate experiment with a separate cleanup burden.
+- **`multi_select` replacement semantics.** Step 8 proves replace-not-append for the column it
+  was pointed at. If that column is `single_select`, a `multi_select` column is still an open
+  question — the two formats could differ, and that is the case where append-vs-replace
+  actually changes what a user sees.
+- **The `cells[]` ceiling per call.** Three cells says nothing about a hundred.
+- **Whether `select: []` clears a populated cell.** Not exercised; clearing is not on the path.
+
+Retiring a claim the run did not test is how a probe degrades into a rubber stamp. Each of the
+above stays behind its own warning until something actually asserts it.
+
+## Hygiene
+
+**A dry run makes no network calls at all.** Not "skips the writes" — makes no calls. The
+`--dry-run` path returns before the transport helper is reachable, prints the plan and the
+resolved config, and exits. It is the mode you run first, and the mode a reviewer runs to see
+what a real run would do before anyone points a write-capable token at a live workspace.
+
+**Never print a token.** Not truncated, not fingerprinted, not "just the last four." The
+transport helper is the only code that holds one, and it puts the token in exactly one place:
+the `authorization` header.
+
+**Never print cell bodies or row titles.** Probe output gets pasted into tickets and chat
+threads. Print method names, `ok`/error codes, the probe row id, and static assertion labels —
+nothing that carries workspace content. This is what makes the output shareable without an
+editing step.
+
+**Read granted scopes off `x-oauth-scopes`.** Slack returns the token's actual granted scopes
+in that response header on every Web API call, and names what the endpoint would accept in
+`x-accepted-oauth-scopes`. When step 1 fails with `missing_scope` or `not_authed`, the header
+is the difference between "the manifest requests `lists:write`" and "this token has it" — two
+different questions, since adding a scope requires an OAuth reinstall that may never have
+happened.
+
+## When to Re-Run
+
+The evidence is scoped to one List, one token, one schema, so re-run and re-record the output
+when any of those move:
+
+- The List is recreated or replaced (a new `list_id` is a new subject entirely).
+- The token is rotated into a different app, or reinstalled with a different scope set.
+- The schema changes — a column added, an option set edited in the UI, a label renamed.
+- The workspace changes plan tier or flips the Lists admin toggle.
+
+A stale PASS is worse than no PASS, because it reads as proof.
