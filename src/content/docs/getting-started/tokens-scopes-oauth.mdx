@@ -33,4 +33,13 @@ The full redirect flow matters once the app leaves your workspace: **public dist
 
 ## Reinstalling After A Scope Change
 
-Scopes are additive: requesting a new scope and sending the workspace through install again adds it to the existing grant rather than replacing it, and there's no way to downgrade a token's scopes short of reinstalling with a smaller manifest ([Installing with OAuth](https://docs.slack.dev/authentication/installing-with-oauth/)). In practice: edit the manifest or the scope list on **OAuth & Permissions**, then click **Reinstall to Workspace**. Reinstalling issues a new bot token -- the old one stops working, so update the stored Worker secret in the same change ([Worker Backend: Secrets & Config](../worker-backend/secrets-and-config.mdx)).
+Scopes are additive: requesting a new scope and sending the workspace through install again adds it to the existing grant rather than replacing it, and there's no way to downgrade a token's scopes short of reinstalling with a smaller manifest ([Installing with OAuth](https://docs.slack.dev/authentication/installing-with-oauth/)). Editing the manifest or the scope list alone changes nothing live -- Slack's manifest guidance notes that updating a manifest doesn't modify tokens already issued to a workspace ([App distribution](https://docs.slack.dev/distribution)) -- so a newly added scope has no effect until the workspace goes through **Reinstall to Workspace** again, and the token issued before that reinstall never gains it.
+
+The full sequence, in order:
+
+1. Add the scope to the manifest or the **OAuth & Permissions** scope list.
+2. Click **Reinstall to Workspace**.
+3. Compare the token now shown on **OAuth & Permissions** against the stored secret. Reinstalling *may* issue a new bot token, but that isn't guaranteed by Slack's docs -- observed across repeated reinstalls of a production reference integration, rotation has gone both ways: sometimes a new token, sometimes the same one back.
+4. If the token changed, set the new value as the Worker secret and verify it works ([Worker Backend: Secrets & Config](../worker-backend/secrets-and-config.mdx)) *before* treating the old token as invalid -- Slack doesn't revoke the previous token as part of reinstalling, so there's no rush. If it's unchanged, there's nothing to rotate.
+5. Deploy -- this pushes the rotated secret if step 4 applied, and ships any code that depends on the new scope.
+6. Enable the event subscriptions the new scope unlocks. A scope grant doesn't retroactively subscribe the app to the event types it makes available.
