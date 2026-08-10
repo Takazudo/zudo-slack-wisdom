@@ -68,6 +68,37 @@ succeed; a label rename is safe by contrast, because writes address `value`, nev
 On an unexpected `invalid_option_id`, re-read `list_metadata.schema` via `items.info` rather
 than trusting a hardcoded constant that assumes the schema never changed.
 
+## Detecting Drift Proactively
+
+Reacting to `invalid_option_id` after a write already failed works, but it means a business
+state can silently remap onto the wrong option for however long it takes a write to hit that
+particular slug — a status column with low write volume could carry a stale assumption for
+days. The more defensive pattern is to check for drift before it can affect a write at all:
+
+1. **Fingerprint the resolved contract at registration.** Hash the parts of `list_metadata.schema`
+   that a write actually depends on — column ids and their types, each select column's format,
+   and every option's `value`/`label`/color triplet — with SHA-256, and persist that fingerprint
+   alongside the `list_id` when a List is registered for sync.
+2. **Re-verify every sync cycle, before writing.** Call `items.info`, recompute the same
+   fingerprint from the fresh `list_metadata.schema`, and compare it to the persisted value
+   *before* the cycle's writes go out — not after one has already failed.
+3. **On any mismatch, fail closed.** Mark the List registration unhealthy, halt sync against it,
+   and persist a bounded error code for operators to act on. Do not attempt to auto-adapt to the
+   new schema: a renamed option, a re-typed column, or a reordered option list can silently
+   remap what a business state means, and a sync loop that "helpfully" reconciles against the
+   new shape can commit that remap without a human ever reviewing it. Fail-closed here is a
+   direct extension of the same policy this section's own [Errors Reference](./errors-reference.mdx#production-error-handling-branch-on-category-not-code)
+   applies to every other permanent-configuration error: retrying (or auto-adapting) cannot fix
+   a schema that changed out from under you — only a human, or a deliberate redeploy, can.
+
+One deployment nuance is worth a sentence: fingerprint composition is itself a compatibility
+surface. During an additive migration window — rolling out a Worker version that adds a new
+column to the schema it registers — an already-deployed Worker and the newly-deployed one will
+compute different fingerprints for the same list unless the just-added column is excluded from
+the hash until the rollout completes. Otherwise the two versions disagree about what the
+"correct" schema is mid-rollout, and one of them fails closed against a schema that is, from
+its own valid perspective, unexpectedly different — even though nothing is actually wrong.
+
 ## The Sanctioned Workaround: Recreate via `copy_from_list_id`
 
 The documented API path for "I need one more option" is a **new list**:

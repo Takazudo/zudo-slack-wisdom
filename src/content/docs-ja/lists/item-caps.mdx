@@ -27,19 +27,30 @@ Slack のヘルプ記事「Use lists in Slack」はこの上限をそのまま�
 
 もし*報告されている*「古い行から自動アーカイブ」の挙動が実在するなら、それはここで起こり得る最も厄介な失敗モードだ。自分のデータベースがまだ指している行が、イベントもエラーもないまま黙ってリストから消える — 後になってその `row_id` に対する `items.update` が失敗するまで気づけない。この失敗は、些細な問題では済まなくなるまで一切うるさく知らせてくれない。
 
-## 緩和策: 上限の十分手前で自己制限し、明示的に退避する
+## 主要パターン: desired-state のクエリ自体に上限を組み込む
 
-元調査の結論であり、本セクション全体が寄りかかっている設計はこうだ。**成長し続けるテーブルの system of record をリストにしてはならない。** 具体的には次のとおり。
+元調査の結論であり、本セクション全体が寄りかかっている設計はこうだ。**成長し続けるテーブルの system of record をリストにしてはならない。** これを実現する最も堅牢な方法は、後付けの「確認して退避する」ステップではなく、desired state を生成するクエリそのものに上限を焼き込むことだ。
 
 - **有界なアクティブ作業セットだけをミラーする** — 例えば未アーカイブの行や現在関連のあるソース行だけで、全履歴は載せない。
-- **自分のミラーに 1,000 の十分手前でハード上限を設ける**（元調査の推奨レンジは 300〜500）。こうしておけば、実際の天井付近でプラットフォームがどう振る舞うかに依存せずに成長の余地を確保できる。
-- **自分の上限を超えたら、`items.deleteMultiple`（Tier 2、20+/min）で最も古い行を自分で取り除く** — Slack 自身の自動アーカイブが何をするかに頼らない。明示的に削除すれば、削除対象を自分で選べるうえ、`row_id` のマッピングを正確に保てる — データベースがまだリストにあると思っている状態と黙って食い違うことがなくなる。
+- **desired-state のクエリ自体に上限を設ける: ビジネス上のタイムスタンプで新しい順に N 件だけ選ぶ**（挿入順ではない）、同一タイムスタンプの行に対しては安定した id をタイブレークに使う。N は 1,000 の十分手前に保つこと — 元調査の推奨レンジは 300〜500 — こうしておけば、実際の天井付近でプラットフォームがどう振る舞うかに依存せずに成長の余地を確保できる。
+- **ウィンドウから外れた行は特別扱いしない。** それらは単に、リストと突き合わせる desired-state 集合から現れなくなるだけであり、その結果、「desired だがリストにない」ものを create に変える同じ照合の仕組みが、そのまま通常の `desired_operation = delete` の作業に変えてくれる。同期ロジックの他の部分と整合を取り続けなければならない別枠の退避コードパスは存在しない — クエリの形そのものが容量ポリシーになる。
+- **各照合バッチ内では delete を create より先に順序付ける。** ウィンドウから外れた行を落とすのと新しい行を追加するのを同じバッチで行う場合、消費する前に容量を解放すべきだ — こうすることで、「ちょうど上限」と「上限を超えそう」の境界で無用な `over_row_maximum` を作り出さずに済む。
 - **行の予算が厳しいならサブタスク（`parent_item_id`）は一切使わない** — 別枠なしで同じ上限を共有するため、親子構造にすると、自分で設けた上限に対して使える予算が実質的に半減する。
 
+はっきり言っておく価値のある帰結が一つある。desired-state の上限が容量を強制する以上、自分が容量に達しているかどうかを判断するために `items.info` の `list_limits` / `row_count` を参照する必要は一切なくなる — 自分の有界な projection クエリそのものが容量ポリシーだ。`items.info` の `list_limits` は、依然としてヘルスチェックのシグナルとして定期的に読む価値がある（後述の「リストの充填状況を読む」を参照）。書き込み経路の判断からは完全に外れるだけだ。
+
+## バルククリーンアップのフォールバック: `items.deleteMultiple`
+
+上記の主要パターンがあれば、明示的な一括削除パスはほとんど、あるいは一切必要ないはずだ — desired-state の projection が毎サイクル上限内に収めてくれる。`items.deleteMultiple`（Tier 2、20+/min）は、projection だけではカバーできないケースのフォールバックとして残しておく: 一度きりのバックフィルのクリーンアップ、あとから引き下げた上限、あるいはこのパターンを導入する前に溜まったバックログの一掃だ。
+
+[`slackLists.items.deleteMultiple` の Slack メソッドリファレンス](https://docs.slack.dev/reference/methods/slackLists.items.deleteMultiple/)には、リクエストボディが `{list_id, ids}` だと明記されている — パラメータは **`row_ids` ではなく `ids`** だ。delete 系のメソッド間には知っておく価値のある命名の非対称性がある: `items.delete` は単数の `id` を取り、`deleteMultiple` は複数形の `ids` 配列を取り、`items.info` は取得する 1 行に対して `id` を取る。トップレベルに `row_id` というパラメータを持つメソッドは一つもない — この名前が現れるのはネストした場所、つまり `items.update` の `cells[]` 内のエントリだけで、各セルはどの行を対象にするかを示すために独自の `row_id`（または `row_id_to_create`）を持つ。
+
+`deleteMultiple` のまともなラッパーは、0 件の id 配列をノーオペとして扱い（空の `ids` 配列を往復させる理由はない）、1 件の配列は `items.delete` にルーティングする — それは正真正銘の単数削除だからだ。
+
 ```typescript
-// Self-imposed ceiling, well under Slack's 1,000-row cap. Evict the
-// oldest rows explicitly rather than depending on Slack's own
-// (reported, unverified) auto-archive behavior.
+// Bulk-cleanup fallback — the primary desired-state cap (above) should mean
+// this rarely fires. Request body is {list_id, ids}, not row_ids; see
+// https://docs.slack.dev/reference/methods/slackLists.items.deleteMultiple/
 const MIRROR_ROW_CEILING = 400;
 
 async function evictOldestIfOverCeiling(
@@ -49,29 +60,36 @@ async function evictOldestIfOverCeiling(
 ): Promise<void> {
   if (currentRowIds.length <= MIRROR_ROW_CEILING) return;
   const toEvict = currentRowIds.slice(0, currentRowIds.length - MIRROR_ROW_CEILING);
-  const res = await fetch("https://slack.com/api/slackLists.items.deleteMultiple", {
+  // A 1-length array is a genuinely singular delete — route it to items.delete's
+  // `id` rather than paying for the deleteMultiple round trip.
+  const method = toEvict.length === 1 ? "slackLists.items.delete" : "slackLists.items.deleteMultiple";
+  const payload =
+    toEvict.length === 1 ? { list_id: listId, id: toEvict[0] } : { list_id: listId, ids: toEvict };
+  const res = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${botToken}`,
       "content-type": "application/json; charset=utf-8",
     },
-    body: JSON.stringify({ list_id: listId, row_ids: toEvict }),
+    body: JSON.stringify(payload),
   });
   // Slack's Web API returns HTTP 200 even on failure — {"ok": false, "error": "..."}.
   // Only remove rows from your own mapping table AFTER confirming ok: true; removing
   // them unconditionally would desync your mapping from Slack on a rejected call.
   const body = (await res.json()) as { ok: boolean; error?: string };
   if (!body.ok) {
-    throw new Error(`slackLists.items.deleteMultiple rejected: ${body.error}`);
+    throw new Error(`${method} rejected: ${body.error}`);
   }
-  // Remove the same row_ids from your own mapping table in the same
+  // Remove the same row ids from your own mapping table in the same
   // operation — do not let the two stores drift apart.
 }
 ```
 
 ## リストの充填状況を読む
 
-`items.list` は行数を一切返さない。容量に関する数字が表に出てくる唯一の場所は、`items.info` レスポンスの `list_limits`（`row_count`、`row_count_limit`、`archived_row_count`）だ — ミラー用の行を 1 つ潰さずにこれを読む方法は、[リストの読み取り](./reading-lists.mdx)のセンチネル行パターンを参照。事後的に `over_row_maximum` へ反応するだけでなく、定期的に確認すること — 自分の上限に対して先回りして退避していれば、通常運用でこのエラーが発火しない程度には実際の上限から距離を保てる。
+`items.list` は行数を一切返さない。容量に関する数字が表に出てくる唯一の場所は、`items.info` レスポンスの `list_limits`（`row_count`、`row_count_limit`、`archived_row_count`）だ — ミラー用の行を 1 つ潰さずにこれを読む方法は、[リストの読み取り](./reading-lists.mdx)のセンチネル行パターンを参照。
+
+desired-state の projection 上限を主要パターンとする以上（前述）、書き込みが安全かどうかを判断するために `list_limits` は不要だ — projection クエリが毎サイクル上限内に収めてくれる。それでも定期的にヘルスチェックとして読んでおくとよい: 自分の上限より低いはずなのに `row_count` が `row_count_limit` に近づいていくのは、何か他のものがそのリストに書き込んでいるか、自分の上限を見直すべきだというシグナルだ — `over_row_maximum` が発火してから事後的に反応するだけでは足りない。
 
 ## 関連ページ
 
