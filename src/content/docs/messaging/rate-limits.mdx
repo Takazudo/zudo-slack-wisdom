@@ -30,10 +30,20 @@ installed in.
 ## `Retry-After` Handling
 
 A rate-limited call returns `HTTP 429 Too Many Requests` with a `Retry-After` header giving the
-number of seconds to wait before retrying. Treat this as authoritative rather than rolling your
-own backoff schedule from scratch — sleep for (at least) the stated duration, then retry the exact
-same call. Every official SDK's built-in retry handler already implements this; reach for it
-before writing a custom retry loop.
+number of seconds to wait before retrying. Treat this as authoritative when it's present rather
+than rolling your own backoff schedule from scratch — sleep for (at least) the stated duration,
+then retry the exact same call. Every official SDK's built-in retry handler already implements
+this; reach for it before writing a custom retry loop.
+
+"Authoritative" doesn't mean "always present" or "safe to obey unbounded," though. The header can
+be absent or unparseable on a `429`, and it is never present on a `5xx` — a retry loop that only
+knows how to read `Retry-After` has nothing to act on in either case and, with no fallback, ends up
+retrying back-to-back against an endpoint that just asked it to slow down. Pair header-based
+waiting with an exponential fallback (1 second base, doubling on each subsequent failure) for the
+cases where no usable header value is present, and clamp **both** the header's value and the
+fallback's computed value to a per-call-path ceiling — an unusually large or corrupt `Retry-After`
+value shouldn't be able to stall a call path indefinitely any more than an unbounded exponential
+fallback should.
 
 ## Message-Posting Limits: ~1/sec/Channel
 
@@ -86,6 +96,31 @@ as the sanctioned alternative for searching message/file content without large e
 2026-08-06 it is scoped to "select partners," not a drop-in replacement any app can adopt. Getting
 Marketplace-approved is the path that keeps the original Tier 3 limits on
 `conversations.history`/`conversations.replies` directly.
+:::
+
+## Field Notes from a Production Deployment
+
+Two operational realities from running this rate-limit model in production, worth carrying into a
+runbook rather than rediscovering under load.
+
+:::note[Read budgets settle above the raw floor]
+A production reference integration operating under the non-Marketplace regime above raises its
+*effective* Retry-After ceiling on the read path to roughly 60 seconds rather than clamping to
+something tighter — 1 request/minute is a hard floor, not a target, and a self-imposed ceiling
+below what the platform actually enforces just adds failed calls without buying anything. Budget
+how many `conversations.history`/`conversations.replies` calls a single cron tick is allowed to
+spend, and cache anything read-heavy and reusable — permalinks in particular — server-side rather
+than re-fetching it on every pass.
+:::
+
+:::note[The internal-app exemption is live, not one-time]
+An app stays exempt from the non-Marketplace limits above only as long as it stays "internal" — a
+single-workspace app never submitted for commercial distribution. Enabling **Manage Distribution**
+reclassifies the app out of that exemption immediately, silently dropping
+`conversations.history`/`conversations.replies` onto the reduced 1-request-per-minute ceiling for a
+read design that was sized for Tier 3. "Manage Distribution stays OFF" belongs in the runbook as a
+standing operational invariant, not a one-time setup decision — anyone with admin access can flip
+it later without realizing what it breaks.
 :::
 
 ## Applying This to a Dashboard Bot
