@@ -1,6 +1,6 @@
 ---
 title: Three-Second Ack
-description: "Slack's 3-second ack rule, ctx.waitUntil() for the real work, and handling X-Slack-Retry-Num retries."
+description: "Slack's 3-second ack rule, race-free event_id dedupe, a durable outbox behind the ack, and the 30-second ctx.waitUntil() budget."
 sidebar_position: 4
 ---
 
@@ -15,8 +15,10 @@ Slash commands and interactivity payloads follow the same shape: acknowledge
 fast, do the real work after.
 
 A Cloudflare Worker's `fetch` handler is a natural fit for this, as long as
-the "real work" — calling an LLM, writing to a database, posting a follow-up
-message — happens *after* the response is returned, not before.
+everything with a third-party round-trip in it — calling an LLM, posting a
+follow-up message — happens *after* the response is returned. The one thing
+that belongs *before* the ack is a fast local write recording that the event
+has to be handled at all; "Durable intent before the ack" below develops why.
 
 ## Ack first, work in `ctx.waitUntil()`
 
@@ -46,20 +48,20 @@ export default {
 `ctx.waitUntil()` tells the Workers runtime to keep the isolate alive for a
 given promise even after the response has been sent. Without it, the runtime
 is free to tear the Worker down as soon as `fetch()` returns, and an
-in-flight `handleEvent()` call can be cut off mid-way. Cloudflare documents
-a roughly 30-second budget for work registered this way (shared across all
-`waitUntil()` calls in the same request) — plenty for a Slack event handler,
-but not a substitute for a real queue if the work routinely runs longer than
-that. See
-[Cloudflare's `ctx.waitUntil()` docs](https://developers.cloudflare.com/workers/runtime-apis/context/)
-for the full behavior, including what happens if the promise never settles.
+in-flight `handleEvent()` call can be cut off mid-way.
 
-:::danger[Never `await` the real work before responding]
-`await handleEvent(...)` before `return` blows the 3-second budget the
-moment the handler does anything nontrivial — an LLM call, a Slack Web API
-round-trip, a database write. `ctx.waitUntil()` is not an optimization here;
-without it the ack and the work are coupled, and Slack starts retrying
-almost immediately.
+This shape is correct for work that may be lost without consequence. It is
+**not** sufficient for side effects that must not be lost — see
+"Durable intent before the ack" below, which changes what happens before the
+`return`.
+
+:::danger[Await the durable write — never the external effect]
+`await handleEvent(...)` before `return` blows the 3-second budget the moment
+the handler does anything with a remote dependency: an LLM call, a Slack Web
+API round-trip, a third-party fetch. The only thing that belongs before the
+ack is a write to *your own* datastore — a single D1 batch, single-digit
+milliseconds, no third-party latency in the path. Everything that talks to
+somebody else's server goes after the response.
 :::
 
 ## Retry semantics
@@ -85,14 +87,23 @@ cases where your Worker actually processed the event but the 200 response
 didn't make it back in time. That is the deduplication problem: the retry
 is a new HTTP request, but it may describe work you already did.
 
+Note where the first retry lands. Slack sends it *nearly immediately*, which
+means the two deliveries can be in flight against your Worker at the same
+time. Any dedupe scheme has to survive genuine concurrency, not just a
+replay minutes later.
+
 ## Deduplication with `event_id`
 
 Every event payload carries a globally-unique `event_id`. Slack's docs
 don't prescribe a specific dedup mechanism, but `event_id` is the field
-built for this: record it (KV with a short TTL is enough — the retry window
-tops out around 5 minutes) and skip processing if you've already seen it.
+built for this.
+
+### Why get-then-put loses the race
+
+The obvious implementation is a read followed by a write:
 
 ```typescript
+// DO NOT COPY -- this loses the race it is meant to win.
 async function handleEvent(event: SlackEvent, env: Env, eventId: string): Promise<void> {
   const dedupeKey = `slack-event:${eventId}`;
   if (await env.KV.get(dedupeKey)) {
@@ -104,26 +115,431 @@ async function handleEvent(event: SlackEvent, env: Env, eventId: string): Promis
 }
 ```
 
-:::tip[Ack fast even when you're going to dedupe-and-skip]
-Return `200` immediately whether or not this turns out to be a duplicate.
-The ack and the dedupe check are separate concerns — don't let a KV read
-before responding eat into the 3-second budget.
+It has two independent defects, and Slack's retry timing lands squarely on
+both.
+
+**Read-then-write is not atomic.** Between the `get` and the `put` there is
+a window in which a second delivery can also read a miss. Both then proceed,
+and the side effect runs twice. This is a plain time-of-check/time-of-use
+gap; it exists on *any* store that lacks a compare-and-set primitive, no
+matter how consistent that store is. Workers KV offers no conditional write,
+so the window cannot be closed from the application side.
+
+**Workers KV is eventually consistent.** Cloudflare
+[documents](https://developers.cloudflare.com/kv/concepts/how-kv-works/)
+that a write may take up to 60 seconds — or longer — to become visible at
+other network locations, and that **negative lookups are cached too**: a
+"this key does not exist" answer is itself cached for the same duration. So
+the near-immediate first retry, arriving at a different location, can read a
+cached miss for a key that was written moments ago. The propagation window
+is measured in tens of seconds; Slack's first retry arrives inside it.
+Cloudflare's own guidance is that KV is not the right tool when values must
+be read and written in a single transaction.
+
+### An atomic receipt in D1
+
+Replace the check with a **conditional insert against a `UNIQUE` key**. The
+database decides who won; the application only reads the verdict.
+
+```sql
+CREATE TABLE slack_event_receipts (
+  event_id    TEXT PRIMARY KEY,
+  event_type  TEXT NOT NULL,
+  received_at INTEGER NOT NULL
+);
+```
+
+```typescript
+const batch = await env.DB.batch<{ changes: number }>([
+  env.DB.prepare(
+    `INSERT INTO slack_event_receipts (event_id, event_type, received_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT (event_id) DO NOTHING`,
+  ).bind(eventId, eventType, Date.now()),
+  env.DB.prepare("SELECT changes() AS changes"),
+]);
+
+// 1 -> this delivery inserted the receipt. 0 -> a concurrent or earlier
+// delivery already owns this event_id.
+const isFirstDelivery = batch[1].results[0].changes === 1;
+```
+
+Two mechanics make this work, and both are easy to get wrong:
+
+- **`ON CONFLICT (event_id) DO NOTHING` is one statement.** The uniqueness
+  check and the insert are the same operation, so there is no window between
+  them. Exactly one of two concurrent deliveries inserts a row; the other
+  conflicts and is told so.
+- **`changes()` reports the immediately preceding statement.** D1's `batch()`
+  runs its statements
+  [sequentially and non-concurrently inside a single transaction](https://developers.cloudflare.com/d1/worker-api/d1-database/),
+  which is what makes a `SELECT changes()` placed directly after the insert
+  read *that* insert's row count. Put another statement in between and it
+  reports the wrong one. Issued as a separate `run()` outside the batch, the
+  guarantee does not hold at all.
+
+Bind positionally with `?` — D1 does not support named parameters.
+
+The receipts table grows without bound, so prune it on a schedule. Slack's
+retry window tops out around five minutes, so anything older than a day is
+safe to delete and leaves enormous margin.
+
+KV is still useful here, but only as a **best-effort fast path**: a cached
+"already seen" answer can let you skip work cheaply, and a cached miss costs
+nothing because the D1 insert is the thing that actually decides. Never let
+KV be the only guard.
+
+### Return 200 for everything you deliberately ignore
+
+Duplicates are one case of a broader rule. **Every authenticated event you
+choose not to act on gets a `200`** — wrong channel, an unmapped case, a
+message subtype you don't handle, your own bot's message, a duplicate.
+
+```typescript
+// Every one of these is an ack, not an error: a retry would re-deliver the
+// identical payload and be ignored identically.
+if (event.channel !== env.WATCHED_CHANNEL_ID) return ack();
+if (event.subtype && !HANDLED_SUBTYPES.has(event.subtype)) return ack();
+if (event.bot_id) return ack();
+```
+
+Returning an error status because you didn't want the event spends one of
+Slack's three retries to receive the same payload again and reach the same
+conclusion. It changes nothing except your error rate and Slack's opinion of
+your endpoint's health.
+
+Reserve a non-2xx for the one situation where a retry could plausibly reach
+a *different* outcome: you could not durably record the event. That is the
+next section. (A `401` on a failed signature check is a separate axis — you
+are rejecting an unauthenticated request, not ignoring an event.)
+
+## Durable intent before the ack
+
+Ack-then-`waitUntil` is fine for work that may be dropped. It is not fine
+for a side effect that must happen, because `waitUntil` work can be
+cancelled by runtime teardown or by the time budget, and its failures are
+invisible to Slack — Slack already has its `200` and will never send the
+event again. An event that is acked but not recorded is simply gone.
+
+The production shape splits the guarantee from the latency. See
+[Events API on Workers](../events/events-api-on-workers.mdx#retries-and-event-dedupe-a-durable-ledger-for-must-eventually-happen-side-effects)
+for the same ledger-plus-cron shape with a second, fact-identity key layered on top — needed once
+the same underlying event can arrive through more than one path (a retried delivery and a polling
+sweep both landing on the same fact).
+
+### 1. One fast durable transaction, before the ack
+
+Before responding, a single local transaction records the receipt **and**
+enqueues the intended side effect as an outbox row. The ack then depends
+only on a write to your own database — never on Slack Web API latency, an
+LLM, or any other third party.
+
+```sql
+CREATE TABLE outbox (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  idempotency_key  TEXT NOT NULL UNIQUE,
+  effect           TEXT NOT NULL,
+  payload          TEXT NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'pending',
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  claim_token      TEXT,
+  claim_expires_at INTEGER,
+  created_at       INTEGER NOT NULL,
+  completed_at     INTEGER
+);
+
+CREATE INDEX outbox_claimable ON outbox (status, claim_expires_at, id);
+```
+
+```typescript
+async function recordIntent(payload: SlackEnvelope, env: Env): Promise<boolean> {
+  const now = Date.now();
+  const batch = await env.DB.batch<{ changes: number }>([
+    env.DB.prepare(
+      `INSERT INTO slack_event_receipts (event_id, event_type, received_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT (event_id) DO NOTHING`,
+    ).bind(payload.event_id, payload.event.type, now),
+
+    // Must sit immediately after the receipt insert to report its row count.
+    env.DB.prepare("SELECT changes() AS changes"),
+
+    // Unconditional and idempotent: on a redelivery the UNIQUE key absorbs it.
+    env.DB.prepare(
+      `INSERT INTO outbox (idempotency_key, effect, payload, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT (idempotency_key) DO NOTHING`,
+    ).bind(`${payload.event_id}:notify`, "notify", JSON.stringify(payload.event), now),
+  ]);
+
+  return batch[1].results[0].changes === 1;
+}
+```
+
+The outbox insert runs unconditionally because its own `UNIQUE` key makes it
+idempotent — a redelivery enqueues nothing new. The receipt's `changes()`
+verdict is used for something narrower: deciding whether this delivery
+should also try the immediate attempt.
+
+### 2. If the transaction fails, do not ack
+
+:::danger[Never ack without durable intent]
+If the pre-ack transaction throws, or cannot finish inside the three-second
+window, return a **retryable non-2xx**. This is the one case where an error
+response is the correct answer: a `200` here tells Slack the event is handled
+and Slack will never send it again, while nothing anywhere records that it
+must happen. The event is lost silently. A `5xx` buys another delivery.
 :::
+
+```typescript
+const ACK_BUDGET_MS = 2_000; // Headroom inside Slack's 3 seconds.
+
+const budget = new Promise<never>((_, reject) =>
+  setTimeout(() => reject(new Error("pre-ack budget exceeded")), ACK_BUDGET_MS),
+);
+
+let isFirstDelivery: boolean;
+try {
+  isFirstDelivery = await Promise.race([recordIntent(payload, env), budget]);
+} catch (err) {
+  console.error("no durable intent recorded", err);
+  // Do NOT ack: only a retry can still save this event.
+  return new Response("retry", { status: 500 });
+}
+```
+
+Losing that race does not cancel the D1 write — it may well commit after you
+have already returned `500`. That is safe, and it is safe for a specific
+reason: both inserts are idempotent, so Slack's retry re-runs the same
+transaction, finds the receipt already there (`changes()` returns `0`), acks,
+and leaves the already-enqueued outbox row to the sweep. A pre-ack path that
+was not idempotent could not afford this timeout at all.
+
+### 3. Immediate delivery is best-effort only
+
+With the intent durable, hand the actual delivery to `ctx.waitUntil()` as an
+optimization for the common case. It swallows every error: there is no
+caller left to inform, and throwing out of a backgrounded promise
+accomplishes nothing except marking the invocation as errored.
+
+```typescript
+if (isFirstDelivery) {
+  ctx.waitUntil(
+    sweepOutbox(env).catch((err) => {
+      // Best effort. The cron sweep owns the guarantee; log and move on.
+      console.error("immediate delivery failed", err);
+    }),
+  );
+}
+return new Response(null, { status: 200 });
+```
+
+Note that this calls the *same* claim-and-deliver loop the cron tick calls
+(`sweepOutbox`, below) — the identical code path, triggered by the request
+instead of by the clock. There is no separate "fast path" implementation to
+keep in sync, and the leasing described below is what keeps the two triggers
+from colliding.
+
+### 4. The cron sweep is the contract
+
+A scheduled tick re-claims anything the immediate attempt failed to deliver
+or the runtime cancelled mid-flight. Say it plainly to yourself when
+reasoning about this system: **immediate delivery is the optimization; the
+cron sweep of the outbox is the contract.** If you would not be willing to
+delete the `waitUntil` call and let every effect be delivered by the sweep
+alone, the sweep is not yet correct.
+
+### 5. Claim-token leasing and fenced acknowledgement
+
+Multiple workers can reach the outbox at once — the immediate attempt, the
+current cron tick, and the previous tick that overran. Leasing keeps them
+from doing the same work twice.
+
+Each attempt mints a **random claim token** and stamps it onto the rows it
+takes, with a bounded expiry:
+
+```typescript
+const LEASE_MS = 10 * 60 * 1000; // Comfortably longer than the worst-case delivery.
+
+type OutboxRow = { id: number; effect: string; payload: string; attempts: number };
+
+async function claimBatch(env: Env, token: string, limit: number): Promise<OutboxRow[]> {
+  const now = Date.now();
+
+  await env.DB.prepare(
+    `UPDATE outbox
+        SET claim_token = ?, claim_expires_at = ?
+      WHERE id IN (
+        SELECT id FROM outbox
+         WHERE status = 'pending'
+           AND (claim_expires_at IS NULL
+                OR claim_expires_at < ?
+                OR claim_token = ?)
+         ORDER BY id
+         LIMIT ?
+      )`,
+  ).bind(token, now + LEASE_MS, now, token, limit).run();
+
+  const { results } = await env.DB.prepare(
+    "SELECT id, effect, payload, attempts FROM outbox WHERE claim_token = ? ORDER BY id",
+  ).bind(token).all<OutboxRow>();
+
+  return results;
+}
+```
+
+Three properties, each traceable to one clause above:
+
+- **Concurrent claimers lease disjoint rows.** Eligibility and the stamp are
+  the *same* `UPDATE`, so the database serializes them. A `SELECT` of
+  claimable ids followed by a separate `UPDATE` reintroduces exactly the
+  time-of-check/time-of-use gap the dedupe section warned about.
+- **Re-claiming with the same token is idempotent.** The `claim_token = ?`
+  disjunct keeps rows this token already owns eligible, so a claim step that
+  is retried after a crash re-selects and re-leases *the same* batch — with
+  `ORDER BY id LIMIT ?` it cannot silently drift onto a second, larger set.
+  Without that disjunct the retry would skip its own rows (their lease is
+  still valid) and lease a disjoint batch instead, so the same worker would
+  hold two claims.
+- **Expiry, not release, is what frees a row.** A worker that dies mid-batch
+  releases nothing. The lease simply runs out and the next tick reclaims.
+
+Acknowledgement is then **fenced to the exact token**:
+
+```typescript
+async function completeClaimed(env: Env, id: number, token: string): Promise<boolean> {
+  const batch = await env.DB.batch<{ changes: number }>([
+    env.DB.prepare(
+      `UPDATE outbox
+          SET status = 'done', claim_token = NULL, claim_expires_at = NULL, completed_at = ?
+        WHERE id = ? AND claim_token = ?`,
+    ).bind(Date.now(), id, token),
+    env.DB.prepare("SELECT changes() AS changes"),
+  ]);
+
+  return batch[1].results[0].changes === 1;
+}
+```
+
+The `AND claim_token = ?` is the fence. If this attempt took longer than its
+lease and another worker has already reclaimed the row under a new token,
+the update matches zero rows and cannot mark it done. Without the fence, a
+slow, expired attempt would ack work that a *different* worker is currently
+performing — and that second delivery would then be dropped, turning a
+duplicate into a loss. A fence rejection is worth logging: it means the
+lease was too short for the real work.
+
+```typescript
+async function sweepOutbox(env: Env): Promise<void> {
+  const token = crypto.randomUUID();
+
+  for (const row of await claimBatch(env, token, 25)) {
+    try {
+      await performEffect(row, env);
+    } catch (err) {
+      await recordFailure(env, row.id, token, err); // Bump attempts, back off, park if exhausted.
+      continue;
+    }
+
+    if (!(await completeClaimed(env, row.id, token))) {
+      console.warn(`outbox ${row.id}: lease expired before ack; another worker owns it now`);
+    }
+  }
+}
+```
+
+### 6. At-least-once, on purpose
+
+The Slack post and the database acknowledgement are two different systems,
+and there is no transaction spanning them. Something has to go first, and
+either order can be interrupted between the two:
+
+- **Post, then ack** — if the ack write fails, the lease expires, the sweep
+  reclaims the row, and the message is posted a second time. **At-least-once.**
+- **Ack, then post** — if the post fails, the row is already marked done and
+  nothing will ever retry it. The effect is lost, silently. **At-most-once.**
+
+This design chooses the first, deliberately: a visible duplicate is a better
+failure than an invisible loss. Say so in your own docs rather than implying
+exactly-once, because a reader who believes the effect is exactly-once will
+build something downstream that breaks the first time it isn't.
+
+Two things narrow the window without pretending to close it. Prefer effects
+that are **idempotent by shape** where you can choose — updating a message
+you already hold the `ts` for, or adding a reaction that reports
+`already_reacted`, both absorb a redelivery harmlessly, whereas
+`chat.postMessage` has no caller-supplied idempotency key and will happily
+create a second message. And keep the lease comfortably longer than the
+worst-case delivery, so the fence rarely has to reject anything.
+
+## The `waitUntil` budget and three escapes
+
+Cloudflare documents a **30-second limit on `waitUntil()` work, measured from
+the end of the invocation** and shared across every `waitUntil()` call in the
+request. The failure mode is worth being precise about: promises that have
+not settled by then are **cancelled outright**, not rejected. There is no
+error to catch, no `finally` that runs, no chance to clean up. See
+[the `ctx.waitUntil()` reference](https://developers.cloudflare.com/workers/runtime-apis/context/).
+
+The knock-on effects land on anything the cancelled work was holding. A run
+lock, an outbox lease, a "sync in progress" flag: none of them are released,
+because the code that would release them never executes. A stranded lock
+blocks every subsequent tick until its own staleness window elapses. This is
+the concrete reason the outbox lease above expires on a timestamp instead of
+being cleared in a `finally` block — expiry is the only release mechanism
+that survives cancellation.
+
+Three escapes, in order of preference:
+
+1. **Keep it under the budget.** Bound the work per invocation: a fixed
+   claim batch, a capped page size, no unbounded loop over an upstream
+   result set. Let the next tick take the remainder.
+2. **Move it off the request.** A queue or a cron sweep — the outbox above
+   is exactly this pattern. This is the only escape that also survives the
+   Worker being torn down for unrelated reasons.
+3. **Await it inline in `fetch()`.** Counter-intuitive, and right for one
+   specific shape. Cloudflare
+   [documents no hard duration limit for HTTP-triggered Workers](https://developers.cloudflare.com/workers/platform/limits/):
+   as long as the client stays connected, the Worker keeps processing. The
+   binding constraint is **CPU** time (paid plan: 30 seconds by default, 5
+   minutes maximum; free plan: 10 ms), and time spent waiting on I/O does
+   not consume CPU. So for HTTP-triggered work that is dominated by I/O wait
+   and whose caller actually wants the real result, awaiting inline outlives
+   `waitUntil` *and* returns an answer.
+
+:::warning[The third escape does not apply to the Slack ack path]
+Awaiting inline works because the client is willing to wait. Slack is that
+client here, and it stops waiting after three seconds. Escape 3 is for your
+own admin endpoints, manual backfills, and internal tools — never for an
+Events API, slash command, or interactivity handler.
+:::
+
+Size the sweep against the cron-side limits, which are different again: on
+the paid plan a `scheduled()` invocation gets 30 seconds of CPU when the
+cron interval is under an hour (15 minutes at intervals of an hour or more),
+under a 15-minute wall-clock ceiling
+([Workers limits](https://developers.cloudflare.com/workers/platform/limits/)).
+A bounded batch that runs every minute drains a backlog just as well as an
+unbounded one that gets cut off partway through.
 
 ## Gotchas
 
-- **`ctx.waitUntil()` failures are silent to the caller.** Slack already
-  got its `200`; if the backgrounded promise throws, that has to be caught
-  and logged inside the promise itself, not surfaced as an HTTP error.
-- **A retry is not necessarily a duplicate signal of user intent.** If the
-  underlying event genuinely needs to run again (e.g. your dedupe store
-  itself failed), don't assume every retry is safe to drop — dedupe by
-  `event_id`, not by "this is attempt 2 or 3."
-- **The 3-second budget includes your own signature verification and JSON
-  parsing**, not just the "real work." Keep everything before the `return`
-  cheap and synchronous-feeling.
-- **Slash commands and interactivity share the ack pattern but not the
-  event shape.** The 3-second rule and `ctx.waitUntil()` approach carry
-  over; the payload structure and `X-Slack-Retry-*` headers are
-  Events-API-specific — check the relevant Slack docs for the surface
-  you're handling.
+- **`ctx.waitUntil()` failures are silent to the caller.** Slack already got
+  its `200`; if the backgrounded promise throws, that has to be caught and
+  logged inside the promise itself. There is no HTTP status left to put it
+  in — which is precisely why the durable record has to exist before the ack.
+- **Dedupe by `event_id`, never by `X-Slack-Retry-Num`.** A retry is Slack's
+  claim that the *first* attempt failed, not evidence that the work was done.
+  If the first delivery never got as far as recording durable intent, the
+  retry is the delivery that must succeed. The receipt row is the only thing
+  that knows which case you are in.
+- **The 3-second budget includes signature verification, JSON parsing, and
+  now the durable write.** All three are local work with no third-party
+  latency in them, which is what makes the budget comfortable — keep it that
+  way and nothing else creeps in before the `return`.
+- **Slash commands and interactivity share the ack pattern but have no
+  `event_id`.** The 3-second rule, the outbox, and the leasing all carry
+  over, but there is no globally-unique envelope id to key a receipt on.
+  Those surfaces need an application-level operation id instead, and two
+  identical slash commands may well be two intentional invocations rather
+  than a duplicate.

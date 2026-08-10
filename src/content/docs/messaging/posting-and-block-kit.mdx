@@ -1,6 +1,6 @@
 ---
 title: Posting and Block Kit
-description: chat.postMessage essentials — channel resolution, threading, blocks + text fallback, common block types, unfurl flags
+description: chat.postMessage essentials — channel resolution, threading, blocks + text fallback, common block types, message-size limits, the colored accent bar, link buttons, unfurl flags, and safe cron posting
 sidebar_position: 2
 ---
 
@@ -53,12 +53,188 @@ summary of the message even when the visible body is entirely blocks.
 A message can carry up to **50 blocks**; modals and Home tab views raise that to 100
 ([Block Kit overview](https://docs.slack.dev/block-kit/)).
 
+## Message-Size Reality
+
+The per-block limits above cap individual blocks, but `text` on `chat.postMessage` has its own
+message-level ceiling: Slack truncates (and may split into multiple messages) text over roughly
+**40,000 characters**
+([Truncating really long messages](https://docs.slack.dev/changelog/2018-truncating-really-long-messages/)).
+That ceiling is far above what any well-formed message should approach — treat it as a hard
+backstop, not a budget to design against.
+
+For a bot that renders a list into a message (a digest, a batch summary), the practical risk isn't
+the 40,000-character ceiling — it's the 3,000-character `section` limit from the table above, plus
+a subtler trap: a "…and N more" footer whose own length changes as N changes while you're still
+deciding whether another line fits. Fit-check the **fully rendered** text, footer included, against
+a conservative budget well under the platform ceiling (e.g. 20,000 characters for the whole
+message), dropping lines from the end until it fits — computing the footer *after* the drop
+decision, not before. Give the per-`section` 3,000-character limit its own headroom too: truncate
+to something like 2,900, not 3,000, so a last-line footer or an off-by-one doesn't tip a block over
+into a rejected message.
+
+## The Colored Left Accent Bar
+
+Block Kit alone has no way to render the colored vertical strip against the left edge of a
+message — the `section` block has no border/color property for it. The only mechanism that still
+produces it is the legacy `attachments` field, with modern Block Kit blocks nested *inside* one
+attachment:
+
+```typescript
+{
+  channel: "C0123456789",
+  text: "Deploy failed: payment-service",
+  attachments: [
+    {
+      color: "#e01e5a",
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: "*Deploy failed:* payment-service" },
+        },
+      ],
+    },
+  ],
+}
+```
+
+`attachments` is legacy but not deprecated — it's frozen in place rather than actively developed,
+and Slack's own guidance is to prefer Block Kit for everything attachments doesn't uniquely do
+([Legacy secondary message attachments](https://docs.slack.dev/legacy/legacy-messaging/legacy-secondary-message-attachments/)).
+The accent bar is one of those things it uniquely does, and it composes fine with modern Block Kit
+nested inside — reaching for it here doesn't mean giving up Block Kit elsewhere in the message.
+Keep the top-level `text` field set regardless: it's still the notification fallback described
+above, independent of whatever lives inside `attachments`.
+
+Resist the urge to invent a color per fine-grained category (one per status code, one per priority
+level). A small **semantic palette** — two states, such as a routine/attention split, is usually
+enough — reads faster than a rainbow of near-identical hues, and it gives a reader a mental map of
+two or three consistent meanings instead of a dozen to memorize.
+
+## Link Buttons
+
+An `actions` block button with `url` set works as a pure link button: clicking it opens the URL in
+the user's browser, no different from clicking any other link. Omitting `action_id` is spec-legal
+rather than a shortcut — Slack's button reference lists `type` and `text` as the element's only
+required fields, with `action_id`, `url`, `value`, and `style` all optional
+([Button element](https://docs.slack.dev/reference/block-kit/block-elements/button-element/)).
+
+Read the rest of that reference before concluding the payload does not exist. It says that if
+you're using `url` you'll still receive an interaction payload and will need to acknowledge it —
+which is a stronger statement than "the app may handle it if it likes." What makes the link button
+work anyway is configuration, not the schema: an app with no Interactivity Request URL set has
+nowhere for Slack to deliver that payload, so there is no unacknowledged request to answer. The
+link opens regardless, which is why a bot that only ever ships link buttons never needs to turn on
+Interactivity in the first place.
+
+**Set a stable `action_id` anyway.** It costs one line, it is documented as the field you match on
+when an interaction payload does arrive, and it is the difference between "turn Interactivity on"
+being a config change and being a hunt through every button the bot has ever shipped. The sample
+below leaves it off to show the minimum that works; production code is better off with one.
+
+```typescript
+{
+  type: "actions",
+  elements: [
+    {
+      type: "button",
+      text: { type: "plain_text", text: "Open dashboard" },
+      url: `${env.DASHBOARD_BASE_URL}/deploys/${deployId}`,
+      style: "primary",
+    },
+  ],
+}
+```
+
+`style: "primary"` gives one button (at most one per set) a highlighted color for the main action.
+
+**A button whose `url` is not an absolute `http://` or `https://` URL doesn't just fail that one
+button — it rejects the whole message** with `invalid_blocks`. This is exactly the failure mode a
+missing or empty base-URL environment variable produces in practice: `env.DASHBOARD_BASE_URL`
+resolves to an empty string, the button's `url` becomes a bare relative path, and the entire post
+— everything else in the message included — never goes out. Validate every candidate URL (has a
+scheme, is `http`/`https`) before building the block, and degrade a bad one to a plain text line in
+the message body instead of shipping a broken button — a message missing one link is a much
+smaller failure than a message that silently never posts at all.
+
 ## Unfurl Flags
 
-`unfurl_links` and `unfurl_media` both default to enabled — a bare URL in the message text
-expands into a preview card unless explicitly suppressed. Set either to `false` to keep a message
-compact, which matters most for messages that already carry their own Block Kit layout and don't
-need Slack's auto-generated link preview competing for space underneath.
+`unfurl_links` and `unfurl_media` do not share a default for a bot's `chat.postMessage` calls, even
+though earlier guidance on this page said they did. The method's own argument reference words the
+two oppositely: `unfurl_media`'s description is "pass `false` to **disable**" unfurling of media
+content, while `unfurl_links`'s is "pass `true` to **enable**" unfurling of text-based content
+([`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postMessage/)) — the same
+disable/enable pairing that reference page uses elsewhere to mark a field as on-by-default versus
+off-by-default (`mrkdwn` is worded the same way: "disable... by setting to `false`. Enabled by
+default"). In practice: a bot post gets automatic media-preview unfurling with no parameter needed,
+but a plain text link needs `unfurl_links: true` passed explicitly before its preview card appears.
+
+This asymmetry is specific to programmatic posts. A link a person pastes directly into Slack's
+message composer unfurls under the client's own default behavior, with no app-side parameter
+involved at all — the "links unfurl automatically" intuition holds for what people type, just not
+for what a bot posts through the Web API.
+
+Set `unfurl_media: false` when a message already carries its own Block Kit layout and doesn't need
+an auto-generated media card competing for space underneath. Pass `unfurl_links: true` deliberately
+when a text link's preview is actually wanted — it won't appear otherwise.
+
+See [Permalinks and Cross-Channel Alerts](./permalinks-and-cross-channel-alerts.mdx) for this same
+asymmetry applied to a permalink cross-post, where `unfurl_links: true` has to be passed explicitly
+or the preview card never appears.
+
+## Posting from a Cron, Safely
+
+A scheduled job that posts a new message per source record (a batch job creating individual Slack
+posts, not a single dashboard message refreshed in place) needs its own definition of "posted
+successfully" — "the API call didn't throw" isn't quite it, because a call can succeed at the HTTP
+layer while Slack itself rejects the message.
+
+**Success is HTTP ok AND `json.ok === true` AND both `channel` and `ts` present and non-empty.**
+Only once all three hold should the source record be marked posted:
+
+```typescript
+async function postAndRecord(env: Env, record: SourceRecord): Promise<void> {
+  const res = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.SLACK_BOT_TOKEN}`,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify({ channel: env.TARGET_CHANNEL_ID, text: renderText(record) }),
+  });
+  const json = await res.json<{ ok: boolean; channel?: string; ts?: string; error?: string }>();
+
+  if (!res.ok || !json.ok || !json.channel || !json.ts) {
+    throw new Error(`chat.postMessage failed for ${record.id}: ${json.error ?? res.status}`);
+  }
+
+  await saveDeliveryIdentity(env, record.id, { channel: json.channel, ts: json.ts });
+}
+```
+
+Persist the `(channel, ts)` pair as the record's durable identity the moment success is confirmed.
+This pair is the **only** reverse-lookup key back to that message — a message posted before your
+job started storing it is permanently unsyncable; there is no API that finds "the message this
+record produced" after the fact except by having recorded it yourself at post time.
+
+`chat.getPermalink` is a separate, independently retryable step, not part of the same
+success/failure unit. If the post lands but the permalink fetch fails (a network blip, a transient
+error on that one call), the record is still correctly marked posted — a later pass should re-query
+only the permalink for records that have `(channel, ts)` but no permalink yet, never re-post a
+message that already has an identity.
+
+**Name the crash window instead of pretending it's closed.** Between "Slack accepts the message"
+and "the identity write completes," a crash (isolate eviction, an uncaught exception, a KV/DB write
+failure) produces one duplicate post on the next run — the source record still shows unposted, so
+the job posts it again. This window is narrowable (write the identity as the very next step, keep
+no other work between the two) but not eliminable without a mechanism Slack itself doesn't offer
+(`chat.postMessage` takes no idempotency-key parameter). Accept it as a known, bounded failure mode
+rather than building elaborate machinery to chase it to zero.
+
+**Thread replies get their own try/catch.** If a job posts a parent message and then immediately
+posts one or more thread replies (`thread_ts` set to the parent's `ts`), a reply's failure must
+never roll back the parent's already-confirmed posted-state. Wrap each reply post separately, log
+or queue a retry for the failed reply, and leave the parent's identity write exactly as it was — the
+parent record is posted; a missing reply is a smaller, independently fixable problem.
 
 See [Formatting](./formatting.mdx) for the `mrkdwn` syntax used inside `text` objects, and
 [Updating in Place](./updating-in-place.mdx) for turning a posted message into a

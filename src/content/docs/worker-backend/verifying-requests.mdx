@@ -129,6 +129,151 @@ a length mismatch only ever means "malformed input," not "N characters
 matched."
 :::
 
+## Hardening checklist
+
+The scheme above is the whole of what Slack's docs require. A production reference integration layers a few additional checks on top of it — none of them change the wire protocol, but each closes a way the basic implementation can be technically correct and still fail in practice.
+
+### 1. Strict-parse the signature header before any HMAC work
+
+`X-Slack-Signature` must match `^v0=([0-9a-fA-F]{64})$` — a `v0=` literal followed by exactly 64 hex characters, the hex encoding of a 32-byte SHA-256 digest. Parse and validate the header against this pattern *before* touching `crypto.subtle`. A `v1=...` header (a future signing version Slack hasn't shipped, or a header from something other than Slack) or a truncated or malformed hex string should fail immediately, with no HMAC computed at all — there's no reason to spend a cryptographic operation on a header shape a regex can reject for free.
+
+```typescript
+const SIGNATURE_PATTERN = /^v0=([0-9a-fA-F]{64})$/;
+
+function parseSignature(header: string | null): string | null {
+  if (!header) return null;
+  const match = SIGNATURE_PATTERN.exec(header);
+  return match ? match[1] : null; // the 64-char hex digest, "v0=" stripped
+}
+```
+
+### 2. Byte-compare, not hex-string compare
+
+The timing-safe comparison above compares two hex strings. A hardened variant skips the hex-encoding step on the computed side entirely: decode the expected hex into bytes, compare those bytes directly against the raw `ArrayBuffer` `crypto.subtle.sign` returns, and fold any length mismatch into the accumulator instead of returning early on it.
+
+```typescript
+function timingSafeEqualBytes(expectedHex: string, actual: ArrayBuffer): boolean {
+  const expectedBytes = expectedHex.match(/.{2}/g)!.map((b) => parseInt(b, 16));
+  const actualBytes = new Uint8Array(actual);
+
+  // Fold the length difference into the accumulator instead of an early
+  // return -- one code path regardless of input shape.
+  let result = expectedBytes.length ^ actualBytes.length;
+  const len = Math.max(expectedBytes.length, actualBytes.length);
+  for (let i = 0; i < len; i++) {
+    result |= (expectedBytes[i] ?? 0) ^ (actualBytes[i] ?? 0);
+  }
+  return result === 0;
+}
+```
+
+### 3. Timestamp validation: format, range, and both directions of skew
+
+`Number(timestamp)` is more permissive than it looks. `Number("1760000000.5")` returns a valid finite number, so a naive `Math.abs(nowSeconds - Number(timestamp)) > 300` check happily accepts a timestamp with a fractional second that should never have parsed as a Unix-seconds integer in the first place. Harden the check with three layers, in order:
+
+1. A digits-only regex on the raw string — rejects `"1760000000.5"`, `"1e9"`, `"-5"`, and anything with an explicit sign, before it ever reaches `Number()`.
+2. `Number.isSafeInteger()` on the parsed value — guards against a very long digit string coercing to `Infinity` (`Number.isSafeInteger(Infinity)` is `false`) or otherwise landing outside the range where integer precision is reliable.
+3. A window check written as two explicit comparisons, not one `Math.abs()`. It covers the same set of valid inputs, but two explicit comparisons make it obvious when a later refactor accidentally drops one side — e.g. someone tightens future-skew rejection but leaves past-skew unbounded, and it still compiles. Test both directions so that mistake fails loudly.
+
+```typescript
+const TIMESTAMP_PATTERN = /^\d+$/;
+const WINDOW_SECONDS = 300;
+
+function isTimestampValid(raw: string, nowSeconds: number): boolean {
+  if (!TIMESTAMP_PATTERN.test(raw)) return false;
+
+  const timestamp = Number(raw);
+  if (!Number.isSafeInteger(timestamp)) return false;
+
+  const tooOld = nowSeconds - timestamp > WINDOW_SECONDS;
+  const tooNew = timestamp - nowSeconds > WINDOW_SECONDS;
+  return !tooOld && !tooNew;
+}
+```
+
+### 4. Test with a fixed, independently-computed digest
+
+A test that signs a body and then verifies its own signature can pass even when the base-string construction is wrong, because both sides of the test share the same bug — swap the order of `timestamp` and `rawBody` in the base string, and a sign-then-verify roundtrip still round-trips. The suite needs at least one case with a signature computed independently of the code under test: a fixed secret, timestamp, and body, with the expected `X-Slack-Signature` value hardcoded as a constant.
+
+```typescript
+test("verifies a known-good v0 signature (fixed test vector)", async () => {
+  // Secret, timestamp, and body are arbitrary but fixed. The expected
+  // signature was computed once, independently, with Node's crypto module --
+  // not by calling verifySlackSignature and capturing its own output.
+  vi.setSystemTime(new Date(1531420618 * 1000)); // freeze the clock so the
+  // fixed timestamp below doesn't fall outside the 5-minute window
+
+  const env = { SLACK_SIGNING_SECRET: "8f742231b10e8888abcd99yyyzzz85a5" };
+  const rawBody = "token=xyzz0WbapA4vBCDEFasx0q6G&team_id=T1DC2JH3J";
+  const request = new Request("https://example.com/slack/events", {
+    headers: {
+      "x-slack-request-timestamp": "1531420618",
+      "x-slack-signature":
+        "v0=bca5eef5dd737ed259b428b18cd24f679baa18c3fc5f1cb2a6ac9f03e717969a",
+    },
+  });
+
+  expect(await verifySlackSignature(request, rawBody, env)).toBe(true);
+});
+```
+
+### 5. `url_verification` only after the signature passes
+
+Slack's Events API sends a one-time `{"type": "url_verification", "challenge": "..."}` POST when you first save the endpoint URL, and expects `{"challenge": "..."}` echoed back. If that branch is checked before `verifySlackSignature`, an attacker doesn't need the signing secret at all: any unsigned POST with that same JSON shape gets the challenge echoed back on demand. The endpoint becomes an unauthenticated echo oracle — it parrots back whatever `challenge` value it's sent, to anyone, whether or not the request came from Slack. The fix is ordering: verify unconditionally first, and only branch on `payload.type` once `isValid` is true.
+
+```typescript
+const payload = JSON.parse(rawBody);
+
+// url_verification only after the signature has already passed -- an
+// unsigned request must never see its "challenge" echoed back.
+if (payload.type === "url_verification") {
+  return Response.json({ challenge: payload.challenge });
+}
+```
+
+:::tip[Worth a dedicated test]
+Beyond "a valid signed challenge returns the challenge," assert the negative case directly: an *unsigned* POST with a well-formed `url_verification` body must 401, not 200 with the challenge echoed back.
+:::
+
+### 6. Fail closed when the signing secret is unconfigured
+
+`env.SLACK_SIGNING_SECRET` being empty or undefined is a deployment error — a missing secret binding, a typo'd variable name — not a signal to skip verification. Check for the missing secret explicitly, before any HMAC work, and respond with an explanatory 500, distinct from the 401 an actual bad signature gets, so whoever is monitoring the deploy can tell "misconfigured" from "someone's probing the endpoint." An early return like `if (!env.SLACK_SIGNING_SECRET) return true` — written for local testing and never removed — is the failure mode this guards against: never let a missing secret be silently read as "trust the request."
+
+```typescript
+async function verifySlackSignature(
+  request: Request,
+  rawBody: string,
+  env: Env,
+): Promise<boolean> {
+  if (!env.SLACK_SIGNING_SECRET) {
+    // Never fall through to "assume valid" -- a missing secret is a
+    // deployment error, not a reason to skip verification.
+    throw new Error("SLACK_SIGNING_SECRET is not configured");
+  }
+  // ... rest of verification, as above
+}
+```
+
+```typescript
+try {
+  const isValid = await verifySlackSignature(request, rawBody, env);
+  if (!isValid) return new Response("Unauthorized", { status: 401 });
+} catch (err) {
+  console.error("Signature verification misconfigured:", err);
+  return new Response("Server misconfigured", { status: 500 });
+}
+```
+
+## Production validation and the single-public-route pattern
+
+This page's approach — a plain-`fetch` client with no SDK, reading the raw body exactly once before any parsing, the 5-minute timestamp window, and answering `url_verification` synchronously inline — is the shape validated in a production reference integration, not a simplified sketch.
+
+One pattern from that integration is worth naming explicitly: on an otherwise fully auth-gated internal Worker, the events endpoint is deliberately the **one** route that accepts public, unauthenticated-by-session traffic — it trades a session or API key for a valid Slack signature instead. Every other route on the same Worker sits behind whatever auth scheme protects the rest of the deployment. See [Gated UI and Slack Endpoint](./gated-ui-plus-slack-endpoint.mdx) for the full shape of that Worker — the cookie-gated dashboard, the exact-match exemption for the Slack route, and the static-asset routing quirks that can silently widen the exemption. When smoke-testing a deploy of this shape, cover both directions of that boundary plus the boundary itself:
+
+- A correctly-signed `url_verification` challenge succeeds.
+- An unsigned request to the events route 401s.
+- No other route or method on the Worker accidentally bypasses the gate — a wildcard route that matches the events path prefix without invoking the verification middleware is the easy way to get this wrong.
+
 ## Gotchas
 
 - **`request.json()` before signature checking** silently breaks

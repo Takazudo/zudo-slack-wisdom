@@ -1,14 +1,17 @@
 ---
 title: Errors Reference
-description: Branchable error codes for slackLists.items.update, with causes and context
+description: Branchable, category-driven error codes across the Lists API, with causes, context, and a production handling policy
 sidebar_position: 9
 ---
 
 ## Overview
 
-`slackLists.items.update` returns `{"ok": false, "error": "<code>"}` on failure. This page
-groups the documented error codes by cause so a Worker can branch on `body.error` instead of
-treating every non-`ok` response the same way.
+`slackLists.items.update` and Lists' other write and read methods all return
+`{"ok": false, "error": "<code>"}` on failure. This page groups the documented error codes —
+across every `slackLists.*` method used elsewhere in this section, not just `items.update` — by
+cause, so a Worker can branch on `body.error` instead of treating every non-`ok` response the
+same way. See ["Production Error Handling"](#production-error-handling-branch-on-category-not-code)
+below for how to turn that branching into an actual retry/halt/alert policy.
 
 ## The Full Table
 
@@ -18,16 +21,23 @@ treating every non-`ok` response the same way.
 | `invalid_input_type` | Wrong value key for the column type, or a bare scalar where an array was required |
 | `invalid_array_arg` | An array argument was mangled — usually a form-encoded body instead of JSON |
 | `invalid_column_id` / `column_not_found` | Stale persisted `column_id` |
-| `invalid_row_id` / `row_not_found` | Stale persisted `row_id` |
+| `invalid_row_id` / `row_not_found` | Stale persisted `row_id` (from `items.update`) |
+| `record_not_found` / `record_deleted` | `items.info`'s row-missing spellings — same stale-row meaning as `row_not_found` / `invalid_row_id`, different method, different wording |
+| `duplicated_item_not_found` | `items.create`'s duplicate-from-row source could not be found |
 | `column_id_not_provided` | A cell is missing `column_id` (and did not supply the undocumented `column_id_to_create`) |
 | `uneditable_column` | Target is a computed column (`created_by`, `last_edited_by`, `created_time`, `last_edited_time`) |
 | `over_cell_fields_limit` | Too many cells in one call (docs JSON: `maxItems: 100`) |
 | `over_row_maximum` | Per-list item cap reached (create path; the cap's only authoritative signal) |
+| `list_item_limit_exceeded` / `list_row_limit_exceeded` / `too_many_items` / `too_many_records` | Additional capacity-error spellings surfaced by the source research; **unconfirmed** — see the taxonomy note below |
 | `list_not_found` | Bad `list_id` — also reported for access failures, see below |
 | `no_permission` / `access_denied` / `permission_denied` | Bot token lacks access to this list |
+| `team_access_not_granted` | Token lacks the specific workspace access required — appears across most `slackLists.*` methods, not just `items.update` |
 | `paid_teams_only` | Workspace is on a free plan — Lists is a paid-plan feature |
 | `lists_disabled_user_team` | An admin has disabled Lists for the workspace (distinct from the plan gate above) |
+| `archive_not_supported` | `items.list`'s plan-tier error for the archived-items query — archive filtering isn't available on the caller's plan |
 | `missing_scope` | Token lacks the `lists:write` scope |
+| `not_allowed_token_type` | Wrong token type for this method (e.g. a user token where a bot token is required, or vice versa) |
+| `not_authed` / `invalid_auth` / `token_expired` / `token_revoked` | The broader token-auth family alongside `not_allowed_token_type` — no token present, token fails validation, token expired, or token was revoked |
 | `invalid_blocks` / `invalid_text_block` | Malformed `rich_text` cell on a text/notes column |
 | `ratelimited` | Rate limit hit — honor the `Retry-After` header |
 
@@ -49,12 +59,17 @@ every value is array-wrapped even for a single value.
 ## Stale-ID Errors
 
 `invalid_column_id` / `column_not_found` and `invalid_row_id` / `row_not_found` both mean a
-persisted ID no longer resolves. Since there is no `slackLists.info` or `slackLists.list` to
-re-discover a list's structure, and no "find row by external key" endpoint, the only recovery
-for a stale `row_id` is a full paginated read of the list to rebuild the mapping from
-whatever your own primary key is stored in (for example, a text column mirroring the source
-row's ID). A stale `column_id` means the list's schema changed out from under you — re-read
-`list_metadata.schema` via `items.info`.
+persisted ID no longer resolves. `items.info` reports the same row-missing condition under its
+own spellings, `record_not_found` and `record_deleted` — same cause, different method, different
+wording, so a code-matching branch has to check both families to catch a stale row id regardless
+of which method surfaced it. `items.create`'s `duplicated_item_not_found` is the same shape of
+problem one level removed: the row you asked to duplicate from is itself gone.
+
+Since there is no `slackLists.info` or `slackLists.list` to re-discover a list's structure, and
+no "find row by external key" endpoint, the only recovery for a stale row id is a full paginated
+read of the list to rebuild the mapping from whatever your own primary key is stored in (for
+example, a text column mirroring the source row's ID). A stale `column_id` means the list's
+schema changed out from under you — re-read `list_metadata.schema` via `items.info`.
 
 ## Permission and Access Errors
 
@@ -69,19 +84,28 @@ bot-creates-the-list sidesteps the access question rather than needing to disamb
 error.
 
 `no_permission`, `access_denied`, and `permission_denied` are the more direct access-denied
-family, distinct from the plan-gate and scope errors below.
+family, distinct from the plan-gate and scope errors below. `team_access_not_granted` is the
+same family under a different name — it shows up across most `slackLists.*` methods, not just
+`items.update`, whenever the token's workspace-level access doesn't cover this list.
+
+Because `list_not_found` can mean either "bad ID" or "access problem" and there is no way to
+tell which from the wire, the [category taxonomy below](#production-error-handling-branch-on-category-not-code)
+gives it its own category — `access_or_stale_id` — rather than folding it into either the
+stale-ID group above or the access-denied family here.
 
 ## Plan and Scope Errors
 
-Three errors gate on different things and are easy to conflate:
+Four errors gate on different things and are easy to conflate:
 
 - `paid_teams_only` — the workspace itself is on a free plan; Lists requires a paid plan.
 - `lists_disabled_user_team` — the workspace is paid, but a workspace admin has turned Lists
   off. This is an admin toggle, not a billing state, and both errors can look identical from
   inside a Worker's error-handling branch unless you check for both explicitly.
-- `missing_scope` — the token itself lacks `lists:write`. Unlike the two errors above, this is
+- `archive_not_supported` — `items.list`'s archived-items query isn't available on the caller's
+  plan; a third, narrower plan gate distinct from the two above.
+- `missing_scope` — the token itself lacks `lists:write`. Unlike the errors above, this is
   fixable by reinstalling the app with the correct scope, not by anything the workspace admin
-  controls.
+  or plan tier controls.
 
 ## Rich Text Errors
 
@@ -99,9 +123,57 @@ Java SDK's machine-readable
 how many seconds to wait before retrying; honor it rather than retrying immediately or on a
 fixed interval.
 
+## Production Error Handling: Branch on Category, Not Code
+
+A Worker that branches on the literal error string ends up re-deriving the same handful of
+policies over and over, once per code. It's more robust to map every code into a small category
+taxonomy first, then drive retry/halt/alert policy off the *category* — new codes Slack adds
+later slot into an existing bucket instead of falling through to a default.
+
+| Category | Codes | Policy |
+|---|---|---|
+| `scope` | `missing_scope` | Permanent configuration error |
+| `auth` | `not_allowed_token_type`, `not_authed`, `invalid_auth`, `token_expired`, `token_revoked` | Permanent configuration error |
+| `access` | `no_permission`, `access_denied`, `permission_denied`, `team_access_not_granted` | Permanent configuration error |
+| `access_or_stale_id` | `list_not_found` | Permanent configuration error |
+| `schema` | `invalid_option_id`, `invalid_column_id` / `column_not_found`, `uneditable_column`, `column_id_not_provided`, `invalid_input_type`, `invalid_array_arg`, `invalid_blocks` / `invalid_text_block` | Permanent configuration error |
+| `plan` | `paid_teams_only`, `lists_disabled_user_team`, `archive_not_supported` | Permanent configuration error |
+| `capacity` | `over_row_maximum`, `over_cell_fields_limit`, and the unconfirmed `list_item_limit_exceeded` / `list_row_limit_exceeded` / `too_many_items` / `too_many_records` spellings | Permanent configuration error (a ceiling/design fix, not a retry — see [Item Caps and Auto-Archive](./item-caps.mdx)) |
+| `stale_id` | `invalid_row_id` / `row_not_found`, `record_not_found` / `record_deleted`, `duplicated_item_not_found` | Feed reconciliation |
+| `transient` | `internal_error`, `fatal_error`, `service_unavailable`, `request_timeout` | Backoff |
+| `rate_limit` | `ratelimited` | Backoff |
+
+The first six rows — `scope`, `auth`, `access`, `access_or_stale_id`, `schema`, `plan` — plus
+`capacity` are all **permanent configuration errors**: retrying cannot fix them, because nothing
+about the request changes on the next attempt. On any code in these categories, mark the List
+registration unhealthy, halt sync against that list, and alert — a human (or a schema-drift
+redeploy, see [Schema Mutability](./schema-mutability.mdx#detecting-drift-proactively)) has to
+change something before sync can resume safely.
+
+`transient` and `rate_limit` are the opposite: back off and retry. `ratelimited` carries a
+`Retry-After` header telling you how long; the generic server-error family
+(`internal_error`, `fatal_error`, `service_unavailable`, `request_timeout`) doesn't, so use a
+capped exponential backoff instead.
+
+`stale_id` is neither — it isn't a config problem to halt on, nor pure noise to retry through.
+It means your locally persisted ID no longer resolves, which is exactly the signal a
+[reconcile pass](./no-events-no-idempotency.mdx) exists to correct: feed it into the next
+reconcile cycle to rebuild the mapping rather than either halting the whole sync or blindly
+retrying the same stale ID.
+
+:::warning[Sanitize error codes before logging or echoing]
+`body.error` is response data that reflects whatever request you sent — treat it as
+attacker-influenceable rather than a trusted enum, especially before writing it into a log
+line, an alert payload, or anything an operator might view unescaped. Validate it against
+`^[a-z0-9_]{1,80}$` before logging or echoing it anywhere; fall back to a generic "unrecognized
+error" label for anything that doesn't match rather than passing the raw string through.
+:::
+
 ## Related
 
 For the request/response contract these errors apply to, see
 [Writing List Items](./writing-cells.mdx). For the select-value rules behind
 `invalid_option_id`, see [Select Columns](./select-columns.mdx). For why the schema itself is
-closed to most API-driven changes, see [Schema Mutability](./schema-mutability.mdx).
+closed to most API-driven changes, see [Schema Mutability](./schema-mutability.mdx). For what
+the capacity error `over_row_maximum` means and how to avoid triggering it in normal operation,
+see [Item Caps and Auto-Archive](./item-caps.mdx).

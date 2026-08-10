@@ -50,6 +50,69 @@ async function callSlackApi<T>(
 }
 ```
 
+## A class-based client and the workerd receiver pitfall
+
+Wrapping the call above in a small client class — often to make `fetch`
+injectable for tests — is a natural next step:
+
+```typescript
+class SlackClient {
+  constructor(
+    private readonly botToken: string,
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {}
+
+  async call<T>(method: string, body: Record<string, unknown>): Promise<T> {
+    const res = await this.fetchImpl(`${SLACK_API_BASE_URL}/${method}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${this.botToken}`,
+        "content-type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(body),
+    });
+    const json = (await res.json()) as { ok: boolean; error?: string } & T;
+    if (!json.ok) {
+      throw new Error(`${method} rejected: ${json.error}`);
+    }
+    return json;
+  }
+}
+```
+
+This breaks in production. `this.fetchImpl(url, init)` invokes the stored
+function *with the class instance as its receiver*, and workerd rejects
+that: the native `fetch` implementation requires being called without a
+receiver (or with `undefined`/`globalThis`), so calling it as a method
+throws an illegal-invocation-style error before any request goes out.
+
+```typescript
+// Fix: read fetchImpl into a local binding first, so the call site has
+// no receiver at all.
+async call<T>(method: string, body: Record<string, unknown>): Promise<T> {
+  const fetchImpl = this.fetchImpl;
+  const res = await fetchImpl(`${SLACK_API_BASE_URL}/${method}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${this.botToken}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(body),
+  });
+  // ...
+}
+```
+
+:::danger[This only fails on Workers — not in Node-based tests]
+Node's `fetch` doesn't enforce the same receiver check, so a test suite
+running under a plain Node test runner calls `this.fetchImpl(...)` without
+complaint and the bug ships. It only surfaces at runtime on Workers
+(workerd) — pin the fix with a dedicated unit test that exercises the
+client under a Workers-accurate runtime, such as Cloudflare's
+[Workers Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/),
+not a generic Node test runner, or the regression has no test to catch it.
+:::
+
 ## JSON vs form encoding — use JSON, always
 
 The Web API accepts both `application/x-www-form-urlencoded` and
@@ -81,23 +144,67 @@ await callSlackApi("slackLists.items.update", {
 }, botToken);
 ```
 
+:::note[Read methods are conventionally GET + query string]
+The rule above is about how to encode a **POST body**. Read methods like
+`conversations.history` and `users.info` are conventionally called as `GET`
+with their arguments in the query string, not sent as a JSON body at all —
+there's no encoding choice to make for them, because there's no body.
+:::
+
 ## Honoring `Retry-After`
 
 Web API methods are grouped into rate-limit tiers (Tier 1 through Tier 4,
 roughly 1+ to 100+ requests/minute per method per workspace), plus a
-special tier for a few high-traffic methods like `chat.postMessage`. When a
-call is rate-limited, Slack responds `429 Too Many Requests` with a
+special tier for a few high-traffic methods like `chat.postMessage`. A
+non-Marketplace app without the higher-throughput approval also runs into a
+much coarser per-workspace throttle on top of that — as low as roughly 1
+request/minute on some methods — which is why a legitimate `Retry-After`
+can be as long as ~60 seconds; a retry strategy sized for "a few seconds"
+will clamp or abandon a wait Slack actually meant. When a call is
+rate-limited, Slack responds `429 Too Many Requests`, ideally with a
 `Retry-After` header giving the number of seconds to wait before retrying
 that specific method against that specific workspace.
 
+`Retry-After` isn't guaranteed present or parseable, though: it never
+appears on `5xx` responses at all, and even on `429` it can be missing or
+non-numeric depending on what sits between the Worker and Slack.
+`Number(header ?? "1")` silently produces `NaN` on a malformed header and
+schedules a wait for `NaN` milliseconds — fall back to exponential backoff
+(1 second base, doubling each attempt) whenever the header is missing or
+doesn't parse, and clamp *every* wait, server-supplied or backed-off, to a
+per-path ceiling. Nothing stops a misbehaving intermediary or an
+unanticipated Slack response from sending a huge `Retry-After`, and an
+unclamped wait can blow the isolate's own time or background-work budget
+(see the `ctx.waitUntil()` warning below).
+
+The right ceiling depends on what's being retried, so split the budget by
+call class instead of using one number everywhere:
+
 ```typescript
+interface RetryBudget {
+  maxRetries: number;
+  ceilingMs: number;
+  retryOn5xx: boolean;
+}
+
+// Fail-fast: a single item write inside a request handler. If it's still
+// failing after a couple of quick retries, persist "retry this" state and
+// let the next cron tick pick it up instead of blocking the handler.
+const WRITE_BUDGET: RetryBudget = { maxRetries: 2, ceilingMs: 2_000, retryOn5xx: false };
+
+// Patient: a once-per-tick cron read that can afford to wait out the
+// ~1 req/min non-Marketplace throttle rather than skip the tick entirely.
+const READ_BUDGET: RetryBudget = { maxRetries: 5, ceilingMs: 60_000, retryOn5xx: true };
+
 async function callSlackApiWithRetry<T>(
   method: string,
   body: Record<string, unknown>,
   botToken: string,
-  maxRetries = 3,
+  budget: RetryBudget,
 ): Promise<T> {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  let backoffMs = 1_000;
+
+  for (let attempt = 0; attempt <= budget.maxRetries; attempt++) {
     const res = await fetch(`${SLACK_API_BASE_URL}/${method}`, {
       method: "POST",
       headers: {
@@ -107,12 +214,17 @@ async function callSlackApiWithRetry<T>(
       body: JSON.stringify(body),
     });
 
-    if (res.status === 429) {
-      const retryAfterSeconds = Number(res.headers.get("retry-after") ?? "1");
-      if (attempt === maxRetries) {
-        throw new Error(`${method} rate-limited after ${maxRetries} retries`);
+    const isRateLimited = res.status === 429;
+    const isRetryable5xx = budget.retryOn5xx && res.status >= 500;
+
+    if (isRateLimited || isRetryable5xx) {
+      if (attempt === budget.maxRetries) {
+        throw new Error(`${method} failed after ${budget.maxRetries} retries (status ${res.status})`);
       }
-      await new Promise((resolve) => setTimeout(resolve, retryAfterSeconds * 1000));
+      const header = isRateLimited ? Number(res.headers.get("retry-after")) : NaN;
+      const waitMs = Number.isFinite(header) && header > 0 ? header * 1000 : backoffMs;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(waitMs, budget.ceilingMs)));
+      backoffMs *= 2;
       continue;
     }
 
@@ -126,6 +238,12 @@ async function callSlackApiWithRetry<T>(
 }
 ```
 
+Retrying on `5xx` is a per-path opt-in (`retryOn5xx`), not a default: a
+transient Slack-side error is often worth one retry on a patient read, but
+a write's fail-fast budget usually shouldn't spend its two retries on a
+`5xx` it can't distinguish from a real outage — better to fail fast and let
+the persisted-retry fallback handle it.
+
 :::tip[A rate limit is per method, per workspace]
 Getting `429` from `chat.postMessage` says nothing about whether
 `slackLists.items.update` is also limited. There's no global backoff to
@@ -133,16 +251,18 @@ apply — back off the specific method that returned `429`, and let every
 other call proceed normally.
 :::
 
-:::warning[A long Retry-After can outlive ctx.waitUntil()'s budget]
-Sleeping in-isolate is fine for the short delays Slack typically sends, but
-`Retry-After` has no documented upper bound, and background work registered
-with `ctx.waitUntil()` only gets roughly 30 seconds after the response is
-sent (see [Three-Second Ack](./three-second-ack.mdx)). If this retry runs
-inside that background work and `Retry-After` is long enough to blow the
-budget, the runtime cancels the pending promise mid-wait. For a call where
-that matters, don't loop-and-sleep past a couple of retries in-Worker —
-persist "retry this later" state (KV, D1, a queue) and let the next cron
-tick or a dedicated retry path pick it up instead.
+:::warning[A long wait can outlive ctx.waitUntil()'s budget]
+Sleeping in-isolate is fine for the short delays a write's tight ceiling
+allows, but background work registered with `ctx.waitUntil()` only gets
+roughly 30 seconds after the response is sent (see [Three-Second
+Ack](./three-second-ack.mdx)). If a retry loop runs inside that background
+work and its ceiling is close to or past that budget, the runtime cancels
+the pending promise mid-wait. This is the real argument for keeping the
+write budget's ceiling small (2 seconds, above) rather than reusing the
+read budget's 60-second ceiling everywhere: past a couple of quick
+retries, persist "retry this later" state (KV, D1, a queue) and let the
+next cron tick or a dedicated retry path pick it up instead of looping and
+sleeping in-Worker.
 :::
 
 ## Gotchas
@@ -156,10 +276,11 @@ tick or a dedicated retry path pick it up instead.
   `200`.** Most Web API responses are `200` with the real result in the
   JSON body's `ok` field — check `json.ok`, not just `res.ok` — but `429`
   and transient HTTP-level errors (timeouts, `5xx`) do happen and need
-  their own handling, as the retry helper above does for `429`.
-- **`Retry-After` is authoritative — don't guess your own backoff.** Slack
-  tells you exactly how long to wait; a shorter self-chosen delay just
-  produces another `429`.
+  their own handling, as the retry helper above does.
+- **`Retry-After` is the right signal, but never trust it uncapped.** Slack
+  tells you how long to wait, and that's usually correct — but clamp it to
+  a per-path ceiling before sleeping on it; a missing, malformed, or
+  unexpectedly huge value shouldn't be able to blow the isolate's budget.
 - **Bulk operations should batch, not loop-and-call.** Methods like
   `slackLists.items.update` accept multiple entries in one call (up to a
   documented cap); a cron mirroring many rows should build one batched call

@@ -24,6 +24,13 @@ staying inside the rate limits both methods enforce.
 - [Rate Limits](./rate-limits.mdx) — the Tier 1–4 model, `Retry-After` handling, the
   per-channel message-posting limit, and the 2025–2026 rate-limit changes for non-Marketplace
   apps
+- [Reading Channel History](./reading-channel-history.mdx) — polling `conversations.history` and
+  `conversations.replies` as a read model, with per-tick budgets and replace-on-read idempotency
+- [Reactions](./reactions.mdx) — `reactions.add` as an idempotent state marker, and reading
+  reaction state past skin-tone variants, alias pairs, and truncated user lists
+- [Permalinks and Cross-Channel Alerts](./permalinks-and-cross-channel-alerts.mdx) —
+  `chat.getPermalink`, the permalink-plus-unfurl cross-post pattern, and caching permalinks
+  server-side
 
 ## Two Methods, One Constraint
 
