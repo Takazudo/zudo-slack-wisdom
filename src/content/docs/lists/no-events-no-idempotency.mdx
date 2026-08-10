@@ -109,6 +109,61 @@ At roughly 10 paginated calls per 1,000 rows (Tier 2, 20+/min), a reconcile pass
 to run on every cron tick if the list stays within a bounded working set — see
 [Item Caps and Auto-Archive](./item-caps.mdx) for why you want that bound regardless.
 
+## Reconcile policies: identity, duplicates, vanished rows, foreign rows
+
+The reconcile pass above answers "what rows exist"; these four policies answer the harder
+questions it raises once rows start diverging from a clean 1:1 mapping.
+
+### Identity grammar: a namespaced token, not a title match
+
+Write a namespaced identity token — shaped like `app:item:<id>` — into a rich_text column on
+every mirrored row, and extract it during reconcile with a regex anchored on whitespace
+boundaries, so the token must appear as a whole word rather than as a substring of something
+longer. This is what keeps a human-authored row whose title happens to *look like* an identity
+token from ever matching by accident. Put the app link in the **same cell** as a separate
+rich_text link element, alongside the plain-text token — one column carries both the machine
+identity (the token, matched by regex) and the human affordance (a clickable link).
+
+### Duplicates: a deterministic canonical, not "the first one found"
+
+When reconcile finds more than one row carrying the same identity token, deletion order must be
+deterministic or the sync flaps — a different "winner" on each pass reads as inexplicable data
+churn to anyone watching. Pick the canonical row this way, in order:
+
+1. If one of the duplicate rows is the row currently mapped in your database, keep that one.
+2. Otherwise, keep the oldest by `date_created`, breaking ties with a plain string compare on
+   `row_id`.
+
+Delete every other duplicate. Nondeterminism here — picking whichever row happens to sort first
+in an API response, for example — is exactly what causes the flapping.
+
+### Vanished rows: confirm-missing before recreate, never same-pass
+
+A mapped row absent from **both** the active and archived `items.list` passes is not proof of a
+permanent deletion on first sighting — it can also mean the listing lagged a row that was just
+created. Recreating immediately risks minting a duplicate the moment the listing catches up.
+Instead: null the mapping's `row_id`, mark the source record confirmed-missing, and defer
+recreation to a short interval later — roughly one reconcile pass, or ~60 seconds — rather than
+the same pass that first noticed the row was gone.
+
+### Foreign rows: counted and ignored, never deleted
+
+Rows that carry no identity token at all are foreign — not created by this sync — and reconcile
+must count them for visibility but never delete or otherwise touch them. This is what makes a
+mixed human-and-bot list safe: a reconcile pass that assumes exclusive bot ownership of every
+row will eventually delete something a human added by hand. Foreign-row counting only works
+because of the identity grammar above — without a token to test for, "foreign" is not a
+distinguishable category.
+
+### Hash-skip: no writes for unchanged rows
+
+Before writing any row, serialize its desired per-row projection — the cell values as they
+would be written — and hash it with SHA-256. Compare against the hash stored from the last
+write; if it matches, skip the row entirely: no `items.update` call, no `updated_by` churn, no
+"field changed" notification noise, and near-zero Tier-3 budget consumed on a reconcile pass
+over a list that is mostly stable between ticks. This turns a full-list reconcile from "N calls
+every tick" into "N calls only on rows that actually changed."
+
 ## Related
 
 - [Reading Lists](./reading-lists.mdx) — the `items.list` cursor-pagination mechanics behind
