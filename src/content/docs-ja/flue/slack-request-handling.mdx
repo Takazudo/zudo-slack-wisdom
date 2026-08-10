@@ -8,10 +8,9 @@ sidebar_position: 5
 このページのすべての主張は、タグ付きの `@flue/slack` 2.0.3 source（
 [README](https://github.com/withastro/flue/blob/v2.0.3/packages/slack/README.md)、`createSlackChannel`
 contract、channel blueprint）に対して**ソース検証済み**である。**実行検証はしていない**。この経路で
-実際の Events API delivery、redelivery、interaction payload、slash command を実行したことは一度も
-なく、[記述のラベル](./index.mdx#記述のラベル)で定義した `検証済みの事実` label を持つ主張とは異なる。
+実際の Events API delivery、redelivery、interaction payload、slash command を実行したことは一度もない。
 ここでの delivery-behavior に関する主張（何が agent に届くか、redelivery が何に収束するか）は、実行
-による裏付けのないソースからの再構成として扱う。
+による裏付けのないソースからの再構成として扱い、実行検証の spike を待つ。
 :::
 
 ## Channel の境界
