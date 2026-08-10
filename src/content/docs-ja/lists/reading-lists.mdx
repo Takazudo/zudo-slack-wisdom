@@ -9,7 +9,7 @@ sidebar_position: 20
 | メソッド | 答えるもの | 必要なもの | レート階層 |
 |---|---|---|---|
 | [`items.list`](https://docs.slack.dev/reference/methods/slackLists.items.list/) | 「どんな行が存在するか」 | `list_id` | Tier 2（20+/min） |
-| [`items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/) | 「スキーマはどうなっていて、上限はいくつか」 | `list_id` と既存の `row_id` | 元調査に記載なし |
+| [`items.info`](https://docs.slack.dev/reference/methods/slackLists.items.info/) | 「スキーマはどうなっていて、上限はいくつか」 | `list_id` と既存行の `id` | 元調査に記載なし |
 | [`download.start`](https://docs.slack.dev/reference/methods/) / `download.get` | 「全部まとめてファイルでほしい」 | `list_id` | 元調査に記載なし |
 
 5 つ目の選択肢は存在しない。`slackLists.list`（ワークスペースのリストを列挙する）と `slackLists.info`（行なしでスキーマを読む）はどちらも存在しない — `slack.com/api` への実プローブが両方に `unknown_method` を返して確認済みで、それぞれの「あるはずの」ドキュメントページに対するソフト 404 のバイトサイズ対照でも裏付けられている。何を読み戻すにせよ、上の 3 行のいずれかを通ることになる。そして `list_id` は決して再発見できない — `slackLists.create` が返した瞬間から、それを永続化する責任は呼び出し側にある。
@@ -19,13 +19,17 @@ sidebar_position: 20
 `items.list` が `list_id` 以外に取る引数はちょうど 3 つ、`limit`、`cursor`、`archived` だけ。これが表面のすべてで、フィルタも検索もソートも「X が Y と等しい行を探す」もない。ページネーションは Slack 標準のカーソル形式に従う。`limit` を渡し、レスポンスから `response_metadata.next_cursor` を読み、それが空で返ってくるまでカーソルを渡し続ける。
 
 ```typescript
+const MAX_PAGES = 100;
+
 export async function listAllItems(
   botToken: string,
   listId: string,
   archived = false,
 ): Promise<ListItem[]> {
   const items: ListItem[] = [];
+  const seenCursors = new Set<string>();
   let cursor: string | undefined;
+  let pageCount = 0;
 
   do {
     const res = await fetch("https://slack.com/api/slackLists.items.list", {
@@ -38,17 +42,38 @@ export async function listAllItems(
     });
     const body = (await res.json()) as {
       ok: boolean;
-      items?: ListItem[];
+      items?: unknown;
       response_metadata?: { next_cursor?: string };
     };
     if (!body.ok) throw new Error("slackLists.items.list failed");
-    items.push(...(body.items ?? []));
-    cursor = body.response_metadata?.next_cursor || undefined;
+    if (!Array.isArray(body.items)) {
+      throw new Error("slackLists.items.list: items is not an array");
+    }
+    items.push(...(body.items as ListItem[]));
+
+    pageCount += 1;
+    if (pageCount > MAX_PAGES) {
+      throw new Error(`slackLists.items.list exceeded ${MAX_PAGES} pages`);
+    }
+
+    const next = body.response_metadata?.next_cursor ?? "";
+    if (next === "") {
+      cursor = undefined; // explicit end-of-list, not merely a missing field
+    } else if (seenCursors.has(next)) {
+      throw new Error("slackLists.items.list: repeated cursor");
+    } else {
+      seenCursors.add(next);
+      cursor = next;
+    }
   } while (cursor);
 
   return items;
 }
 ```
+
+:::note[Worker 内でのレスポンスサイズの制限]
+`MAX_PAGES` とページあたりの `limit: 100` を組み合わせると、メモリ上に蓄積される行数は最大 10,000 行に収まる。この上限は付け足しではなく意図的なものだ — Cloudflare Worker の isolate にはリクエストごとに固定のメモリ上限があり、際限なく大きくなり続けるリスト（あるいは空のカーソルを永遠に返さないサーバー側のバグ）に対する `items.push(...)` の無制限ループは、きれいなエラーではなくメモリ不足による強制終了に行き着く。リストがページ上限を正当に超えうる場合は、呼び出し側で全件を 1 つの配列に蓄積するのではなく段階的に処理するか、インメモリの全件走査の代わりに（後述の）`download.start` / `download.get` によるファイルエクスポートを使うこと。
+:::
 
 1,000 行を一巡すると `limit` 100 でおよそ 10 回のページネーション呼び出しになる — cron 1 ティックにつき 1 回の照合パスなら Tier 2（20+/min）に余裕で収まる。`items.list` は各行に `updated_by` も返す。これは「この行を人間が触ったか」を知る唯一のシグナルで、bot が排他的に所有しているはずのリストで発生した想定外の編集を検知するのに使える（[イベントなし、冪等性なし](./no-events-no-idempotency.mdx)を参照）。
 
@@ -64,21 +89,40 @@ export async function listAllItems(
 
 ## `items.info` — スキーマを読み戻す唯一の手段。ただし先に行が要る
 
-`items.info` は 1 行に**加えて**リストのメタデータ一式（名前、スキーマ（全列とその型）、ビュー、上限）を返す。作成後にスキーマを読み戻せる場所は、`slackLists.create` 自身のレスポンスを除けばここだけだ — そして落とし穴が引数リストに焼き込まれている。このメソッドは `list_id` だけでなく `row_id` を取る。尋ねるための行をすでに持っていないかぎり、「このリストはどんな形をしているのか」とは訊けない。
+`items.info` は 1 行に**加えて**リストのメタデータ一式（名前、スキーマ（全列とその型）、ビュー、上限）を返す。作成後にスキーマを読み戻せる場所は、`slackLists.create` 自身のレスポンスを除けばここだけだ — そして落とし穴が引数リストに焼き込まれている。このメソッドは `list_id` に加えて、既存行の `id` を取る。尋ねるための行をすでに持っていないかぎり、「このリストはどんな形をしているのか」とは訊けない。
 
 つまり `items.info` は*発見*のためのツールではなく*復旧*のためのツールだ。想定されている流れはこうなる。
 
 1. **`slackLists.create` の時点で `list_id` とすべての `column_id` を永続化する。** 作成レスポンスは、これらが行なしで返ってくる唯一の場所だ。
-2. その永続化データが失われた場合、既知の行に対する `items.info` でスキーマを再構築できる — ただし出発点となる行 ID は 1 つ必要になる。
+2. その永続化データが失われた場合、既知の行に対する `items.info` でスキーマを再構築できる — ただし出発点となる行 ID は 1 つ必要になる。恒久的な行を固定せずに常に 1 つ手元に持っておく方法が、次のライフサイクルだ。
 
 ### センチネル行パターン
 
-`items.info` にしか教えられないものが 2 つある — スキーマと `list_limits`（`row_count`、`row_count_limit`、`archived_row_count`）— そのどちらも入場料として行 ID を要求する。ミラーしているデータ行の 1 つをこの用途に充てるのは無駄が多く、しかも脆い（その行が自前の上限退避ロジックで削除されると、リストへの唯一のハンドルごと失われる）。元調査から導かれる実践的な解決策は、リスト作成時に使い捨ての**センチネル行**を 1 つ作り、決して削除せず、スキーマや上限が必要になったら常にその固定行 ID に対して `items.info` を呼ぶことだ — 実際のミラー作業セットと競合しない、恒久的で安価なアンカーになる。
+`items.info` にしか教えられないものが 2 つある — スキーマと `list_limits`（`row_count`、`row_count_limit`、`archived_row_count`）— そのどちらも入場料として行 ID を要求する。ミラーしているデータ行の 1 つをこの用途に充てるのは動きはするが単独では脆い（その行が自前の上限退避ロジックで削除されると、リストへのハンドルごと失われる）。ただし、このリスクは「使い捨ての行を 1 つ固定して決して削除しない」ことの根拠にはならない — むしろ、フォールスルーの連鎖でアンカー行を実行のたびに*動的に*解決すべきだという根拠になる。個々の行を失っても、代償は `items.list` 呼び出し 1 回分だけで、ハンドルそのものは失わない。
+
+永久に削除しないセンチネルは、実際に運用者が目にするリストにとっても不適切な形だ。ずっとそこに居座る空の行は、運用者から見ればゴミにしか見えない。運用者が手で削除し、復旧ロジックが次のティックでそれを再作成し、インテグレーションはまるでゴミ行を量産しているように見える。それに加えて不要でもある — `items.info` が返すスキーマは**リストレベル**（`list.list_metadata.schema`）のものなので、アーカイブ済みの行を含め、どの行も等しく有効なハンドルになる。以下のライフサイクルでは、センチネルは常設の備品ではなく最後の手段として扱う。
+
+1. **アンカーの解決順序。** `items.info` を呼ぶ対象の行を、次の順で試し、最初に解決できたところで止める：記録済みのセンチネル行 ID があればそれ、なければ `items.list` から得られる任意の行（アクティブな行を優先し、次に `archived: true` の行）、そのどちらも空だった場合にのみ、空の行を新規作成してその ID を新しいセンチネルとして記録する。
+2. **行消失レースへのフォールスルー。** `items.list` の呼び出しと、それに続く `items.info` の呼び出しの間に、行が削除されることがある。`items.info` はこれをスキーマ読み取りの失敗としてではなく、`record_deleted`、`record_not_found`、`row_not_found`、`invalid_row_id` のいずれかとして表面化させる。このエラー群を個別に捕捉し、アンカーの解決順序に沿って次の候補へ進む。病的なケースで無限ループにならないよう、試行回数には小さな上限（~5 回）を設ける。この 4 つのコードは `list_not_found` とは明確に異なる — こちらはフェイルクローズドのままにする。リストそのものへのアクセスが失われているということであり、別の行 ID をいくら再試行しても解決しない。
+3. **退役。** リストが実際の行を 1 つでも持つようになったら、センチネルは役目を終えている：削除し、記録している ID をクリアする。順序が重要だ — **永続化を先に行う**：Slack 上で行を削除する間もセンチネル ID の記録は残したままにし、その削除呼び出しが成功したあとにだけ記録済み ID をクリアする。先に ID をクリアしてから削除に失敗すると、ID が永遠にわからない空の行が取り残される。永続化を先に行っておけば、次のティックでどちらの失敗方向からも復旧できる — 削除に失敗した場合は同じ既知の ID に対して単に再試行すればよく、ID クリアに失敗した場合はすでに存在しない行を単に再削除するだけになる（成功とみなしてよい `record_deleted` だ）。
+4. **運用者が手で削除したものを再作成しない。** 実際の行が残っているあいだに運用者がセンチネルを削除したら、削除されたままにしておく — アンカーの解決順序はすでに次の実行で実際の行にフォールスルーする。あとでリストが空になれば、必要になった次のティックで、上のステップ 1 を通じて自然にセンチネルが再作成される。空の行が存在するのは、空のリストを誰も見ていない間だけになる。
+5. **引数の名前を正しく付ける。** `items.info` は行 ID を `list_id` と並べて `id` として受け取る — `items.update` の `cells[]` の各エントリが同じ概念に使っている `row_id` ではない。この 2 つを取り違えると、型エラーにはならず一部のクライアント実装では引数が黙って落とされることがあるので、最初から正しく書くだけの価値がある。
 
 ```typescript
-// Created once, alongside the list, and never touched again except as
-// the fixed target for items.info schema/limit reads.
-const SENTINEL_ROW_ID = "Rec0SENTINEL01"; // persisted at list-creation time
+// Stored per list. Recorded when a sentinel is created (step 1), cleared once
+// the List carries a real row (step 3), and re-created on demand if the List
+// empties out again (step 4) — never a fixed, permanent id.
+let sentinelRowId: string | null = await loadSentinelRowId(listId);
+
+// items.info takes the row id as `id`, not `row_id` — see step 5 above.
+const res = await fetch("https://slack.com/api/slackLists.items.info", {
+  method: "POST",
+  headers: {
+    authorization: `Bearer ${botToken}`,
+    "content-type": "application/json; charset=utf-8",
+  },
+  body: JSON.stringify({ list_id: listId, id: sentinelRowId }),
+});
 ```
 
 :::note
