@@ -1,0 +1,216 @@
+---
+title: 認証付き UI と Slack エンドポイント
+description: 認証で保護したダッシュボードと Slack の webhook を 1 つの Worker で捌く。run_worker_first、完全一致のバイパス、HMAC クッキー、そしてディープリンクを壊す静的アセットの癖。
+sidebar_position: 8
+---
+
+## 概要
+
+このセクションが取る立場 -- Slack の呼び出しはすべて Worker のなかで行い、Slack 由来のものはブラウザへ渡さない -- は、ある形を含意しながら、それを一度も説明していない。人間向けのダッシュボードをログインゲートの内側で配信し、**かつ**同じオリジンで Slack の webhook を受け取る、1 つの Worker である。ある本番リファレンス連携はまさにこの形に行き着いたのだが、その組み立ては見た目ほど自明ではない。2 種類の相手がまったく異なる方法で認証してくるうえに、Cloudflare の静的アセット層がその両方の手前に居座っているからだ。
+
+ダッシュボード側はクッキーを持ったブラウザである。Slack 側は署名を持ち、クッキーをまったく持たないサーバーである。どちらも相手の資格情報を使えないため、1 つの Worker が 2 本の認証経路を走らせ、その境界がどこに引かれるかについて厳密でなければならない。
+
+## ここでの `run_worker_first` は任意設定ではない
+
+既定のルーティング順序は、Worker のコードで書いたゲートを黙って無効化する。[Cloudflare の Worker スクリプトのルーティングドキュメント](https://developers.cloudflare.com/workers/static-assets/routing/worker-script/)によれば、こうである。
+
+> 静的アセットと Worker スクリプトの両方を設定している場合、Cloudflare はまず、受信リクエストに一致する静的アセットがあればそれを配信しようとする。
+
+Cloudflare が Worker スクリプトを呼び出すのは、一致するアセットがひとつもなかったときだけである。つまり、アセットディレクトリのファイルに解決されるパス -- ダッシュボードの `index.html`、その JavaScript バンドル、各ページのシェル -- はすべて、あなたの Worker が走る前に配信される。ゲートはバグで迂回されるのではない。そもそも参照されないのだ。
+
+さらに範囲は広がる。[Cloudflare のアセットバインディングのドキュメント](https://developers.cloudflare.com/workers/static-assets/binding/)によれば、Worker スクリプトがあり、`assets.not_found_handling` を設定しており、互換性日付が `2025-04-01` 以降（あるいは `assets_navigation_prefers_asset_serving` フラグ）である場合、「ナビゲーションリクエストは Worker スクリプトを呼び出さない」。ここでいうナビゲーションリクエストとは `Sec-Fetch-Mode: navigate` を伴うリクエストのことで、ブラウザはページへ遷移するときにこれを自動的に付ける。ログアウトした人がアドレスバーに打ち込みうる URL は、ファイルに一致しないものも含めてすべてこれに当たる。
+
+解決策は、Cloudflare 自身がまさにこの用途を指して挙げている設定である。曰く、「静的アセットの配信より先に Worker スクリプトを走らせたい場合（リクエストのログ取りや、なんらかの認証チェックを行いたい場合など）は、追加で `assets.run_worker_first` を設定できる。これは、他のアセットが一致しないときの `assets.not_found_handling` の挙動を保ったまま、Worker スクリプトでアプリケーションへのアクセスを制御できるようにする」。
+
+```toml
+name = "slack-ops-worker"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+
+[assets]
+directory = "./dist/"
+binding = "ASSETS"
+run_worker_first = true
+not_found_handling = "single-page-application"
+```
+
+`run_worker_first` は `true` かルートパターンの配列を取り、既定値は `false` である。曰く、「`run_worker_first = false`（既定）はリクエストに一致する静的アセットをそのまま配信し、`run_worker_first = true` は無条件に Worker スクリプトを呼び出す」。ゲートを設けるなら正しい値は `true` しかない。配列は Worker へ到達するパスの許可リストであり、言い換えれば、まだ思いついていない穴の一覧でしかないからだ。
+
+## Worker: すべてを閉じ、1 つのルートだけを免除する
+
+```typescript
+export interface Env {
+  ASSETS: Fetcher;
+  DASHBOARD_PASSWORD: string;
+  SLACK_BOT_TOKEN: string;
+  SLACK_SIGNING_SECRET: string;
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    // Slack cannot carry the browser's gate cookie, so this one route is
+    // exempt from it -- and authenticates by signature instead.
+    // Exact method + exact path: no prefix match, no method wildcard.
+    if (request.method === "POST" && url.pathname === "/slack/events") {
+      return await handleSlackEvents(request, env, ctx);
+    }
+
+    if (!(await hasValidGateCookie(request, env))) {
+      return renderLoginPage();
+    }
+
+    // Gate passed -- the Worker serves the assets itself from here on.
+    return await env.ASSETS.fetch(request);
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+`run_worker_first = true` のもとでは、ファイルを配信するのは `env.ASSETS.fetch()` だけであり、それはゲートを通過したあとにしか走らない。この反転こそがセキュリティ上の性質のすべてである。アセットは並行する入り口であることをやめ、Worker が手渡すものになる。
+
+:::danger[Slack のルートが免除されているのはクッキーであって、認証そのものではない]
+`POST /slack/events` がゲートを飛ばすのは、Slack に送れるクッキーがないからであって、そこが公開エンドポイントだからではない。ボディに反応する前に、signing secret に対して `X-Slack-Signature` を検証しなければならない。片方の資格情報チェックを外して、もう片方を足さないなら、その免除は URL を知った誰もが POST できる開いたエンドポイントに変わる。
+:::
+
+### なぜ完全一致でなければならないのか
+
+`url.pathname.startsWith("/slack")` は `/slack/admin` も `/slack/debug` も、今後そのプレフィックスの下に置かれる何もかもを免除してしまう。メソッドのチェックを落とせば `GET /slack/events` が免除され、それは人間がブラウザでハンドラーを覗ける状態そのものである。どちらの間違いもレビューでは無害に見える。完全一致とプレフィックス一致の差は、メソッド呼び出し 1 つぶんしかないからだ。
+
+正常系だけでなく、その外側を主張するテストで固定しておく。
+
+```typescript
+const MUST_BE_GATED = [
+  ["GET", "/"],
+  ["GET", "/slack"],
+  ["GET", "/slack/events"],
+  ["POST", "/slack/events/"],
+  ["POST", "/slack/events/extra"],
+  ["POST", "/api/runs"],
+] as const;
+
+it("only POST /slack/events bypasses the gate", async () => {
+  for (const [method, path] of MUST_BE_GATED) {
+    const res = await worker.fetch(new Request(`https://example.com${path}`, { method }));
+    expect(res.status, `${method} ${path} should be gated`).toBe(401);
+  }
+
+  const slack = await worker.fetch(signedSlackRequest("/slack/events"));
+  expect(slack.status).toBe(200);
+});
+```
+
+ログイン用の HTML を `200` ではなく `401` で返すことが、この主張を曖昧さのないものにしている。ついでに、クローラーがシェルをインデックスするのも防げる。
+
+## ゲートのクッキー: HMAC で署名し、`crypto.subtle` だけで組む
+
+Workers では Node の `crypto` モジュールは既定で使えず、組み込みの道は Web Crypto API、すなわち [`crypto.subtle`](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/) である。署名付きクッキーにはそれで十分であり、このゲートに必要なのもそれだけだ。`issuedAt.nonce.signature` という形のトークンで、署名部分はサーバーが再計算でき、他の誰にも作れない HMAC である。
+
+```typescript
+const COOKIE_NAME = "dash_gate";
+const MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
+
+async function sign(payload: string, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function issueGateCookie(env: Env): Promise<string> {
+  const payload = `${Math.floor(Date.now() / 1000)}.${crypto.randomUUID()}`;
+  const token = `${payload}.${await sign(payload, env.DASHBOARD_PASSWORD)}`;
+  return `${COOKIE_NAME}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${MAX_AGE_SECONDS}`;
+}
+
+async function hasValidGateCookie(request: Request, env: Env): Promise<boolean> {
+  const token = readCookie(request, COOKIE_NAME);
+  if (!token) return false;
+
+  const parts = token.split(".");
+  if (parts.length !== 3) return false;
+  const [issuedAt, nonce, signature] = parts;
+
+  const age = Math.floor(Date.now() / 1000) - Number(issuedAt);
+  if (!Number.isFinite(age) || age < 0 || age > MAX_AGE_SECONDS) return false;
+
+  // Sign the RAW string parts, never a re-serialized number: "0007" and "7"
+  // parse to the same value but are different bytes to the HMAC.
+  const expected = await sign(`${issuedAt}.${nonce}`, env.DASHBOARD_PASSWORD);
+  return timingSafeEqual(signature, expected);
+}
+```
+
+HMAC の鍵をパスワードのシークレットそのものにすることで、3 つの性質がついてくる。
+
+- **パスワードをローテーションすれば全員がログアウトされる。** 出回っているクッキーはすべて古い鍵で署名されているので、新しいシークレットがデプロイされた瞬間に、そのすべてが検証を通らなくなる。セッションストアも失効リストも要らない。
+- **クッキーの名前と構造は公開リポジトリに置いてよい。** 秘密は鍵にあるのであって、形式にはない。`dash_gate` も、3 分割という形も、7 日間という有効期間も、コミットして安全である。攻撃者がそれらを知っても、シークレットがなければ何も得られない。
+- **偽造されたクッキーは推測ではなく署名で落ちる。** 比較は定数時間で行う。Slack 自身のリクエスト検証が同じことを求めているのと、理由は同じである。
+
+この文脈で `Strict` ではなく `SameSite=Lax` を選ぶのは意図的だ。人々は Slack に投稿されたリンクをクリックしてダッシュボードへ来るのであり、それはトップレベルのナビゲーションとして届く。`Strict` はまさにそのクリックでクッキーを送らず、Slack からのリンクをすべてログイン画面で出迎えることになる。
+
+## ディープリンクを壊す静的アセットの癖
+
+アセット層の 2 つの既定挙動は、実行時の識別子を含む URL -- `/runs/<id>`、`/channels/<id>` のような、Slack のメッセージに最も載りやすい種類のリンク -- と相性が悪い。
+
+### SPA の `not_found_handling` が返すのはルートの `index.html` だけである
+
+[Cloudflare の SPA ルーティングのドキュメント](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/)は、それがどのファイルなのかを明示している。曰く、「受信リクエストが `assets.directory` 内のファイルに一致しない場合、Workers は `/index.html` の内容を `200 OK` ステータスで配信する」。
+
+ルートのものである。常に。単一バンドルの純粋な SPA ならそれで正しい。しかし、`/runs/index.html`、`/channels/index.html` のように、それぞれ独自のシェルを持つ複数ディレクトリとして作られたダッシュボードでは、静かに誤りになる。`/runs/abc123` へのリクエストはどのファイルにも一致しないので、訪問者には**ルートの**シェルが返り、それは違うビューを起動し、id を一度も受け取らない。
+
+解決策は、リクエストをアセットバインディングへ渡す前に、Worker 側でシェルの正規 URL へ書き換えることだ。
+
+```typescript
+const RUNTIME_ID_ROUTES: Array<[RegExp, string]> = [
+  [/^\/runs\/[^/]+\/?$/, "/runs/"],
+  [/^\/channels\/[^/]+\/?$/, "/channels/"],
+];
+
+function rewriteToShell(url: URL): URL | null {
+  for (const [pattern, shell] of RUNTIME_ID_ROUTES) {
+    if (pattern.test(url.pathname)) {
+      const rewritten = new URL(url);
+      rewritten.pathname = shell;
+      return rewritten;
+    }
+  }
+  return null;
+}
+
+// In fetch(), after the gate passes:
+const shellUrl = rewriteToShell(url);
+return await env.ASSETS.fetch(shellUrl ? new Request(shellUrl, request) : request);
+```
+
+リダイレクトではなく書き換えである。ブラウザのアドレスバーには `/runs/abc123` が残るので、クライアント側のコードは `location.pathname` から id を読める。ディープリンクが存在する理由はそこにしかない。
+
+### 既定の `html_handling` によるリダイレクトはブラウザまで届く
+
+書き換え先が `/runs/` でなければならない理由が、2 つ目の癖である。`html_handling` の既定値は `auto-trailing-slash` であり、[Cloudflare の HTML ハンドリングのドキュメント](https://developers.cloudflare.com/workers/static-assets/routing/advanced/html-handling/)によれば、その既定値はディレクトリのシェルを次のように解決する。
+
+| 受信リクエスト | レスポンス | 配信されるアセット |
+|---|---|---|
+| `/runs/` | 200 | `/dist/runs/index.html` |
+| `/runs` | `/runs/` へ 307 | -- |
+| `/runs/index.html` | `/runs` へ 307 | -- |
+| `/runs/index` | `/runs` へ 307 | -- |
+
+そのまま配信されるのは末尾スラッシュの形だけだ。それ以外はすべて `307` であり、`307` はブラウザまで旅をしてアドレスバーを書き換える、れっきとした HTTP レスポンスである。したがって `/runs/index.html` への書き換えは、見た目とは正反対のことをする。ブラウザは `/runs` へ飛ばされ、さらに `/runs/` へ飛ばされ、保とうとしていた識別子は、クライアントのコードが動き出す前に URL から消えている。
+
+バインディング経由にしてもこれは回避できない。Cloudflare は、`env.ASSETS.fetch()` を通したリクエストには「`html_handling` と `not_found_handling` の設定が適用される」と明記している。同じ規則が、呼び出し元が自分のコードになるだけで、そのまま働く。
+
+## つまずきどころ
+
+- **`run_worker_first = true` はアセット 1 つごとに呼び出しを課金する。** ナビゲーションリクエストの最適化は、まさに「Worker スクリプトの課金対象となる呼び出しを減らす」ために存在しており、これを有効にするとその恩恵を、画像もバンドルも含めたすべてのリクエストについて手放すことになる。ゲートを持つことの代価である。驚くのではなく、最初から見込んでおくこと。
+- **選択的な配列形式には新しめのツールチェーンが要る。** ルートパターンの配列としての `run_worker_first` は Wrangler v4.20.0 以上（Cloudflare Vite プラグインは v1.7.0 以上）を必要とする。そもそもゲートには不適な道具でもある。ここに挙げたのは、例としていちばんよく見かける形だからにすぎない。
+- **`env.ASSETS.fetch()` はホスト名を無視する。** Cloudflare は「アセットの一致には URL のパス名だけが使われる」と記しており、どのオリジンで組み立てた書き換え URL でも解決結果は同じになる。書き換えを作るぶんには便利だが、そこでホストベースのルーティングが効くと期待していたなら罠である。
+- **ゲートの検証は curl ではなく、ログアウト状態のブラウザで行うこと。** ナビゲーションリクエストの挙動は `Sec-Fetch-Mode: navigate` を手がかりにしており、これはブラウザが送りコマンドラインのクライアントは送らないヘッダーである。`curl` での確認を通るゲートでも、URL を打ち込んだ人には開けっ放しでありうる。
+- **`Secure` クッキーは `localhost` でも動く。** ブラウザは `localhost` をセキュアなコンテキストとして扱うので、本番向けのクッキー属性にローカル用の別版は要らない。`wrangler dev` のために弱めて、戻し忘れる、ということをしないこと。
