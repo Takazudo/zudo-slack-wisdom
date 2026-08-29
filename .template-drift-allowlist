@@ -15,3 +15,12 @@
 # base/features templates, so the drift check flags them.
 pages/docs/[[...slug]].tsx
 pages/[locale]/docs/[[...slug]].tsx
+
+# ── Minified HTML compatibility: check-links.js ───────────────────────────
+# zfb's production HTML emits unquoted href/id attributes. The 5.13.1
+# scaffold checker only recognizes quoted values, which makes its built-site
+# pass silently skip navigation links and anchors. Keep the scaffold checker
+# plus the small unquoted-attribute compatibility patch guarded by
+# scripts/check-links.test.mjs; backslashes stay excluded so escaped demo
+# markup is not mistaken for a real attribute. Track zudolab/zudo-doc#3720.
+scripts/check-links.js
