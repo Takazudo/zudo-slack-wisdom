@@ -5,6 +5,7 @@ export default defineConfig(
   zudoDoc({
     siteName: "zudo-slack-wisdom",
     siteDescription: "Slack developer knowledge base with a Cloudflare Worker backend editorial stance, for me and AI agents",
+    themePack: "observatory",
     // Must be explicit: zudo-doc defaults `logo` to "auto", which silently
     // renders a generated mark seeded by siteName instead of this site's own.
     // The asset is a flat fill:#fff silhouette by design — it is consumed as a

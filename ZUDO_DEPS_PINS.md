@@ -10,6 +10,6 @@ Updated by /dev-bump-zudo-deps on every sync — keep `pinned:` accurate.
 - files: .claude/skills/zudo-doc-design-system/SKILL.md, .claude/skills/zudo-doc-translate/SKILL.md, .claude/skills/zudo-doc-version-bump/SKILL.md, pages/docs/[[...slug]].tsx, pages/index.tsx, pages/[locale]/docs/[[...slug]].tsx, public/favicon-16x16.png, public/favicon-32x32.png, public/favicon.ico, public/favicon.svg, scripts/check-links.js, scripts/setup-doc-skill.sh, src/styles/global.css, tsconfig.json
 - source: packages/create-zudo-doc/templates/base/ -> repo root; packages/create-zudo-doc/templates/features/i18n/files/ -> repo root; packages/create-zudo-doc/templates/features/claudeSkills/files/ -> repo root
 - track: releases
-- pinned: 7ca73f197021961603c22042748c23d9ce9d6c50 (v5.13.1)
-- updated: 2026-08-29
-- notes: The two doc route stubs are patched for doc history and check-links.js preserves unquoted href/id support for minified zfb HTML while excluding backslashes so escaped demo markup is not treated as live attributes; preserve the intentional divergences in .template-drift-allowlist and the package scripts' explicit `SKILL_NAME=slack-wisdom` override, while non-allowlisted scaffold files must match upstream exactly.
+- pinned: 58839021301cb6b5b4bf2eb950a285f910ca8ca1 (v5.26.2)
+- updated: 2026-09-20
+- notes: The two doc route stubs are patched for doc history; preserve those intentional divergences in .template-drift-allowlist and the package scripts' explicit `SKILL_NAME=slack-wisdom` override, while non-allowlisted scaffold files must match upstream exactly.
