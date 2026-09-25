@@ -33,10 +33,10 @@
     "b4push": "bash scripts/run-b4push.sh"
   },
   "dependencies": {
-    "@takazudo/zfb": "2.20.3",
-    "@takazudo/zfb-runtime": "2.20.3",
-    "@takazudo/zfb-md-wasm": "2.20.3",
-    "@takazudo/zfb-adapter-cloudflare": "2.20.3",
+    "@takazudo/zfb": "2.20.4",
+    "@takazudo/zfb-runtime": "2.20.4",
+    "@takazudo/zfb-md-wasm": "2.20.4",
+    "@takazudo/zfb-adapter-cloudflare": "2.20.4",
     "@takazudo/zudo-doc": "^5.27.0",
     "zod": "^4.3.6",
     "preact": "^10.29.1",
