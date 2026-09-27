@@ -43,7 +43,6 @@
     "preact-render-to-string": "^6.6.6",
     "katex": "^0.16.38",
     "diff": "^8.0.3",
-    "@takazudo/zdtp": "0.8.5",
     "minisearch": "^7.2.0",
     "@takazudo/zudo-doc-history-server": "^5.28.1"
   },
