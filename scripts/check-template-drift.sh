@@ -10,7 +10,7 @@ fi
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ALLOWLIST="$ROOT_DIR/.template-drift-allowlist"
 
-# v5 note: the v4-era sibling this script was ported from reads templates
+# Thin-host note: the v4-era sibling this script was ported from reads templates
 # straight out of `node_modules/create-zudo-doc` because that project keeps
 # create-zudo-doc pinned as a devDependency. Here, create-zudo-doc is a
 # one-shot scaffolding CLI (`pnpm create zudo-doc`) and is deliberately NOT a
@@ -23,7 +23,7 @@ ALLOWLIST="$ROOT_DIR/.template-drift-allowlist"
 # create-zudo-doc version is derived from the INSTALLED `@takazudo/zudo-doc`
 # version (node_modules, i.e. what the lockfile actually resolved) rather
 # than the package.json range specifier — package.json pins zudo-doc with a
-# caret (`^5.2.0`), so reading the specifier would silently pin the templates
+# caret (`^7.0.0`), so reading the specifier would silently pin the templates
 # to the range's minimum forever, even after a `pnpm up` resolves a newer
 # compatible zudo-doc release. The two packages ship in lockstep (same
 # release train), so this stays correct across future zudo-doc bumps with no
@@ -126,7 +126,7 @@ done < <(find "$BASE_DIR" -type f -print0 | sort -z)
 echo "Checking feature template files..."
 
 # Only check features that were scaffolded for this site (see
-# setup-preset.json `features`). create-zudo-doc 5.x ships template-file
+# setup-preset.json `features`). create-zudo-doc 7.x ships template-file
 # feature dirs for: i18n, claudeSkills, tauri, tauriDev — everything else
 # (search, sidebarResizer, docHistory, llmsTxt, claudeResources,
 # skillSymlinker, ...) is package-internal and toggled via the `zudoDoc()`

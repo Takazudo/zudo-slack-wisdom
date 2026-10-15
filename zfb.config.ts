@@ -30,7 +30,7 @@ export default defineConfig(
     },
     // Noto Sans JP webfont for JA + Latin body text. Emitted as real <head>
     // links (preconnect + async stylesheet); never load the font via CSS
-    // @import — Tailwind v4 bundling can push it past the first style rule and
+    // @import — CSS bundling can push it past the first style rule and
     // the browser silently drops it.
     head: {
       preconnect: [
