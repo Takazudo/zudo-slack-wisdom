@@ -10,16 +10,18 @@ generated: true
 
 # zudo-slack-wisdom
 
-Documentation site built with [zudo-doc](https://github.com/zudolab/zudo-doc) — a zfb-based documentation framework with MDX, Tailwind CSS v4, and Preact islands. This project is intentionally minimal: one config file (`zfb.config.ts`) plus markdown content — layout, chrome, and islands all ship from `@takazudo/zudo-doc` in `node_modules`.
+Documentation site built with [zudo-doc](https://github.com/zudolab/zudo-doc) — a zfb-based documentation framework with MDX, zudo-wind utilities, and zudo-react islands. This project is intentionally minimal: one config file (`zfb.config.ts`) plus markdown content — layout, chrome, and islands all ship from `@takazudo/zudo-doc` in `node_modules`.
 
 ## Tech Stack
 
 - **zfb** — documentation build framework
 - **MDX** — content format, authored under `src/content/`
-- **Tailwind CSS v4** — compiled by zfb's embedded Tailwind engine (no `@tailwindcss/vite` plugin, no `tailwindcss` dependency); `src/styles/global.css` imports `tailwindcss/preflight` + `tailwindcss/utilities` and zfb's internal resolver serves both
-- **Preact** — for interactive islands only (with compat mode for React API)
+- **zudo-wind** — zfb compiles the package utility manifest; `src/styles/global.css` imports the public zudo-doc CSS and uses plain `:root` custom properties
+- **zudo-react** — zfb-owned rendering and interactive islands; the package base tsconfig owns JSX settings
 - **zfb semantic highlighting** — native build-time fenced-code rendering plus lazy `@takazudo/zfb-md-wasm` for HtmlPreview; both emit `hi-*` classes resolved through `--zd-syntax-*` design tokens
-- **@takazudo/zudo-doc** — the package that owns everything: layout, chrome, islands, default `@theme` design tokens, and (via `packageOwnedRoutes`, on by default) the doc routes themselves
+- **@takazudo/zudo-doc** — the package that owns everything: layout, chrome, islands, default CSS design tokens, and (via `packageOwnedRoutes`, on by default) the doc routes themselves
+
+Runtime: Node 24 (`>=24 <25`), matching CI and `@types/node` 24.
 
 ## Commands
 
@@ -137,7 +139,7 @@ Admonitions (above), tabbed content (`<Tabs>` / `<TabItem>`, `<CodeGroup>`), and
 - English (default): `/docs/...` — content in `src/content/docs/`
 - Japanese: `/ja/docs/...` — content in `src/content/docs-ja/`
 - Japanese docs mirror the English directory structure (same relative path under `docs-ja/`)
-- Both `pages/docs/[[...slug]].tsx` and `pages/[locale]/docs/[[...slug]].tsx` are self-contained doc-route stubs shipped by the generator — required so `pnpm dev` doesn't 404 on doc pages (a zfb dev-mode limitation on package-injected dynamic routes). Don't delete them.
+- Both `pages/docs/[[...slug]].tsx` and `pages/[locale]/docs/[[...slug]].tsx` are self-contained doc-route stubs shipped by the generator — retained for explicit host route ownership in dev and build. Don't delete them.
 
 **Bilingual rule**: every content PR that adds or changes a doc page carries **both** the English (`docs/`) and Japanese (`docs-ja/`) versions of that page. Code blocks, Mermaid diagrams, and any other non-prose content must be **byte-identical** between the two languages — only the surrounding prose is translated. If a Japanese version doesn't exist yet, create it in the same PR.
 
