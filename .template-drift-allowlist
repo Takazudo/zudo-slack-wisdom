@@ -1,6 +1,7 @@
-# Intentional divergences from published create-zudo-doc@7.0.0.
-# Three-way reconciliation against 5.28.1 and 7.0.0 preserves host additions.
-# All other base/i18n/claudeSkills files match the published scaffold bytes.
+# Intentional divergences from published create-zudo-doc@10.0.0.
+# The doc-history feature patch is applied by create-zudo-doc at scaffold time
+# and is not in the static template bytes. All other base/i18n/claudeSkills
+# files match the published scaffold bytes.
 
 # Doc-history feature patches bind the server boundary and preserve host slots.
 pages/docs/[[...slug]].tsx
