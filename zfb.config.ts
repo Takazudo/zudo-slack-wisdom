@@ -5,7 +5,10 @@ export default defineConfig(
   zudoDoc({
     siteName: "zudo-slack-wisdom",
     siteDescription: "Slack developer knowledge base with a Cloudflare Worker backend editorial stance, for me and AI agents",
-    themePack: "observatory",
+    // themePack omitted on purpose. zudo-doc 10 resolves an omitted pack to
+    // Graphite on a light/dark site — that is the scaffold default. Classic
+    // is the explicit slug "classic"; do not set "default" (it is only an
+    // alias of Graphite, and listing it beside "graphite" fails the build).
     // Must be explicit: zudo-doc defaults `logo` to "auto", which silently
     // renders a generated mark seeded by siteName instead of this site's own.
     // The asset is a flat fill:#fff silhouette by design — it is consumed as a
